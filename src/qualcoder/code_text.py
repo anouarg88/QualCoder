@@ -611,6 +611,7 @@ class DialogCodeText(QtWidgets.QWidget):
         self.ui.pushButton_bookmark_go.pressed.connect(self.go_to_bookmark)
         self.ui.pushButton_document_memo.setIcon(qta.icon('mdi6.text-long'))
         self.ui.pushButton_document_memo.pressed.connect(self.active_file_memo)
+        # Formatted view tab is set up later (after _text_margins_splitter exists)
         self.ui.pushButton_file_attributes.setIcon(qta.icon('mdi6.variable', options=[{'scale_factor': 1.3}]))
         self.ui.pushButton_file_attributes.pressed.connect(self.get_files_from_attributes)
         self.ui.pushButton_clear_filter_file.setIcon(qta.icon('mdi6.filter-off-outline', options=[{'scale_factor': 1.3}]))
@@ -806,6 +807,10 @@ class DialogCodeText(QtWidgets.QWidget):
 
         # sync margin redraw with editor scroll <- L
         self.ui.plainTextEdit.verticalScrollBar().valueChanged.connect(self.coding_margin.update)
+
+        # ── Formatted text tab ────────────────────────────────────────
+        self._setup_formatted_text_tab()
+        # ──────────────────────────────────────────────────────────────
 
         self.app.project_events.project_data_changed.connect(self._on_project_data_changed)
         self.fill_tree()
@@ -2719,6 +2724,112 @@ class DialogCodeText(QtWidgets.QWidget):
             self.app.conn.commit()
         self.app.delete_backup = False
         self.get_coded_text_update_eventfilter_tooltips()
+
+    # ── Formatted text tab infrastructure ──────────────────────────
+
+    def _setup_formatted_text_tab(self):
+        """Replace the plainTextEdit in the text-margins splitter with a QTabWidget
+        that offers both a 'Plain text' tab (the original editor) and a 'Formatted'
+        tab (QTextEdit with HTML rendering).
+
+        The formatted tab is **codable**: selecting text and clicking a code will
+        mark the same character positions in both editors, because the stored
+        ``fulltext`` is derived from the HTML during import.
+        """
+        # Create the formatted text editor (no font stylesheet — let the HTML
+        # preserve its original fonts from the imported document)
+        self._formatted_text_edit = QtWidgets.QTextEdit()
+        self._formatted_text_edit.setReadOnly(False)
+        self._formatted_text_edit.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu)
+        self._formatted_text_edit.customContextMenuRequested.connect(
+            self.text_edit_menu)
+        self._formatted_text_edit.verticalScrollBar().valueChanged.connect(
+            self.hide_resize_handles)
+
+        # Create the tab widget
+        self._text_tabs = QtWidgets.QTabWidget()
+        self._text_tabs.setDocumentMode(True)
+
+        # Find where plainTextEdit sits in the margins splitter
+        idx = self._text_margins_splitter.indexOf(self.ui.plainTextEdit)
+
+        # Detach plainTextEdit from the splitter (it keeps its reference)
+        self._text_margins_splitter.widget(idx).setParent(None)
+
+        # Insert the tab widget at the same position
+        self._text_margins_splitter.insertWidget(idx, self._text_tabs)
+
+        # Add tabs
+        self._text_tabs.addTab(self.ui.plainTextEdit, _("Plain text"))
+        self._text_tabs.addTab(self._formatted_text_edit, _("Formatted"))
+
+        # Keep the plain-text editor's stretch factor
+        self._text_margins_splitter.setStretchFactor(
+            self._text_margins_splitter.indexOf(self._text_tabs), 1)
+
+        # Offset the NumberBar and coding margin by the tab bar height
+        # so line numbers align with the plain-text editor inside the tab.
+        tb_height = self._text_tabs.tabBar().height()
+        layout = self.ui.lineNumbers.layout()
+        if layout:
+            layout.setContentsMargins(0, tb_height, 0, 0)
+
+        # Re-apply highlights when the user switches tabs
+        self._text_tabs.currentChanged.connect(self._on_text_tab_changed)
+
+    @property
+    def _current_editor(self):
+        """Return the text-editor widget currently visible."""
+        if hasattr(self, '_text_tabs') and self._text_tabs.currentIndex() == 1:
+            return self._formatted_text_edit
+        return self.ui.plainTextEdit
+
+    @property
+    def _editors(self):
+        """Yield all text editors that need code highlights."""
+        yield self.ui.plainTextEdit
+        if hasattr(self, '_formatted_text_edit'):
+            yield self._formatted_text_edit
+
+    def _on_text_tab_changed(self, index):
+        """Refresh highlights when the user switches to a different view.
+
+        Line numbers are kept visible as a placeholder so the editor doesn't
+        jump left/right.  The NumberBar simply paints nothing when the
+        formatted tab is active (line heights vary with HTML).
+        """
+        is_formatted = (index == 1)
+        # Tell the NumberBar to draw (or skip) numbers
+        if hasattr(self, 'number_bar'):
+            self.number_bar._qc_formatted_mode = is_formatted
+            self.number_bar.update()
+        # Hide the coding margin in formatted view (meaningless there)
+        if hasattr(self, 'coding_margin') and self.coding_margin is not None:
+            self.coding_margin.setVisible(
+                not is_formatted and self.show_margin_stripes)
+        if self.file_ is None:
+            return
+        # Load formatted HTML the first time the formatted tab is shown
+        if is_formatted and self._formatted_text_edit.toPlainText() == "":
+            self._load_formatted_text()
+        # Re-apply code highlights for the now-visible editor
+        self.unlight()
+        self.highlight()
+
+    def _load_formatted_text(self):
+        """Load ``fulltext_html`` into the formatted editor, or fall back to
+        plain text if no HTML version exists."""
+        if self.file_ is None:
+            return
+        fid = self.file_['id']
+        cur = self.app.conn.cursor()
+        cur.execute("SELECT fulltext_html FROM source WHERE id=?", [fid])
+        row = cur.fetchone()
+        if row and row[0]:
+            self._formatted_text_edit.setHtml(row[0])
+        else:
+            self._formatted_text_edit.setPlainText(self.text)
 
     def active_file_memo(self):
         """ Send active file to file_memo method.
@@ -5854,6 +5965,9 @@ class DialogCodeText(QtWidgets.QWidget):
             self.text = self.text[:-1]
         self.detect_text_direction()
         self.ui.plainTextEdit.setPlainText(self.text)
+        # Load formatted view (HTML) if available
+        if hasattr(self, '_formatted_text_edit'):
+            self._load_formatted_text()
 
         # margin visibility handled via layout container; sync with preference <- L
         if hasattr(self, 'coding_margin') and self.coding_margin is not None:
@@ -5938,7 +6052,12 @@ class DialogCodeText(QtWidgets.QWidget):
         self.highlight()
 
     def unlight(self):
-        """ Remove all text highlighting from current file. """
+        """ Remove all text highlighting from current file.
+
+        For the plain-text editor the character format is reset directly.
+        For the formatted editor the HTML is reloaded from the database so
+        that the original bold/italic/underline formatting is preserved.
+        """
 
         if self.text is None or self.text == "":
             return
@@ -5946,22 +6065,22 @@ class DialogCodeText(QtWidgets.QWidget):
         cursor.setPosition(0, QtGui.QTextCursor.MoveMode.MoveAnchor)
         cursor.setPosition(len(self.text), QtGui.QTextCursor.MoveMode.KeepAnchor)
         cursor.setCharFormat(QtGui.QTextCharFormat())
+        # Reload HTML in the formatted editor to restore original formatting
+        if hasattr(self, '_formatted_text_edit'):
+            self._load_formatted_text()
 
     def _apply_format_to_code_item(self, item, codes_lookup):  # <- L
         """ Apply highlight formatting to a single coded text item.
         Extracted from highlight() so it can be reused by the incremental
         refresh path in mark(). Honors self.highlight_style and important state.
         Wraps mergeCharFormat with setUpdatesEnabled(False/True) to coalesce
-        paints (critical in 'marker' mode on large files). """
+        paints (critical in 'marker' mode on large files).
+
+        Applies the highlight to ALL editors (plain-text + formatted). """
 
         if self.file_ is None:
             return
         fmt = QtGui.QTextCharFormat()
-        cursor = self.ui.plainTextEdit.textCursor()
-        cursor.setPosition(int(item['pos0'] - self.file_['start']),
-                           QtGui.QTextCursor.MoveMode.MoveAnchor)
-        cursor.setPosition(int(item['pos1'] - self.file_['start']),
-                           QtGui.QTextCursor.MoveMode.KeepAnchor)
         color = codes_lookup.get(item['cid'], {}).get('color', "#777777")
 
         if self.highlight_style == 'underline':
@@ -5980,11 +6099,17 @@ class DialogCodeText(QtWidgets.QWidget):
         if item.get('important'):
             fmt.setFontWeight(QtGui.QFont.Weight.Bold)
 
-        self.ui.plainTextEdit.setUpdatesEnabled(False)
-        try:
-            cursor.mergeCharFormat(fmt)
-        finally:
-            self.ui.plainTextEdit.setUpdatesEnabled(True)
+        for editor in self._editors:
+            cursor = editor.textCursor()
+            cursor.setPosition(int(item['pos0'] - self.file_['start']),
+                               QtGui.QTextCursor.MoveMode.MoveAnchor)
+            cursor.setPosition(int(item['pos1'] - self.file_['start']),
+                               QtGui.QTextCursor.MoveMode.KeepAnchor)
+            editor.setUpdatesEnabled(False)
+            try:
+                cursor.mergeCharFormat(fmt)
+            finally:
+                editor.setUpdatesEnabled(True)
 
     def _mark_incremental_refresh(self, new_coded):  # <- L
         """ Lightweight refresh after a single mark() insertion.
@@ -6024,7 +6149,9 @@ class DialogCodeText(QtWidgets.QWidget):
         """ Underline the overlap regions between 'new_coded' and the rest of
         self.code_text. Same visual style as apply_underline_to_overlaps but
         O(n) instead of O(n^2): only the new code is compared against existing
-        ones. Batches mergeCharFormat inside one setUpdatesEnabled window. """
+        ones. Batches mergeCharFormat inside one setUpdatesEnabled window.
+
+        Applies overlap underlines to ALL editors. """
 
         if self.file_ is None:
             return
@@ -6033,7 +6160,25 @@ class DialogCodeText(QtWidgets.QWidget):
         if new_p0 == new_p1:
             return
 
-        cursor = self.ui.plainTextEdit.textCursor()
+        overlaps = []
+        for other in self.code_text:
+            if other is new_coded:
+                continue
+            if (other.get('ctid') is not None
+                    and new_coded.get('ctid') is not None
+                    and other['ctid'] == new_coded['ctid']):
+                continue
+            o_p0 = other['pos0']
+            o_p1 = other['pos1']
+            ov_start = max(new_p0, o_p0)
+            ov_end = min(new_p1, o_p1)
+            if ov_start >= ov_end:
+                continue
+            overlaps.append((ov_start, ov_end))
+
+        if not overlaps:
+            return
+
         fmt = QtGui.QTextCharFormat()
         fmt.setUnderlineStyle(QtGui.QTextCharFormat.UnderlineStyle.SingleUnderline)
         if self.app.settings['stylesheet'] == 'dark':
@@ -6041,28 +6186,18 @@ class DialogCodeText(QtWidgets.QWidget):
         else:
             fmt.setUnderlineColor(QColor("#FFFFFF"))
 
-        self.ui.plainTextEdit.setUpdatesEnabled(False)
-        try:
-            for other in self.code_text:
-                if other is new_coded:
-                    continue
-                if (other.get('ctid') is not None
-                        and new_coded.get('ctid') is not None
-                        and other['ctid'] == new_coded['ctid']):
-                    continue
-                o_p0 = other['pos0']
-                o_p1 = other['pos1']
-                ov_start = max(new_p0, o_p0)
-                ov_end = min(new_p1, o_p1)
-                if ov_start >= ov_end:
-                    continue
-                cursor.setPosition(ov_start - self.file_['start'],
-                                   QtGui.QTextCursor.MoveMode.MoveAnchor)
-                cursor.setPosition(ov_end - self.file_['start'],
-                                   QtGui.QTextCursor.MoveMode.KeepAnchor)
-                cursor.mergeCharFormat(fmt)
-        finally:
-            self.ui.plainTextEdit.setUpdatesEnabled(True)
+        for editor in self._editors:
+            cursor = editor.textCursor()
+            editor.setUpdatesEnabled(False)
+            try:
+                for ov_start, ov_end in overlaps:
+                    cursor.setPosition(ov_start - self.file_['start'],
+                                       QtGui.QTextCursor.MoveMode.MoveAnchor)
+                    cursor.setPosition(ov_end - self.file_['start'],
+                                       QtGui.QTextCursor.MoveMode.KeepAnchor)
+                    cursor.mergeCharFormat(fmt)
+            finally:
+                editor.setUpdatesEnabled(True)
 
     def highlight(self):
         """ Apply text highlighting to current file.
@@ -6070,6 +6205,10 @@ class DialogCodeText(QtWidgets.QWidget):
         Each code text item contains: fid, date, pos0, pos1, seltext, cid, status, memo,
         name, owner.
         For defined colours in color_selector, make text light on dark, and conversely dark on light
+
+        Highlights are applied to ALL editors (plain-text + formatted).
+        On the formatted editor ``mergeCharFormat`` is used so that the original
+        bold/italic/underline from the HTML is preserved.
         """
 
         if self.file_ is None or self.ui.plainTextEdit.toPlainText() == "":
@@ -6077,57 +6216,60 @@ class DialogCodeText(QtWidgets.QWidget):
             if hasattr(self, 'coding_margin') and self.coding_margin is not None:
                 self.coding_margin.update()
             return
-        # Add coding highlights
         codes = {x['cid']: x for x in self.codes}
-        for item in self.code_text:
-            fmt = QtGui.QTextCharFormat()
-            cursor = self.ui.plainTextEdit.textCursor()
-            cursor.setPosition(int(item['pos0'] - self.file_['start']), QtGui.QTextCursor.MoveMode.MoveAnchor)
-            cursor.setPosition(int(item['pos1'] - self.file_['start']), QtGui.QTextCursor.MoveMode.KeepAnchor)
-            color = codes.get(item['cid'], {}).get('color', "#777777")  # default gray
 
-            # choose between underline-only and full background fill <- L
-            if self.highlight_style == 'underline':
-                fmt.setUnderlineStyle(QtGui.QTextCharFormat.UnderlineStyle.DashUnderline)
-                fmt.setUnderlineColor(QColor(color))
-            else:
-                brush = QBrush(QColor(color))
-                fmt.setBackground(brush)
-                # Foreground depends on the defined need_white_text color in color_selector
-                text_brush = QBrush(QColor(TextColor(color).recommendation))
-                fmt.setForeground(text_brush)
+        for editor in self._editors:
+            # Add coding highlights
+            for item in self.code_text:
+                fmt = QtGui.QTextCharFormat()
+                cursor = editor.textCursor()
+                cursor.setPosition(int(item['pos0'] - self.file_['start']), QtGui.QTextCursor.MoveMode.MoveAnchor)
+                cursor.setPosition(int(item['pos1'] - self.file_['start']), QtGui.QTextCursor.MoveMode.KeepAnchor)
+                color = codes.get(item['cid'], {}).get('color', "#777777")  # default gray
 
-            # Highlight codes with memos - these are italicised
-            # Italics also used for overlapping codes
-            if item['memo'] != "":
-                fmt.setFontItalic(True)
-            else:
-                fmt.setFontItalic(False)
-            # Bold important codes
-            if item['important']:
-                fmt.setFontWeight(QtGui.QFont.Weight.Bold)
-            # Use important flag for ONLY showing important codes (button selected)
-            if self.important and item['important'] == 1:
-                cursor.mergeCharFormat(fmt)  # merge so underline composes correctly <- L
-            # Show all codes, as important button not selected
-            if not self.important:
-                cursor.mergeCharFormat(fmt)  # merge so underline composes correctly <- L
+                # choose between underline-only and full background fill <- L
+                if self.highlight_style == 'underline':
+                    fmt.setUnderlineStyle(QtGui.QTextCharFormat.UnderlineStyle.DashUnderline)
+                    fmt.setUnderlineColor(QColor(color))
+                else:
+                    brush = QBrush(QColor(color))
+                    fmt.setBackground(brush)
+                    # Foreground depends on the defined need_white_text color in color_selector
+                    text_brush = QBrush(QColor(TextColor(color).recommendation))
+                    fmt.setForeground(text_brush)
 
-        # Add annotation marks - these are in bold, important codings are also bold
-        for note in self.annotations:
-            if len(self.file_.keys()) > 0:  # will be zero if using autocode and no file is loaded
-                # Cursor pos could be negative if annotation was for an earlier text portion
-                cursor = self.ui.plainTextEdit.textCursor()
-                if note['fid'] == self.file_['id'] and \
-                        0 <= int(note['pos0']) - self.file_['start'] < int(note['pos1']) - self.file_['start'] <= \
-                        len(self.ui.plainTextEdit.toPlainText()):
-                    cursor.setPosition(int(note['pos0']) - self.file_['start'],
-                                       QtGui.QTextCursor.MoveMode.MoveAnchor)
-                    cursor.setPosition(int(note['pos1']) - self.file_['start'],
-                                       QtGui.QTextCursor.MoveMode.KeepAnchor)
-                    format_bold = QtGui.QTextCharFormat()
-                    format_bold.setFontWeight(QtGui.QFont.Weight.Bold)
-                    cursor.mergeCharFormat(format_bold)
+                # Highlight codes with memos - these are italicised
+                # Italics also used for overlapping codes
+                if item['memo'] != "":
+                    fmt.setFontItalic(True)
+                else:
+                    fmt.setFontItalic(False)
+                # Bold important codes
+                if item['important']:
+                    fmt.setFontWeight(QtGui.QFont.Weight.Bold)
+                # Use important flag for ONLY showing important codes (button selected)
+                if self.important and item['important'] == 1:
+                    cursor.mergeCharFormat(fmt)  # merge so underline composes correctly <- L
+                # Show all codes, as important button not selected
+                if not self.important:
+                    cursor.mergeCharFormat(fmt)  # merge so underline composes correctly <- L
+
+            # Add annotation marks - these are in bold, important codings are also bold
+            for note in self.annotations:
+                if len(self.file_.keys()) > 0:  # will be zero if using autocode and no file is loaded
+                    # Cursor pos could be negative if annotation was for an earlier text portion
+                    cursor = editor.textCursor()
+                    if note['fid'] == self.file_['id'] and \
+                            0 <= int(note['pos0']) - self.file_['start'] < int(note['pos1']) - self.file_['start'] <= \
+                            len(editor.toPlainText()):
+                        cursor.setPosition(int(note['pos0']) - self.file_['start'],
+                                           QtGui.QTextCursor.MoveMode.MoveAnchor)
+                        cursor.setPosition(int(note['pos1']) - self.file_['start'],
+                                           QtGui.QTextCursor.MoveMode.KeepAnchor)
+                        format_bold = QtGui.QTextCharFormat()
+                        format_bold.setFontWeight(QtGui.QFont.Weight.Bold)
+                        cursor.mergeCharFormat(format_bold)
+
         self.apply_underline_to_overlaps()
 
         # refresh the side margin widget after highlights change <- L
@@ -6138,6 +6280,8 @@ class DialogCodeText(QtWidgets.QWidget):
         """ Apply underline format to coded text sections which are overlapping.
         Qt underline options: # NoUnderline, SingleUnderline, DashUnderline, DotLine, DashDotLine, WaveUnderline
         Adjust for start of text file, as this may be a smaller portion of the full text file.
+
+        Applies to ALL editors (plain-text + formatted).
         """
 
         if self.important:
@@ -6159,17 +6303,22 @@ class DialogCodeText(QtWidgets.QWidget):
                             overlaps.append([j['pos0'], i['pos1']])
                         elif j['pos1'] != i['pos0']:  # j['pos0'] < i['pos0']:
                             overlaps.append([j['pos1'], i['pos0']])
-        cursor = self.ui.plainTextEdit.textCursor()
-        for o in overlaps:
-            fmt = QtGui.QTextCharFormat()
-            fmt.setUnderlineStyle(QtGui.QTextCharFormat.UnderlineStyle.SingleUnderline)
-            if self.app.settings['stylesheet'] == 'dark':
-                fmt.setUnderlineColor(QColor("#000000"))
-            else:
-                fmt.setUnderlineColor(QColor("#FFFFFF"))
-            cursor.setPosition(o[0] - self.file_['start'], QtGui.QTextCursor.MoveMode.MoveAnchor)
-            cursor.setPosition(o[1] - self.file_['start'], QtGui.QTextCursor.MoveMode.KeepAnchor)
-            cursor.mergeCharFormat(fmt)
+
+        if not overlaps:
+            return
+
+        for editor in self._editors:
+            cursor = editor.textCursor()
+            for o in overlaps:
+                fmt = QtGui.QTextCharFormat()
+                fmt.setUnderlineStyle(QtGui.QTextCharFormat.UnderlineStyle.SingleUnderline)
+                if self.app.settings['stylesheet'] == 'dark':
+                    fmt.setUnderlineColor(QColor("#000000"))
+                else:
+                    fmt.setUnderlineColor(QColor("#FFFFFF"))
+                cursor.setPosition(o[0] - self.file_['start'], QtGui.QTextCursor.MoveMode.MoveAnchor)
+                cursor.setPosition(o[1] - self.file_['start'], QtGui.QTextCursor.MoveMode.KeepAnchor)
+                cursor.mergeCharFormat(fmt)
 
     def mark(self):
         """ Mark selected text in file with currently selected code.
@@ -6189,9 +6338,11 @@ class DialogCodeText(QtWidgets.QWidget):
         if item.text(1).split(':')[0] == 'catid':  # Cannot mark with category
             return
         cid = int(item.text(1).split(':')[1])
-        selected_text = self.ui.plainTextEdit.textCursor().selectedText()
-        pos0 = self.ui.plainTextEdit.textCursor().selectionStart() + self.file_['start']
-        pos1 = self.ui.plainTextEdit.textCursor().selectionEnd() + self.file_['start']
+        editor = self._current_editor
+        sel_cursor = editor.textCursor()
+        selected_text = sel_cursor.selectedText()
+        pos0 = sel_cursor.selectionStart() + self.file_['start']
+        pos1 = sel_cursor.selectionEnd() + self.file_['start']
         if pos0 == pos1:
             return
 

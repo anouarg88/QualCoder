@@ -41,7 +41,7 @@ class TestApp(TestCase):
             "CREATE TABLE project (databaseversion text, date text, memo text,about text, bookmarkfile integer, "
             "bookmarkpos integer, codername text, recently_used_codes text)")
         cur.execute(
-            "CREATE TABLE source (id integer primary key, name text, fulltext text, mediapath text, memo text, "
+            "CREATE TABLE source (id integer primary key, name text, fulltext text, fulltext_html text, mediapath text, memo text, "
             "owner text, date text, av_text_id integer, risid integer, unique(name))")
         cur.execute(
             "CREATE TABLE code_image (imid integer primary key,id integer,x1 integer, y1 integer, width integer, "
@@ -235,7 +235,7 @@ class TestMainWindow(TestCase):
             "CREATE TABLE project (databaseversion text, date text, memo text,about text, bookmarkfile integer, "
             "bookmarkpos integer, codername text, recently_used_codes text)")
         cur.execute(
-            "CREATE TABLE source (id integer primary key, name text, fulltext text, mediapath text, memo text, "
+            "CREATE TABLE source (id integer primary key, name text, fulltext text, fulltext_html text, mediapath text, memo text, "
             "owner text, date text, av_text_id integer, risid integer, unique(name))")
         cur.execute(
             "CREATE TABLE code_image (imid integer primary key,id integer,x1 integer, y1 integer, width integer, "

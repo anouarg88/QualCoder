@@ -55,7 +55,7 @@ from .code_pdf import DialogCodePdf  # For isinstance update files
 from .code_text import DialogCodeText  # for isinstance()
 from .color_selector import colour_ranges, colors
 from .confirm_delete import DialogConfirmDelete
-from .docx import opendocx, getdocumenttext
+from .docx import opendocx, getdocumenttext, getdocumenttext_html
 from .edit_textfile import DialogEditTextFile
 from .GUI.ui_dialog_manage_files import Ui_Dialog_manage_files
 from .helpers import ExportDirectoryPathDialog, Message, msecs_to_hours_mins_secs
@@ -2208,10 +2208,16 @@ class DialogManageFiles(QtWidgets.QDialog):
             text_ = self.convert_odt_to_text(import_file)
             text_ = text_.replace("\n", "\n\n")  # add line to paragraph spacing for visual format
         # Import from docx
+        html_text_ = None
         if import_file[-5:].lower() == ".docx":
             document = opendocx(import_file)
-            list_ = getdocumenttext(document)
-            text_ = "\n\n".join(list_)  # add line to paragraph spacing for visual format
+            text_ = "\n\n".join(getdocumenttext(document))
+            html_text_ = getdocumenttext_html(document)  # HTML with bold/italic/underline preserved
+            # Derive plain text from HTML so positions match what QTextEdit.toPlainText() returns
+            from PyQt6.QtGui import QTextDocument
+            _doc = QTextDocument()
+            _doc.setHtml(html_text_)
+            text_ = _doc.toPlainText()
         # Import from rtf
         if import_file[-4:].lower() == ".rtf":
             # text_ = rtf_to_text(import_file, encoding="latin-1", errors="replace")
@@ -2244,7 +2250,17 @@ class DialogManageFiles(QtWidgets.QDialog):
                     if not line:
                         break
                     html_text += line
-                text_ = html_to_text(html_text)
+                # Clean the HTML for rendering: remove scripts, styles, but keep formatting tags
+                from .html_parser import clean_html_for_display
+                html_text_ = clean_html_for_display(html_text)
+                # Derive plain text from cleaned HTML so positions match QTextEdit.toPlainText()
+                from PyQt6.QtGui import QTextDocument
+                _doc = QTextDocument()
+                _doc.setHtml(html_text_)
+                text_ = _doc.toPlainText()
+                # Also keep legacy html_to_text for import_errors tracking
+                # (it's no longer the primary text source)
+                _legacy_text = html_to_text(html_text)
                 if import_errors > 0:
                     Message(self.app, _("Warning"), str(import_errors) + _(" lines not imported"), "warning").exec()
         # Import PDF
@@ -2312,12 +2328,15 @@ class DialogManageFiles(QtWidgets.QDialog):
         mediapath = "/docs/" + filename
         if link_path != "":
             mediapath = link_path
-        entry = {'name': filename, 'id': -1, 'fulltext': text_, 'mediapath': mediapath, 'memo': "",
+        entry = {'name': filename, 'id': -1, 'fulltext': text_, 'fulltext_html': html_text_,
+                 'mediapath': mediapath, 'memo': "",
                  'owner': self.app.settings['codername'], 'date': datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
         cur = self.app.conn.cursor()
-        cur.execute("insert into source(name,fulltext,mediapath,memo,owner,date) values(?,?,?,?,?,?)",
+        cur.execute("insert into source(name,fulltext,fulltext_html,mediapath,memo,owner,date) "
+                     "values(?,?,?,?,?,?,?)",
                     (
-                        entry['name'], entry['fulltext'], entry['mediapath'], entry['memo'], entry['owner'],
+                        entry['name'], entry['fulltext'], entry['fulltext_html'], entry['mediapath'],
+                        entry['memo'], entry['owner'],
                         entry['date']))
         self.app.conn.commit()
         cur.execute("select last_insert_rowid()")

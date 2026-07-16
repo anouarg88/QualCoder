@@ -1240,8 +1240,16 @@ class NumberBar(QtWidgets.QFrame):
            
     def paintEvent(self, event):
         """Custom painting logic for rendering the line numbers
-        based on the currently visible text blocks in the QTextEdit."""
+        based on the currently visible text blocks in the QTextEdit.
+        When ``_qc_formatted_mode`` is set (by the formatted-text tab), no
+        numbers are drawn — the widget stays visible as a width placeholder."""
         painter = QtGui.QPainter(self)
+        # In formatted mode, just fill the background and bail out
+        if getattr(self, '_qc_formatted_mode', False):
+            painter.fillRect(event.rect(), self.palette().color(QtGui.QPalette.ColorRole.Base))
+            painter.end()
+            QtWidgets.QWidget.paintEvent(self, event)
+            return
         font = self.text_edit.font()
         font.setFamily('Monospace')
         font.setStyleHint(QtGui.QFont.StyleHint.TypeWriter)

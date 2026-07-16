@@ -1,3 +1,27 @@
+> **⚠️ Experimental Fork Notice**  
+> This repository is an **experimental fork** of [QualCoder](https://github.com/ccbogel/QualCoder) by Colin Curtain.  
+> It is used for testing and prototyping new features. It is **not** the official QualCoder distribution.  
+> For the stable, official version please visit the [original repository](https://github.com/ccbogel/QualCoder).  
+>
+> **⚠️ Disclaimer**  
+> THIS SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND. Use at your own risk.  
+> The modifications in this fork may introduce bugs, data inconsistencies, or project corruption.  
+> Always back up your `.qda` project files before opening them with this fork.  
+> Never use this fork as your primary analysis tool on irreplaceable research data.
+
+## Differences from upstream QualCoder
+
+### ➕ Rich-text formatting (bold, italic, underline)
+- **DOCX files** imported with the **bold**, *italic*, and <u>underline</u> formatting preserved from the original document
+- **HTML files** imported with text formatting kept intact (scripts and styles are stripped for security)
+- The Code Text viewer has two **tabs**: "Plain text" (the original character-based editor) and "Formatted" (rich-text HTML rendering)
+- **Both views are fully codable** — select text in either tab and code it. Code highlights appear in both views simultaneously, and positions are kept in sync because the plain text is derived from the HTML during import
+- **Bold/italic/underline survive code highlighting** — `mergeCharFormat` preserves HTML formatting while code background colors are applied on top
+
+---
+
+# ⬇️ Original README (from upstream [ccbogel/QualCoder](https://github.com/ccbogel/QualCoder))
+
 <img src="https://github.com/ccbogel/QualCoder/blob/master/qualcoder.png" width=200 height=200>
 
 Please also read the manual here: [QualCoder Manual](https://qualcoder.org/)

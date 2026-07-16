@@ -3186,8 +3186,8 @@ Click "Yes" to start now.')
             "CREATE TABLE project (databaseversion text, date text, memo text,about text, bookmarkfile integer, "
             "bookmarkpos integer, codername text, recently_used_codes text, avbookmarkfile integer, avbookmarkmsec integer, avbookmarktext integer)")
         cur.execute(
-            "CREATE TABLE source (id integer primary key, name text, fulltext text, mediapath text, memo text, "
-            "owner text, date text, av_text_id integer, risid integer, unique(name))")
+            "CREATE TABLE source (id integer primary key, name text, fulltext text, fulltext_html text, mediapath text, "
+            "memo text, owner text, date text, av_text_id integer, risid integer, unique(name))")
         cur.execute(
             "CREATE TABLE code_image (imid integer primary key,id integer,x1 integer, y1 integer, width integer, "
             "height integer, cid integer, memo text, date text, owner text, important integer, pdf_page integer)")
@@ -3777,6 +3777,14 @@ Click "Yes" to start now.')
         if cat_changed or code_changed:
             self.app.conn.commit()
             self.ui.textEdit.append(_("Repaired a cyclic code/category hierarchy."))
+        # Database version v17 - add fulltext_html column for rich-text formatting
+        try:
+            cur.execute("select fulltext_html from source")
+        except sqlite3.OperationalError:
+            cur.execute('ALTER TABLE source ADD fulltext_html text')
+            cur.execute('update project set databaseversion="v17", about=?', [qualcoder_version])
+            self.app.conn.commit()
+            self.ui.textEdit.append(_("Updating database to version") + " v17")
         # Vacuum database
         cur.execute("vacuum")
         self.app.conn.commit()

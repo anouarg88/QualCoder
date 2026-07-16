@@ -93,6 +93,40 @@ def html_to_text(html):
     return parser.get_text()
 
 
+def clean_html_for_display(raw_html):
+    """Clean HTML for safe display in QTextEdit / QTextDocument.
+
+    Removes <script>, <style>, <head>, <meta>, <link> elements and their
+    contents, but keeps formatting tags: <b>, <i>, <u>, <p>, <br>, <h1>-<h6>,
+    <ul>, <ol>, <li>, <blockquote>, <em>, <strong>, <span>, <div>, <pre>,
+    <code>, <hr>, <table>, <tr>, <td>, <th>, <thead>, <tbody>, <a>, <img>.
+
+    Returns a well-formed HTML string wrapped in <html><body>…</body></html>.
+    """
+    # Use regex to strip script and style blocks (quick and robust enough)
+    cleaned = re.sub(
+        r'<script[^>]*>.*?</script>',
+        '',
+        raw_html,
+        flags=re.IGNORECASE | re.DOTALL
+    )
+    cleaned = re.sub(
+        r'<style[^>]*>.*?</style>',
+        '',
+        cleaned,
+        flags=re.IGNORECASE | re.DOTALL
+    )
+    # Remove <head>…</head> (but keep its inline children if any)
+    cleaned = re.sub(r'<head[^>]*>.*?</head>', '', cleaned, flags=re.IGNORECASE | re.DOTALL)
+    cleaned = re.sub(r'<meta[^>]*>', '', cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r'<link[^>]*>', '', cleaned, flags=re.IGNORECASE)
+
+    # Ensure it's wrapped in a basic document structure
+    if not cleaned.strip().lower().startswith('<html'):
+        cleaned = '<html><body>' + cleaned + '</body></html>'
+    return cleaned
+
+
 def text_to_html(text):
     """
     Convert the given text to html, wrapping what looks like URLs with <a> tags,

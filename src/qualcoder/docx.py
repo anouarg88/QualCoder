@@ -32,6 +32,7 @@ OTHER DEALINGS IN THE SOFTWARE.
 2022 Modified by Colin Curtain to import docx only.
 """
 
+import html
 import logging
 import sys
 import traceback
@@ -112,6 +113,61 @@ def getdocumenttext(document):
         if not len(paratext) == 0:
             paratextlist.append(paratext)
     return paratextlist
+
+
+def getdocumenttext_html(document):
+    """Return the text of a document as HTML with bold/italic/underline preserved.
+
+    Inspects <w:rPr> child of each <w:r> (run) for <w:b>, <w:i>, <w:u> elements
+    and wraps the run text in the corresponding HTML tags.
+    Returns a full <html><body>…</body></html> string.
+    """
+    ns_w = '{' + nsprefixes['w'] + '}'
+    html_parts = []
+    paralist = []
+    for element in document.iter():
+        if element.tag == ns_w + 'p':
+            paralist.append(element)
+
+    for para in paralist:
+        line_parts = []
+        for element in para.iter():
+            # Only process direct run children of this paragraph
+            if element.tag == ns_w + 'r':
+                # Get run properties
+                rpr = element.find(ns_w + 'rPr')
+                is_bold = False
+                is_italic = False
+                is_underline = False
+                if rpr is not None:
+                    if rpr.find(ns_w + 'b') is not None:
+                        is_bold = True
+                    if rpr.find(ns_w + 'i') is not None:
+                        is_italic = True
+                    if rpr.find(ns_w + 'u') is not None:
+                        is_underline = True
+                # Get run text
+                texts = []
+                for t in element.iter(ns_w + 't'):
+                    if t.text:
+                        texts.append(html.escape(t.text))
+                if element.find(ns_w + 'tab') is not None:
+                    texts.append('&#9;')
+                run_text = ''.join(texts)
+                if is_bold:
+                    run_text = '<b>' + run_text + '</b>'
+                if is_italic:
+                    run_text = '<i>' + run_text + '</i>'
+                if is_underline:
+                    run_text = '<u>' + run_text + '</u>'
+                if run_text:
+                    line_parts.append(run_text)
+        line = ''.join(line_parts)
+        if line:
+            html_parts.append('<p>' + line + '</p>')
+    if html_parts:
+        return '<html><body>' + '\n'.join(html_parts) + '</body></html>'
+    return ''
 
 
 '''def get_document_text(document):
