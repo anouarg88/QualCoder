@@ -79,12 +79,34 @@ nsprefixes = {
 
 
 def opendocx(file):
-    """ Open a docx file, return a document XML tree. """
-
+    """ Open a docx file, return a document XML tree and the zipfile. """
     mydoc = zipfile.ZipFile(file)
     xmlcontent = mydoc.read('word/document.xml')
     document = etree.fromstring(xmlcontent)
-    return document
+    return document, mydoc
+
+
+def _get_default_font_from_styles(zf):
+    """Read the default run font from styles.xml (docDefaults / rPrDefault)."""
+    ns_w = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
+    try:
+        styles_xml = zf.read('word/styles.xml')
+    except KeyError:
+        return ''
+    styles_root = etree.fromstring(styles_xml)
+    doc_defaults = styles_root.find(ns_w + 'docDefaults')
+    if doc_defaults is None:
+        return ''
+    rpr_default = doc_defaults.find(ns_w + 'rPrDefault')
+    if rpr_default is None:
+        return ''
+    rpr = rpr_default.find(ns_w + 'rPr')
+    if rpr is None:
+        return ''
+    rfonts = rpr.find(ns_w + 'rFonts')
+    if rfonts is None:
+        return ''
+    return rfonts.get(ns_w + 'ascii', rfonts.get(ns_w + 'hAnsi', '')) or ''
 
 
 def getdocumenttext(document):
@@ -115,14 +137,77 @@ def getdocumenttext(document):
     return paratextlist
 
 
-def getdocumenttext_html(document):
-    """Return the text of a document as HTML with bold/italic/underline preserved.
+def _build_style_map(zf):
+    """Build a dict mapping styleId -> (font_family, font_size_pt) from
+    styles.xml, resolving basedOn inheritance."""
+    ns_w = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
+    try:
+        styles_root = etree.fromstring(zf.read('word/styles.xml'))
+    except (KeyError, etree.ParseError):
+        return {}
+    # First pass: collect all style definitions
+    raw = {}
+    for style in styles_root.findall(ns_w + 'style'):
+        sid = style.get(ns_w + 'styleId', '')
+        rPr = style.find(ns_w + 'rPr')
+        if rPr is None:
+            continue
+        rfonts = rPr.find(ns_w + 'rFonts')
+        font_family = ''
+        if rfonts is not None:
+            font_family = rfonts.get(ns_w + 'ascii', '') or ''
+        sz = rPr.find(ns_w + 'sz')
+        font_size_pt = 0
+        if sz is not None:
+            try:
+                font_size_pt = int(sz.get(ns_w + 'val', '0')) // 2
+            except (ValueError, TypeError):
+                pass
+        basedOn = style.find(ns_w + 'basedOn')
+        parent_id = basedOn.get(ns_w + 'val', '') if basedOn is not None else ''
+        raw[sid] = {'font': font_family, 'size': font_size_pt, 'parent': parent_id}
+    # Second pass: resolve inheritance
+    resolved = {}
+    # Sort by depth (shortest chain first)
+    def _resolve(sid, visited=None):
+        if visited is None:
+            visited = set()
+        if sid in resolved:
+            return resolved[sid]
+        if sid in visited or sid not in raw:
+            return '', 0
+        visited.add(sid)
+        entry = raw[sid]
+        p_font, p_size = _resolve(entry['parent'], visited)
+        font = entry['font'] or p_font
+        size = entry['size'] if entry['size'] > 0 else p_size
+        resolved[sid] = (font, size)
+        return font, size
 
-    Inspects <w:rPr> child of each <w:r> (run) for <w:b>, <w:i>, <w:u> elements
-    and wraps the run text in the corresponding HTML tags.
+    for sid in raw:
+        _resolve(sid)
+    return resolved
+
+
+def getdocumenttext_html(document, zipfile_=None):
+    """Return the text of a document as HTML with bold/italic/underline and
+    font family / font size / paragraph alignment preserved.
+
+    Inspects <w:rPr> children for <w:b>, <w:i>, <w:u>, <w:rFonts>,
+    <w:sz> elements and wraps run text in the corresponding HTML / CSS.
+    Also reads <w:pPr><w:jc> for paragraph alignment and <w:pPr><w:pStyle>
+    to look up style-based fonts from styles.xml.
+    Falls back to document default font from styles.xml when a run
+    has no explicit font.
     Returns a full <html><body>…</body></html> string.
     """
     ns_w = '{' + nsprefixes['w'] + '}'
+    # Read document defaults and style map
+    default_font = ''
+    style_map = {}
+    if zipfile_ is not None:
+        default_font = _get_default_font_from_styles(zipfile_)
+        style_map = _build_style_map(zipfile_)
     html_parts = []
     paralist = []
     for element in document.iter():
@@ -131,14 +216,39 @@ def getdocumenttext_html(document):
 
     for para in paralist:
         line_parts = []
+
+        # ── Paragraph alignment & style lookup ─────────────────────
+        ppr = para.find(ns_w + 'pPr')
+        align_attr = ''
+        para_font = ''
+        para_size_pt = 0
+        if ppr is not None:
+            jc = ppr.find(ns_w + 'jc')
+            if jc is not None:
+                val = jc.get(ns_w + 'val') or ''
+                _align_map = {
+                    'left': 'left', 'center': 'center', 'right': 'right',
+                    'both': 'justify',
+                }
+                css_val = _align_map.get(val, '')
+                if css_val:
+                    align_attr = f' style="text-align:{css_val}"'
+            # Look up paragraph style from styles.xml
+            pStyle = ppr.find(ns_w + 'pStyle')
+            if pStyle is not None:
+                sid = pStyle.get(ns_w + 'val', '')
+                if sid in style_map:
+                    para_font, para_size_pt = style_map[sid]
+
+        # ── Run loop ──────────────────────────────────────────────
         for element in para.iter():
-            # Only process direct run children of this paragraph
             if element.tag == ns_w + 'r':
-                # Get run properties
                 rpr = element.find(ns_w + 'rPr')
                 is_bold = False
                 is_italic = False
                 is_underline = False
+                font_family = ''
+                font_size_pt = 0
                 if rpr is not None:
                     if rpr.find(ns_w + 'b') is not None:
                         is_bold = True
@@ -146,6 +256,24 @@ def getdocumenttext_html(document):
                         is_italic = True
                     if rpr.find(ns_w + 'u') is not None:
                         is_underline = True
+                    # Font family — try run-level first, then paragraph style,
+                    # then document default
+                    rfonts = rpr.find(ns_w + 'rFonts')
+                    if rfonts is not None:
+                        font_family = rfonts.get(ns_w + 'ascii',
+                                                  rfonts.get(ns_w + 'hAnsi', '')) or ''
+                    if not font_family:
+                        font_family = para_font or default_font
+                    # Font size in half-points — convert to pt.
+                    # Use run-level size if present, otherwise paragraph style size.
+                    if font_size_pt == 0 and para_size_pt > 0:
+                        font_size_pt = para_size_pt
+                    sz = rpr.find(ns_w + 'sz')
+                    if sz is not None:
+                        try:
+                            font_size_pt = int(sz.get(ns_w + 'val', '0')) // 2
+                        except (ValueError, TypeError):
+                            pass
                 # Get run text
                 texts = []
                 for t in element.iter(ns_w + 't'):
@@ -154,17 +282,30 @@ def getdocumenttext_html(document):
                 if element.find(ns_w + 'tab') is not None:
                     texts.append('&#9;')
                 run_text = ''.join(texts)
+                if not run_text:
+                    continue
+                # Build an inline <span> with CSS for font/size
+                css_parts = []
+                if font_family:
+                    # Quote font names with spaces (e.g. "Courier New")
+                    if ' ' in font_family:
+                        css_parts.append(f"font-family:'{font_family}'")
+                    else:
+                        css_parts.append(f'font-family:{font_family}')
+                if font_size_pt > 0:
+                    css_parts.append(f'font-size:{font_size_pt}pt')
+                if css_parts:
+                    run_text = f'<span style="{"; ".join(css_parts)}">{run_text}</span>'
                 if is_bold:
                     run_text = '<b>' + run_text + '</b>'
                 if is_italic:
                     run_text = '<i>' + run_text + '</i>'
                 if is_underline:
                     run_text = '<u>' + run_text + '</u>'
-                if run_text:
-                    line_parts.append(run_text)
+                line_parts.append(run_text)
         line = ''.join(line_parts)
         if line:
-            html_parts.append('<p>' + line + '</p>')
+            html_parts.append(f'<p{align_attr}>' + line + '</p>')
     if html_parts:
         return '<html><body>' + '\n'.join(html_parts) + '</body></html>'
     return ''

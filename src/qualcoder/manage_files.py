@@ -2210,9 +2210,10 @@ class DialogManageFiles(QtWidgets.QDialog):
         # Import from docx
         html_text_ = None
         if import_file[-5:].lower() == ".docx":
-            document = opendocx(import_file)
+            document, docx_zip = opendocx(import_file)
             text_ = "\n\n".join(getdocumenttext(document))
-            html_text_ = getdocumenttext_html(document)  # HTML with bold/italic/underline preserved
+            html_text_ = getdocumenttext_html(document, docx_zip)
+            docx_zip.close()
             # Derive plain text from HTML so positions match what QTextEdit.toPlainText() returns
             from PyQt6.QtGui import QTextDocument
             _doc = QTextDocument()

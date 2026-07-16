@@ -237,9 +237,10 @@ class ReplaceTextFile:
             text = text.replace("\n", "\n\n")  # Add line to paragraph spacing for visual format
         # Import from docx
         if self.new_file_path[-5:].lower() == ".docx":
-            document = opendocx(self.new_file_path)
+            document, docx_zip = opendocx(self.new_file_path)
             list_ = getdocumenttext(document)
             text = "\n\n".join(list_)  # Add line to paragraph spacing for visual format
+            docx_zip.close()
         # Import from epub
         if self.new_file_path[-5:].lower() == ".epub":
             book = epub.read_epub(self.new_file_path)
