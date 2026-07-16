@@ -1744,9 +1744,21 @@ class DialogCodeText(QtWidgets.QWidget):
                     tooltip += "\n" + _("Filtered: ") + self.show_codes_colour_filter
                 self.ui.label_code.setToolTip(tooltip)
                 break
-        selected_text = self.ui.plainTextEdit.textCursor().selectedText()
-        if len(selected_text) > 0 and not (QtWidgets.QApplication.mouseButtons() & Qt.MouseButton.RightButton):
-            self.mark()
+        did_mark = False
+        if hasattr(self, '_text_tabs') and self._text_tabs.currentIndex() == 1:
+            cached = getattr(self, '_cached_fmt_sel', None)
+            if cached:
+                selected_text, pos0, pos1 = cached
+                if len(selected_text) > 0 and pos1 > pos0 \
+                        and not (QtWidgets.QApplication.mouseButtons() & Qt.MouseButton.RightButton):
+                    self._mark_with_data(selected_text, pos0, pos1)
+                    did_mark = True
+        if not did_mark:
+            # Plain text editor path (selection stays intact after tree click)
+            sel_cursor = self.ui.plainTextEdit.textCursor()
+            selected_text = sel_cursor.selectedText()
+            if len(selected_text) > 0 and not (QtWidgets.QApplication.mouseButtons() & Qt.MouseButton.RightButton):
+                self.mark()
         # When a code is selected undo the show selected code features
         self.highlight()
         # Reload button icons as they disappear on Windows
@@ -2407,12 +2419,14 @@ class DialogCodeText(QtWidgets.QWidget):
 
     def text_edit_menu(self, position):
         """ Context menu for textEdit.
-        Mark, unmark, annotate, copy, memo coded, coded importance. """
+        Mark, unmark, annotate, copy, memo coded, coded importance.
+        Works for both the plain-text and the formatted editor. """
 
-        if self.ui.plainTextEdit.toPlainText() == "" or self.edit_mode:
+        source = self.sender() if self.sender() else self.ui.plainTextEdit
+        if source.toPlainText() == "" or self.edit_mode:
             return
-        cursor = self.ui.plainTextEdit.cursorForPosition(position)
-        selected_text = self.ui.plainTextEdit.textCursor().selectedText()
+        cursor = source.cursorForPosition(position)
+        selected_text = source.textCursor().selectedText()
         menu = QtWidgets.QMenu()
         menu.setStyleSheet(f"font-size:{self.app.settings['fontsize']}pt")
         menu.setToolTipsVisible(True)
@@ -2491,7 +2505,7 @@ class DialogCodeText(QtWidgets.QWidget):
         if not self.ui.groupBox.isHidden():
             action_hide_top_groupbox = menu.addAction(_("Hide control panel (H)"))
 
-        action = menu.exec(self.ui.plainTextEdit.mapToGlobal(position))
+        action = menu.exec(source.mapToGlobal(position))
         if action is None:
             return
         if action == action_important:
@@ -2507,6 +2521,16 @@ class DialogCodeText(QtWidgets.QWidget):
             self.copy_selected_text_to_clipboard(True)
             return
         if selected_text != "" and self.ui.treeWidget.currentItem() is not None and action == action_mark:
+            # If the context menu was opened from the formatted editor,
+            # use the cached selection (pre-stored via selectionChanged).
+            is_fmt = (hasattr(self, '_text_tabs') and self._text_tabs.currentIndex() == 1)
+            if is_fmt:
+                cached = getattr(self, '_cached_fmt_sel', None)
+                if cached:
+                    sel_text, p0, p1 = cached
+                    if p1 > p0:
+                        self._mark_with_data(sel_text, p0, p1)
+                        return
             self.mark()
             return
         if action == action_annotate:
@@ -2551,8 +2575,9 @@ class DialogCodeText(QtWidgets.QWidget):
             if self.file_ is None:
                 Message(self.app, _('Warning'), _("No file was selected"), "warning").exec()
                 return
-            selected_text = self.ui.plainTextEdit.textCursor().selectedText()
-            start_pos = self.ui.plainTextEdit.textCursor().selectionStart() + self.file_['start']
+            sel_cursor = source.textCursor()
+            selected_text = sel_cursor.selectedText().replace('\u2029', '\n')
+            start_pos = sel_cursor.selectionStart() + self.file_['start']
             ai_chat_signal_emitter.newTextChatSignal.emit(int(self.file_['id']),
                                                           self.file_['name'],
                                                           selected_text,
@@ -2564,6 +2589,16 @@ class DialogCodeText(QtWidgets.QWidget):
             return
         # Remaining actions will be the submenu codes
         self.recursive_set_current_item(self.ui.treeWidget.invisibleRootItem(), action.text())
+        # If the context menu was opened from the formatted editor,
+        # use the cached selection.
+        is_fmt = (hasattr(self, '_text_tabs') and self._text_tabs.currentIndex() == 1)
+        if is_fmt:
+            cached = getattr(self, '_cached_fmt_sel', None)
+            if cached:
+                sel_text, p0, p1 = cached
+                if p1 > p0:
+                    self._mark_with_data(sel_text, p0, p1)
+                    return
         self.mark()
 
     def mark_with_new_code(self, in_vivo: bool = False):
@@ -2775,6 +2810,11 @@ class DialogCodeText(QtWidgets.QWidget):
         if layout:
             layout.setContentsMargins(0, tb_height, 0, 0)
 
+        # Cache formatted-editor selections before tree clicks steal focus
+        self._cached_fmt_sel = None
+        self._formatted_text_edit.selectionChanged.connect(
+            self._cache_formatted_selection)
+
         # Re-apply highlights when the user switches tabs
         self._text_tabs.currentChanged.connect(self._on_text_tab_changed)
 
@@ -2791,6 +2831,64 @@ class DialogCodeText(QtWidgets.QWidget):
         yield self.ui.plainTextEdit
         if hasattr(self, '_formatted_text_edit'):
             yield self._formatted_text_edit
+
+    def _cache_formatted_selection(self):
+        """Cache the formatted editor's current selection so it's still
+        available after the tree widget click clears focus.
+
+        IMPORTANT: we NEVER clear the cache here (only update it) because
+        focus changes can fire selectionChanged with an empty selection,
+        which would delete the cached data right before the tree click
+        handler needs it.  The cache is consumed in _mark_with_data.
+        """
+        cursor = self._formatted_text_edit.textCursor()
+        text = cursor.selectedText().replace('\u2029', '\n')
+        if text and self.file_:
+            self._cached_fmt_sel = (
+                text,
+                cursor.selectionStart() + self.file_['start'],
+                cursor.selectionEnd() + self.file_['start']
+            )
+
+    def _mark_with_data(self, selected_text, pos0, pos1):
+        """Create a coding from explicit position data (used by the formatted
+        tab where the tree click clears the editor selection)."""
+        if not selected_text or not self.file_:
+            return
+        item = self.ui.treeWidget.currentItem()
+        if item is None or item.text(1).split(':')[0] == 'catid':
+            return
+        cid = int(item.text(1).split(':')[1])
+        coded = {'cid': cid, 'fid': int(self.file_['id']), 'seltext': selected_text,
+                 'pos0': pos0, 'pos1': pos1, 'owner': self.app.settings['codername'], 'memo': "",
+                 'date': datetime.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S"),
+                 'important': None}
+        for _c in self.codes:
+            if _c['cid'] == cid:
+                coded['name'] = _c['name']
+                coded['color'] = _c['color']
+                break
+        if 'color' not in coded:
+            coded['color'] = '#cccccc'
+        # Check duplicates
+        cur = self.app.conn.cursor()
+        cur.execute("select * from code_text where cid = ? and fid=? and pos0=? and pos1=? and owner=?",
+                    (coded['cid'], coded['fid'], coded['pos0'], coded['pos1'], coded['owner']))
+        if cur.fetchall():
+            return
+        cur.execute("insert into code_text (cid,fid,seltext,pos0,pos1,owner, memo,date, important) "
+                     "values(?,?,?,?,?,?,?,?,?)",
+                    (coded['cid'], coded['fid'], coded['seltext'], coded['pos0'], coded['pos1'],
+                     coded['owner'], coded['memo'], coded['date'], coded['important']))
+        cur.execute("select last_insert_rowid()")
+        coded['ctid'] = cur.fetchone()[0]
+        self.code_text.append(coded)
+        self.app.conn.commit()
+        self.app.delete_backup = False
+        self._mark_incremental_refresh(coded)
+        self.fill_code_counts_in_tree()
+        # Clear the cache so the same selection isn't coded twice
+        self._cached_fmt_sel = None
 
     def _on_text_tab_changed(self, index):
         """Refresh highlights when the user switches to a different view.
@@ -6052,11 +6150,14 @@ class DialogCodeText(QtWidgets.QWidget):
         self.highlight()
 
     def unlight(self):
-        """ Remove all text highlighting from current file.
+        """ Remove code highlights from both editors.
 
         For the plain-text editor the character format is reset directly.
-        For the formatted editor the HTML is reloaded from the database so
-        that the original bold/italic/underline formatting is preserved.
+        For the formatted editor we use mergeCharFormat with a neutral
+        format that clears background/foreground/underline/italic/bold —
+        the original HTML formatting (italic, bold, underline from import)
+        survives untouched because mergeCharFormat only overrides the
+        explicitly-set properties.
         """
 
         if self.text is None or self.text == "":
@@ -6065,9 +6166,17 @@ class DialogCodeText(QtWidgets.QWidget):
         cursor.setPosition(0, QtGui.QTextCursor.MoveMode.MoveAnchor)
         cursor.setPosition(len(self.text), QtGui.QTextCursor.MoveMode.KeepAnchor)
         cursor.setCharFormat(QtGui.QTextCharFormat())
-        # Reload HTML in the formatted editor to restore original formatting
+
+        # Formatted editor: clear only the background highlight.
+        # Foreground is left untouched — clearing it makes non-coded text
+        # invisible (white-on-white).  Font properties (bold, italic,
+        # underline from the HTML) also survive.
         if hasattr(self, '_formatted_text_edit'):
-            self._load_formatted_text()
+            fmt = QtGui.QTextCharFormat()
+            fmt.setBackground(QtGui.QBrush(QtCore.Qt.GlobalColor.transparent))
+            cursor2 = self._formatted_text_edit.textCursor()
+            cursor2.select(QtGui.QTextCursor.SelectionType.Document)
+            cursor2.mergeCharFormat(fmt)
 
     def _apply_format_to_code_item(self, item, codes_lookup):  # <- L
         """ Apply highlight formatting to a single coded text item.
@@ -6218,6 +6327,12 @@ class DialogCodeText(QtWidgets.QWidget):
             return
         codes = {x['cid']: x for x in self.codes}
 
+        # Save formatted editor scroll position BEFORE any mergeCharFormat
+        # calls (they can reset the viewport to the top).
+        _fmt_scroll_val = None
+        if hasattr(self, '_formatted_text_edit'):
+            _fmt_scroll_val = self._formatted_text_edit.verticalScrollBar().value()
+
         for editor in self._editors:
             # Add coding highlights
             for item in self.code_text:
@@ -6275,6 +6390,12 @@ class DialogCodeText(QtWidgets.QWidget):
         # refresh the side margin widget after highlights change <- L
         if hasattr(self, 'coding_margin') and self.coding_margin is not None:
             self.coding_margin.update()
+
+        # Restore formatted editor's scroll position (mergeCharFormat
+        # on a QTextEdit can reset the viewport to the top).
+        if _fmt_scroll_val is not None and _fmt_scroll_val > 0:
+            QtCore.QTimer.singleShot(
+                0, lambda sb=self._formatted_text_edit.verticalScrollBar(), v=_fmt_scroll_val: sb.setValue(v))
 
     def apply_underline_to_overlaps(self):
         """ Apply underline format to coded text sections which are overlapping.
@@ -6338,9 +6459,13 @@ class DialogCodeText(QtWidgets.QWidget):
         if item.text(1).split(':')[0] == 'catid':  # Cannot mark with category
             return
         cid = int(item.text(1).split(':')[1])
-        editor = self._current_editor
-        sel_cursor = editor.textCursor()
+        # When the plain-text editor is active, read directly from it.
+        # (The formatted tab path is handled by fill_code_label_with_selected_code
+        # which calls _mark_with_data instead.)
+        sel_cursor = self.ui.plainTextEdit.textCursor()
         selected_text = sel_cursor.selectedText()
+        if not selected_text:
+            return
         pos0 = sel_cursor.selectionStart() + self.file_['start']
         pos1 = sel_cursor.selectionEnd() + self.file_['start']
         if pos0 == pos1:
