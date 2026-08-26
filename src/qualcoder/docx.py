@@ -75,11 +75,11 @@ nsprefixes = {
 
 
 def opendocx(file):
-    """ Open a docx file, return a document XML tree and the zipfile. """
+    """ Open a docx file, return a document XML tree. """
     mydoc = zipfile.ZipFile(file)
     xmlcontent = mydoc.read('word/document.xml')
     document = etree.fromstring(xmlcontent)
-    return document, mydoc
+    return document
 
 
 def _get_default_font_from_styles(zf):
