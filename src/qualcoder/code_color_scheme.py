@@ -14,31 +14,29 @@ See the GNU General Public License for more details.
 You should have received a copy of the GNU Lesser General Public License along with QualCoder.
 If not, see <https://www.gnu.org/licenses/>.
 
-Author: Colin Curtain (ccbogel)
+Authors: Colin Curtain C, Kai Dröge, Justin Missaghieh--Poncet, Lorenzo Salomón
 https://github.com/ccbogel/QualCoder
-https://qualcoder-org.github.io
 https://qualcoder.wordpress.com/
+https://qualcoder-org.github.io
 https://qualcoder.org/
 """
 
 from copy import deepcopy, copy
 import logging
-import os
+from pathlib import Path
 import qtawesome as qta
 
 from PyQt6 import QtCore, QtGui, QtWidgets
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QBrush
 
-
 from .color_selector import colors, colors_red_weak, colors_red_blind, colors_green_weak, colors_green_blind, TextColor
 from .GUI.ui_dialog_code_colours import Ui_Dialog_code_colors
 from .helpers import init_persistent_tree_header, restore_persistent_tree_widths
 
 
-path = os.path.abspath(os.path.dirname(__file__))
+path = Path(__file__).resolve().parent
 logger = logging.getLogger(__name__)
-
 ROWS = 12
 COLS = 10
 
@@ -88,6 +86,12 @@ class DialogCodeColorScheme(QtWidgets.QDialog):
         self.ui.pushButton_undo.setIcon(qta.icon('mdi6.undo', options=[{'scale_factor': 1.3}]))
         self.ui.pushButton_undo.pressed.connect(self.undo_color_changes)
 
+    def _emit_project_table_changes(self, tables):
+        """Notify other open dialogs about changed project tables."""
+
+        if getattr(self.app, "project_events", None) is not None:
+            self.app.project_events.emit_table_changes(tables, source=self)
+
     def get_codes_and_categories(self):
         """ Called from init, delete category/code, event_filter """
 
@@ -105,6 +109,7 @@ class DialogCodeColorScheme(QtWidgets.QDialog):
         for c in self.original_code_colors:
             cur.execute(sql, [c['color'], c['cid']])
         self.app.conn.commit()
+        self._emit_project_table_changes(['code_name'])
         self.get_codes_and_categories()
         self.perspective_idx = 0
         self.fill_tree()
@@ -137,6 +142,7 @@ class DialogCodeColorScheme(QtWidgets.QDialog):
                     ci.setForeground(0, QBrush(QtGui.QColor(color)))
                     cur.execute(sql, [color_list[i], int(ci.text(1)[4:])])
         self.app.conn.commit()
+        self._emit_project_table_changes(['code_name'])
         self.perspective_idx = 4
         self.change_perspective()
         self.ui.treeWidget.clearSelection()

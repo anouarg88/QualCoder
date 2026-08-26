@@ -14,16 +14,16 @@ See the GNU General Public License for more details.
 You should have received a copy of the GNU Lesser General Public License along with QualCoder.
 If not, see <https://www.gnu.org/licenses/>.
 
-Author: Colin Curtain (ccbogel)
+Authors: Colin Curtain C, Kai Dröge, Justin Missaghieh--Poncet, Lorenzo Salomón
 https://github.com/ccbogel/QualCoder
 https://qualcoder.wordpress.com/
+https://qualcoder-org.github.io
 https://qualcoder.org/
 """
 
 import datetime
-import os
 import logging
-import qtawesome as qta
+import qtawesome as qta  # see: https://pictogrammers.com/library/mdi/
 
 from PyQt6 import QtCore, QtWidgets
 
@@ -33,7 +33,6 @@ from .memo import DialogMemo
 from .GUI.ui_dialog_manage_attributes import Ui_Dialog_manage_attributes
 from .GUI.ui_dialog_assign_attribute import Ui_Dialog_assignAttribute
 
-path = os.path.abspath(os.path.dirname(__file__))
 logger = logging.getLogger(__name__)
 
 
@@ -45,9 +44,6 @@ class DialogManageAttributes(QtWidgets.QDialog):
     CASE_FILE_COLUMN = 1
     VALUETYPE_COLUMN = 2
     MEMO_COLUMN = 3
-    app = None
-    parent_tetEdit = None
-    attributes = []
 
     def __init__(self, app, parent_text_edit):
         self.app = app
@@ -58,6 +54,7 @@ class DialogManageAttributes(QtWidgets.QDialog):
         self.setWindowFlags(self.windowFlags() & ~QtCore.Qt.WindowType.WindowContextHelpButtonHint)
         font = f'font: {self.app.settings["fontsize"]}pt "{self.app.settings["font"]}";'
         self.setStyleSheet(font)
+        self.attributes = []
         self.get_attributes()
         self.fill_table_widget()
         # Initial resize of table columns
@@ -219,7 +216,7 @@ class DialogManageAttributes(QtWidgets.QDialog):
         if row == -1 or col == -1:
             return
         menu = QtWidgets.QMenu()
-        menu.setStyleSheet("QMenu {font-size:" + str(self.app.settings['fontsize']) + "pt} ")
+        menu.setStyleSheet(f"QMenu {{font-size:{self.app.settings['fontsize']}pt}} ")
         text_ = str(self.ui.tableWidget.item(row, col).text())
         action_to_character = None
         if col == 2 and text_ == _("numeric"):

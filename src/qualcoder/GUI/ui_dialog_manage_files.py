@@ -12,9 +12,29 @@ from PyQt6 import QtCore, QtGui, QtWidgets
 class Ui_Dialog_manage_files(object):
     def setupUi(self, Dialog_manage_files):
         Dialog_manage_files.setObjectName("Dialog_manage_files")
-        Dialog_manage_files.resize(805, 538)
+        Dialog_manage_files.resize(901, 538)
         self.gridLayout = QtWidgets.QGridLayout(Dialog_manage_files)
         self.gridLayout.setObjectName("gridLayout")
+        self.groupBox_2 = QtWidgets.QGroupBox(parent=Dialog_manage_files)
+        self.groupBox_2.setMinimumSize(QtCore.QSize(0, 32))
+        self.groupBox_2.setTitle("")
+        self.groupBox_2.setObjectName("groupBox_2")
+        self.lineEdit_search_files = QtWidgets.QLineEdit(parent=self.groupBox_2)
+        self.lineEdit_search_files.setGeometry(QtCore.QRect(0, 0, 260, 28))
+        self.lineEdit_search_files.setMinimumSize(QtCore.QSize(180, 28))
+        self.lineEdit_search_files.setMaximumSize(QtCore.QSize(260, 28))
+        self.lineEdit_search_files.setObjectName("lineEdit_search_files")
+        self.pushButton_clear_filter = QtWidgets.QPushButton(parent=self.groupBox_2)
+        self.pushButton_clear_filter.setGeometry(QtCore.QRect(270, 0, 28, 28))
+        self.pushButton_clear_filter.setMinimumSize(QtCore.QSize(28, 28))
+        self.pushButton_clear_filter.setMaximumSize(QtCore.QSize(28, 28))
+        self.pushButton_clear_filter.setText("")
+        self.pushButton_clear_filter.setObjectName("pushButton_clear_filter")
+        self.label_file = QtWidgets.QLabel(parent=self.groupBox_2)
+        self.label_file.setGeometry(QtCore.QRect(310, 0, 561, 28))
+        self.label_file.setText("")
+        self.label_file.setObjectName("label_file")
+        self.gridLayout.addWidget(self.groupBox_2, 3, 0, 1, 1)
         self.groupBox = QtWidgets.QGroupBox(parent=Dialog_manage_files)
         self.groupBox.setMinimumSize(QtCore.QSize(0, 38))
         self.groupBox.setMaximumSize(QtCore.QSize(16777215, 38))
@@ -102,11 +122,7 @@ class Ui_Dialog_manage_files(object):
         self.tableWidget.setObjectName("tableWidget")
         self.tableWidget.setColumnCount(0)
         self.tableWidget.setRowCount(0)
-        self.gridLayout.addWidget(self.tableWidget, 3, 0, 1, 1)
-        self.label_file = QtWidgets.QLabel(parent=Dialog_manage_files)
-        self.label_file.setText("")
-        self.label_file.setObjectName("label_file")
-        self.gridLayout.addWidget(self.label_file, 2, 0, 1, 1)
+        self.gridLayout.addWidget(self.tableWidget, 4, 0, 1, 1)
 
         self.retranslateUi(Dialog_manage_files)
         QtCore.QMetaObject.connectSlotsByName(Dialog_manage_files)
@@ -126,11 +142,15 @@ class Ui_Dialog_manage_files(object):
         Dialog_manage_files.setTabOrder(self.pushButton_bulk_rename, self.pushButton_undo)
         Dialog_manage_files.setTabOrder(self.pushButton_undo, self.pushButton_delete)
         Dialog_manage_files.setTabOrder(self.pushButton_delete, self.pushButton_help)
-        Dialog_manage_files.setTabOrder(self.pushButton_help, self.tableWidget)
+        Dialog_manage_files.setTabOrder(self.pushButton_help, self.lineEdit_search_files)
+        Dialog_manage_files.setTabOrder(self.lineEdit_search_files, self.pushButton_clear_filter)
+        Dialog_manage_files.setTabOrder(self.pushButton_clear_filter, self.tableWidget)
 
     def retranslateUi(self, Dialog_manage_files):
         _translate = QtCore.QCoreApplication.translate
         Dialog_manage_files.setWindowTitle(_translate("Dialog_manage_files", "Files"))
+        self.lineEdit_search_files.setToolTip(_translate("Dialog_manage_files", "<html><head/><body><p>File name filter</p></body></html>"))
+        self.pushButton_clear_filter.setToolTip(_translate("Dialog_manage_files", "Clear filter"))
         self.pushButton_view.setToolTip(_translate("Dialog_manage_files", "<html><head/><body><p>View file</p></body></html>"))
         self.pushButton_create.setToolTip(_translate("Dialog_manage_files", "<html><head/><body><p>Create a text file</p></body></html>"))
         self.pushButton_export.setToolTip(_translate("Dialog_manage_files", "Export selected file.\n"
@@ -170,13 +190,3 @@ class Ui_Dialog_manage_files(object):
 "For csv and tsv files, please avoid using the following in the column names:  , ; |\n"
 "\n"
 "Surveys with many entries (e.g. more than 1,000) please wait, as importation will be slow."))
-
-
-if __name__ == "__main__":
-    import sys
-    app = QtWidgets.QApplication(sys.argv)
-    Dialog_manage_files = QtWidgets.QDialog()
-    ui = Ui_Dialog_manage_files()
-    ui.setupUi(Dialog_manage_files)
-    Dialog_manage_files.show()
-    sys.exit(app.exec())

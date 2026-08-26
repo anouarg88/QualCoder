@@ -14,70 +14,233 @@ See the GNU General Public License for more details.
 You should have received a copy of the GNU Lesser General Public License along with QualCoder.
 If not, see <https://www.gnu.org/licenses/>.
 
-Author: Colin Curtain (ccbogel)
+Authors: Colin Curtain C, Kai Dröge, Justin Missaghieh--Poncet, Lorenzo Salomón
 https://github.com/ccbogel/QualCoder
 https://qualcoder.wordpress.com/
+https://qualcoder-org.github.io
 https://qualcoder.org/
 """
-
-from charset_normalizer import from_bytes
 import datetime
-import ebooklib
-from ebooklib import epub
-import fitz
+import pymupdf
 import json
-# import logging  # Not needed -> L
 import openpyxl
-# import odf  # This is the package that provides the odf module used by pandas for reading .ods # Not needed -> L
-import os.path
 import pandas as pd
+import platform
 from pathlib import Path
-from pdfminer.converter import PDFPageAggregator
-from pdfminer.layout import LAParams, LTTextLine
-from pdfminer.pdfinterp import PDFResourceManager, PDFPageInterpreter
-from pdfminer.pdfpage import PDFPage
 import PIL
 from PIL import Image
 from PyQt6 import QtCore, QtGui, QtWidgets
+from PyQt6.QtWidgets import QProgressDialog
 import qtawesome as qta  # see: https://pictogrammers.com/library/mdi/
 from random import randint
 import sqlite3
-from typing import Iterable, Any
+import time
+from typing import Any
 from shutil import copyfile, move
 from striprtf.striprtf import rtf_to_text
-from urllib.parse import urlparse
 import webbrowser
 import zipfile
 
+# from .__main__ import App
 from .add_attribute import DialogAddAttribute
 from .add_item_name import DialogAddItemName
-from .code_pdf import DialogCodePdf  # For isinstance update files
+from .code_pdf import DialogCodePdf
+from .pdf_utils import extract_pdf_fulltext, extract_pdf_highlights, \
+    pdf_annotations_to_file_memo, code_pdf_highlights, \
+    pdf_markups_question_text  # Same extractor and word map as the PDF viewer
 from .code_text import DialogCodeText  # for isinstance()
 from .color_selector import colour_ranges, colors
 from .confirm_delete import DialogConfirmDelete
 from .docx import opendocx, getdocumenttext, getdocumenttext_html
 from .edit_textfile import DialogEditTextFile
 from .GUI.ui_dialog_manage_files import Ui_Dialog_manage_files
-from .helpers import ExportDirectoryPathDialog, Message, msecs_to_hours_mins_secs
+from .helpers import ExportDirectoryPathDialog, Message, msecs_to_hours_mins_secs, \
+    extract_epub_fulltext
 from .html_parser import *
+from .latex_import import LatexImportError, tex_file_to_plain_text
 from .memo import DialogMemo
+from .pdf_preview import DialogPdfPagesToImages, DialogPdfPreview
 from .pseudonyms import Pseudonyms
 from .report_codes import DialogReportCodes  # for isInstance()
 from .ris import Ris
 from .select_items import DialogSelectItems
 from .view_av import DialogViewAV
+from .view_av_waveform import waveform_backend_available, generate_waveform_png_async, waveform_colour
 from .code_av import DialogCodeAV  # for isinstance update files
 from .view_image import DialogViewImage, DialogCodeImage  # for isinstance update files
+from .text_decoding import decode_text_with_best_encoding as decode_text_with_best_encoding_helper
 
 # If VLC not installed, it will not crash
 vlc = None
 try:
     import vlc
-except Exception as e:
-    print(e)
+    # if VLC plugins stale: Open folder: Program FilesVideoLAN/VLC/plugins delete plugins.dat to force refresh
+except Exception as e:  # python-vlc missing: Qt backend takes over, no console noise
+    import logging as _logging
+    _logging.getLogger(__name__).debug(f"python-vlc unavailable: {e}")
 
-path = os.path.abspath(os.path.dirname(__file__))
+path = Path(__file__).resolve().parent
+
 logger = logging.getLogger(__name__)
+
+
+
+class FilterHeaderView(QtWidgets.QHeaderView):
+    """
+    Horizontal table header with filter funnel per column.
+    Clicking the funnel emits filter_clicked with the column index.
+    """
+
+    filter_clicked = QtCore.pyqtSignal(int)
+    ICON_SIZE = 15
+    ICON_MARGIN = 4
+
+    def __init__(self, parent=None):
+        super().__init__(QtCore.Qt.Orientation.Horizontal, parent)
+        self.filtered_sections = set()
+        self._pressed_section = None
+        self._icon_active = None  # Lazy: qtawesome needs a running QApplication
+        self._icon_inactive = None
+        self.setSectionsClickable(True)
+        self.setHighlightSections(True)
+
+    def set_filtered_sections(self, sections):
+        """
+        Columns with an active filter show a blue funnel.
+        """
+
+        self.filtered_sections = set(sections)
+        self.viewport().update()
+
+    def sectionSizeFromContents(self, logical_index):
+        # Reserve room for the funnel so resizeColumnsToContents does not clip it
+        size = super().sectionSizeFromContents(logical_index)
+        return QtCore.QSize(size.width() + self.ICON_SIZE + self.ICON_MARGIN * 2, size.height())
+
+    def _icon_rect(self, rect):
+        return QtCore.QRect(rect.right() - self.ICON_SIZE - self.ICON_MARGIN,
+                            rect.top() + (rect.height() - self.ICON_SIZE) // 2,
+                            self.ICON_SIZE, self.ICON_SIZE)
+
+    def paintSection(self, painter, rect, logical_index):
+        painter.save()
+        super().paintSection(painter, rect, logical_index)
+        painter.restore()
+        if rect.width() < self.ICON_SIZE * 2 + self.ICON_MARGIN * 2:
+            return
+        if self._icon_active is None:
+            self._icon_active = qta.icon('mdi6.filter', color='#1e90ff')
+            self._icon_inactive = qta.icon('mdi6.filter-outline', color='#909090')
+        if logical_index in self.filtered_sections:
+            self._icon_active.paint(painter, self._icon_rect(rect))
+        else:
+            self._icon_inactive.paint(painter, self._icon_rect(rect))
+
+    def _section_rect(self, logical_index):
+        return QtCore.QRect(self.sectionViewportPosition(logical_index), 0,
+                            self.sectionSize(logical_index), self.height())
+
+    def _icon_hit(self, pos):
+        idx = self.logicalIndexAt(pos)
+        if idx >= 0 and self._icon_rect(self._section_rect(idx)).contains(pos):
+            return idx
+        return None
+
+    def mousePressEvent(self, event):
+        if event.button() == QtCore.Qt.MouseButton.LeftButton:
+            idx = self._icon_hit(event.position().toPoint())
+            if idx is not None:
+                # Swallow so the click does not select the column
+                self._pressed_section = idx
+                return
+        self._pressed_section = None
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == QtCore.Qt.MouseButton.LeftButton and self._pressed_section is not None:
+            idx = self._icon_hit(event.position().toPoint())
+            if idx == self._pressed_section:
+                self._pressed_section = None
+                self.filter_clicked.emit(idx)
+                return
+        self._pressed_section = None
+        super().mouseReleaseEvent(event)
+
+
+class HeaderFilterPopup(QtWidgets.QFrame):
+    """
+    Value picker for one table column: search box, select all
+    and checkable values. Changes apply immediately via apply_callback(excluded_keys).
+    """
+
+    def __init__(self, parent, keys_labels, excluded, apply_callback):
+        super().__init__(parent, QtCore.Qt.WindowType.Popup)
+        self.apply_callback = apply_callback
+        self._updating = False
+        self.setFrameShape(QtWidgets.QFrame.Shape.StyledPanel)
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(4)
+        self.search = QtWidgets.QLineEdit()
+        self.search.setPlaceholderText(_("Search values"))
+        self.search.setClearButtonEnabled(True)
+        self.search.textChanged.connect(self.search_values)
+        layout.addWidget(self.search)
+        self.checkbox_select_all = QtWidgets.QCheckBox(_("(Select all)"))
+        self.checkbox_select_all.clicked.connect(self.select_all_clicked)
+        layout.addWidget(self.checkbox_select_all)
+        self.list_widget = QtWidgets.QListWidget()
+        for key, label in keys_labels:
+            item = QtWidgets.QListWidgetItem(label)
+            item.setData(QtCore.Qt.ItemDataRole.UserRole, key)
+            item.setFlags(QtCore.Qt.ItemFlag.ItemIsEnabled | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(QtCore.Qt.CheckState.Unchecked if key in excluded
+                               else QtCore.Qt.CheckState.Checked)
+            self.list_widget.addItem(item)
+        self.list_widget.itemChanged.connect(self.item_changed)
+        layout.addWidget(self.list_widget)
+        self.update_select_all_state()
+        self.resize(260, min(420, 92 + self.list_widget.count() * 24))
+
+    def visible_items(self):
+        return [self.list_widget.item(r) for r in range(self.list_widget.count())
+                if not self.list_widget.item(r).isHidden()]
+
+    def search_values(self, text):
+        text = text.lower()
+        for r in range(self.list_widget.count()):
+            item = self.list_widget.item(r)
+            item.setHidden(text != "" and text not in item.text().lower())
+        self.update_select_all_state()
+
+    def select_all_clicked(self, checked):
+        # Applies to the values matching the popup search only
+        state = QtCore.Qt.CheckState.Checked if checked else QtCore.Qt.CheckState.Unchecked
+        self._updating = True
+        for item in self.visible_items():
+            item.setCheckState(state)
+        self._updating = False
+        self.apply_excluded()
+
+    def item_changed(self, item):
+        if self._updating:
+            return
+        self.apply_excluded()
+
+    def update_select_all_state(self):
+        items = self.visible_items()
+        all_checked = bool(items) and all(
+            item.checkState() == QtCore.Qt.CheckState.Checked for item in items)
+        self.checkbox_select_all.blockSignals(True)
+        self.checkbox_select_all.setChecked(all_checked)
+        self.checkbox_select_all.blockSignals(False)
+
+    def apply_excluded(self):
+        self.update_select_all_state()
+        excluded = {self.list_widget.item(r).data(QtCore.Qt.ItemDataRole.UserRole)
+                    for r in range(self.list_widget.count())
+                    if self.list_widget.item(r).checkState() != QtCore.Qt.CheckState.Checked}
+        self.apply_callback(excluded)
 
 
 class DialogManageFiles(QtWidgets.QDialog):
@@ -103,12 +266,12 @@ class DialogManageFiles(QtWidgets.QDialog):
         self.rows_hidden = []  # For save display profile, as column_name \t operator \t value
         self.source = []  # Dictionaries of source files
         self.header_labels = []
-        self.default_import_directory = os.path.expanduser("~")
-        self.attribute_names = []  # list of dictionary name:value for AddAtribute dialog
+        self.default_import_directory = str(Path.home())
+        self.attribute_names = []  # list of dictionary name:value for AddAttribute dialog
         self.attribute_labels_ordered = []  # helps with filling table data
         self.files_renamed = []  # list of dictionaries of old and new names and fid
-        self.pdf_page_text = ""  # Used when loading pdf text
         self.clipboard_text = ""  # Used to copy text into another cell
+        self.pdf_import_code_highlights = None  # Per-batch tri-state: code PDF highlight annotations as codings
         QtWidgets.QDialog.__init__(self)
         self.ui = Ui_Dialog_manage_files()
         self.ui.setupUi(self)
@@ -129,7 +292,7 @@ class DialogManageFiles(QtWidgets.QDialog):
         self.ui.pushButton_import.setIcon(qta.icon('mdi6.file-document-plus-outline', options=[{'scale_factor': 1.4}]))
         self.ui.pushButton_import.clicked.connect(self.import_files)
         self.ui.pushButton_import_survey.setIcon(qta.icon('mdi6.clipboard-text-outline', options=[{'scale_factor': 1.4}]))
-        self.ui.pushButton_import_survey.clicked.connect(self.import_survey)        
+        self.ui.pushButton_import_survey.clicked.connect(self.import_survey) 
         self.ui.pushButton_link.setIcon(qta.icon('mdi6.link-variant', options=[{'scale_factor': 1.4}]))
         self.ui.pushButton_link.clicked.connect(self.link_files)
         self.ui.pushButton_import_from_linked.setIcon(
@@ -160,6 +323,14 @@ class DialogManageFiles(QtWidgets.QDialog):
         self.ui.pushButton_bulk_rename.clicked.connect(self.bulk_rename_database_entry)
         self.ui.pushButton_help.setIcon(qta.icon('mdi6.help'))
         self.ui.pushButton_help.pressed.connect(self.help)
+        self.ui.pushButton_clear_filter.setIcon(qta.icon('mdi6.filter-off-outline', options=[{'scale_factor': 1.3}]))
+        self.ui.pushButton_clear_filter.pressed.connect(self.clear_file_filter)
+        self.ui.pushButton_clear_filter.setToolTip(_("Clear filter"))
+        self.ui.pushButton_clear_filter.setVisible(False)  # hidden until a filter is active
+        self.ui.lineEdit_search_files.setToolTip(_("File name filter"))
+        self.ui.lineEdit_search_files.setPlaceholderText(_("Search files"))
+        self.ui.lineEdit_search_files.textChanged.connect(self.apply_file_filter)
+        self.setup_header_filters()
         self.ui.tableWidget.setTabKeyNavigation(False)
         self.ui.tableWidget.itemChanged.connect(self.cell_modified)
         self.ui.tableWidget.cellClicked.connect(self.cell_selected)
@@ -195,8 +366,8 @@ class DialogManageFiles(QtWidgets.QDialog):
         except (TypeError, ValueError):
             return None
 
-    def _restore_current_source(self, source_id):
-        """Restore the current table selection for one source id when possible."""
+    def _restore_current_source(self, source_id:int|None):
+        """ Restore the current table selection for one source id when possible."""
 
         if source_id is None:
             return
@@ -225,6 +396,339 @@ class DialogManageFiles(QtWidgets.QDialog):
     def help(self):
         """ Open help for transcribe section in browser. """
         self.app.help_wiki("3.2.-Files")
+
+    FILE_TYPE_KEYS = ("text", "pdf", "image", "audio", "video")
+    PLAIN_TEXT_KEY = "__plain__"
+    NO_DATE_KEY = "__nodate__"
+    NO_CASE_KEY = "__nocase__"
+
+    def setup_header_filters(self):
+        """
+        Install the filter header on the file table.
+        """
+
+        self.header_filters = {}  # Header label -> set of excluded value keys
+        self.header_filter_popup = None
+        self.filter_header = FilterHeaderView(self.ui.tableWidget)
+        self.ui.tableWidget.setHorizontalHeader(self.filter_header)
+        self.filter_header.filter_clicked.connect(self.show_header_filter_popup)
+        self.filter_header.setVisible(True)
+
+    BASE_COLUMN_KEYS = {0: "name", 1: "memo", 2: "date", 3: "id", 4: "case"}
+
+    def column_filter_key(self, col):
+        """
+        Stable key of one column for the header_filters dict.
+        Base columns use fixed keys, attribute columns use 'attr:' + name,
+        so a translated UI or an attribute named like a base column cannot clash.
+        """
+
+        if col in self.BASE_COLUMN_KEYS:
+            return self.BASE_COLUMN_KEYS[col]
+        att_pos = col - self.ATTRIBUTE_START_COLUMN
+        if 0 <= att_pos < len(self.attribute_labels_ordered):
+            return "attr:" + self.attribute_labels_ordered[att_pos]
+        return None
+
+    def column_of_filter_key(self, key):
+        """
+        Column index of one filter key, or None when the column is gone.
+        """
+
+        for col, base_key in self.BASE_COLUMN_KEYS.items():
+            if key == base_key:
+                return col
+        if key.startswith("attr:"):
+            name = key[5:]
+            if name in self.attribute_labels_ordered:
+                return self.ATTRIBUTE_START_COLUMN + self.attribute_labels_ordered.index(name)
+        return None
+
+    def header_filter_keys_of(self, data, col):
+        """
+        Filter keys of one source for one column.
+        The name column filters by file type and extension, matching its icon.
+        """
+
+        if col == self.NAME_COLUMN:
+            return [f"type\t{self.file_type_of(data)}", f"ext\t{self.file_ext_of(data)}"]
+        if col == self.MEMO_COLUMN:
+            return ["memo" if data['memo'] != "" else ""]
+        if col == self.DATE_COLUMN:
+            return [self.file_date_of(data)]
+        if col == self.ID_COLUMN:
+            return [str(data['id'])]
+        if col == self.CASE_COLUMN:
+            return sorted(self.file_cases_of(data))
+        att_pos = col - self.ATTRIBUTE_START_COLUMN
+        if 0 <= att_pos < len(data['attributes']):
+            return [data['attributes'][att_pos]]
+        return []
+
+    def row_matches_column(self, data, col, excluded):
+        """
+        True when the header filter of one column keeps this file visible.
+        """
+
+        keys = self.header_filter_keys_of(data, col)
+        if not keys:
+            return True
+        if col == self.CASE_COLUMN:
+            # A file in several cases stays visible while any of them is checked
+            return not set(keys).issubset(excluded)
+        return not any(key in excluded for key in keys)
+
+    def row_passes_filters(self, row, data, skip_col=None):
+        """
+        True when the search text, the header filters (except skip_col) and
+        the context menu / loaded display criteria keep this row visible.
+        """
+
+        search = self.ui.lineEdit_search_files.text().lower()
+        if search and search not in data['name'].lower():
+            return False
+        for key, excluded in self.header_filters.items():
+            if not excluded:
+                continue
+            col = self.column_of_filter_key(key)
+            if col is None or col == skip_col:
+                continue
+            if not self.row_matches_column(data, col, excluded):
+                return False
+        return not self.row_hidden_by_criteria(row)
+
+    def header_filter_options(self, col):
+        """
+        (key, label) options for one column popup: distinct
+        values from the rows that pass the search and every other column filter.
+        """
+
+        sources = [data for row, data in enumerate(self.source)
+                   if self.row_passes_filters(row, data, skip_col=col)]
+        if col == self.NAME_COLUMN:
+            type_labels = {'text': _("Text"), 'pdf': _("PDF"), 'image': _("Image"),
+                           'audio': _("Audio"), 'video': _("Video")}
+            present = {self.file_type_of(s) for s in sources}
+            options = [(f"type\t{key}", type_labels[key]) for key in self.FILE_TYPE_KEYS
+                       if key in present]
+            exts = {self.file_ext_of(s) for s in sources}
+            if self.PLAIN_TEXT_KEY in exts:
+                options.append((f"ext\t{self.PLAIN_TEXT_KEY}", _("Plain text")))
+            options += [(f"ext\t{ext}", ext) for ext in sorted(exts - {self.PLAIN_TEXT_KEY})]
+            return options
+        if col == self.MEMO_COLUMN:
+            keys = {self.header_filter_keys_of(s, col)[0] for s in sources}
+            options = []
+            if "memo" in keys:
+                options.append(("memo", _("Memo")))
+            if "" in keys:
+                options.append(("", _("No memo")))
+            return options
+        if col == self.DATE_COLUMN:
+            dates = {self.file_date_of(s) for s in sources}
+            options = [(d, d) for d in sorted(dates - {self.NO_DATE_KEY}, reverse=True)]
+            if self.NO_DATE_KEY in dates:
+                options.append((self.NO_DATE_KEY, _("No date")))
+            return options
+        if col == self.ID_COLUMN:
+            ids = {str(s['id']) for s in sources}
+            return [(id_, id_) for id_ in sorted(ids, key=lambda v: int(v) if v.isdigit() else 0)]
+        if col == self.CASE_COLUMN:
+            names = {name for s in sources for name in self.file_cases_of(s)}
+            options = [(name, name) for name in sorted(names - {self.NO_CASE_KEY})]
+            if self.NO_CASE_KEY in names:
+                options.append((self.NO_CASE_KEY, _("No case")))
+            return options
+        att_pos = col - self.ATTRIBUTE_START_COLUMN
+        values = sorted({s['attributes'][att_pos] for s in sources
+                         if 0 <= att_pos < len(s['attributes'])})
+        options = []
+        for value in values:
+            label = value.replace("\n", "; ") if value != "" else _("(no value)")
+            if len(label) > 40:
+                label = label[:40] + "..."
+            options.append((value, label))
+        return options
+
+    def show_header_filter_popup(self, col):
+        """
+        Open the value picker under the clicked header section.
+        """
+
+        filter_key = self.column_filter_key(col)
+        if filter_key is None:
+            return
+        options = self.header_filter_options(col)
+        excluded = self.header_filters.get(filter_key, set())
+        self.header_filter_popup = HeaderFilterPopup(
+            self, options, excluded, lambda excl, key=filter_key: self.set_header_filter(key, excl))
+        x = self.filter_header.sectionViewportPosition(col)
+        pos = self.filter_header.viewport().mapToGlobal(QtCore.QPoint(x, self.filter_header.height()))
+        screen = self.screen().availableGeometry()
+        pos.setX(max(screen.left(), min(pos.x(), screen.right() - self.header_filter_popup.width())))
+        self.header_filter_popup.move(pos)
+        self.header_filter_popup.show()
+
+    def set_header_filter(self, filter_key, excluded):
+        """
+        Store the excluded value keys of one column and re-apply the filter.
+        """
+
+        if excluded:
+            self.header_filters[filter_key] = set(excluded)
+        else:
+            self.header_filters.pop(filter_key, None)
+        self.update_header_filter_icons()
+        self.apply_file_filter()
+
+    def update_header_filter_icons(self):
+        """
+        Blue funnel on the columns with an active filter.
+        """
+
+        sections = {self.column_of_filter_key(key) for key in self.header_filters}
+        self.filter_header.set_filtered_sections(sections - {None})
+
+    def prune_header_filters(self):
+        """ After a reload, drop filters of removed columns and of values no
+        longer present, so the funnel icons stay truthful. """
+
+        pruned = {}
+        for filter_key, excluded in self.header_filters.items():
+            col = self.column_of_filter_key(filter_key)
+            if col is None:
+                continue
+            all_keys = {key for data in self.source
+                        for key in self.header_filter_keys_of(data, col)}
+            keep = excluded & all_keys
+            if keep:
+                pruned[filter_key] = keep
+        self.header_filters = pruned
+        self.update_header_filter_icons()
+
+    def file_type_of(self, data):
+        """
+        Derive the file type key for one source diccionario
+        """
+
+        mediapath = data['mediapath'] or ""
+        if mediapath[:7] == "/audio/" or mediapath[:6] == "audio:":
+            return "audio"
+        if mediapath[:7] == "/video/" or mediapath[:6] == "video:":
+            return "video"
+        if mediapath[:8] == "/images/" or mediapath[:7] == "images:":
+            return "image"
+        if data['name'].lower().endswith(".pdf"):
+            return "pdf"
+        return "text"
+
+    def file_ext_of(self, data):
+        """
+        Lowercased name extension, or the plain text key when there is none.
+        """
+
+        suffix = Path(data['name']).suffix.lower()
+        return suffix if suffix else self.PLAIN_TEXT_KEY
+
+    def file_date_of(self, data):
+        """
+        Date portion (yyyy-mm-dd) of the source date, or the no date key.
+        """
+
+        date_ = (data['date'] or "")[:10]
+        return date_ if date_ else self.NO_DATE_KEY
+
+    def file_cases_of(self, data):
+        """
+        Set of case names the file belongs to, or the no case key.
+        """
+
+        names = {name for name in (data['case'] or "").split(";") if name}
+        return names if names else {self.NO_CASE_KEY}
+
+
+    def file_filter_active(self):
+        """
+        True when the search text or a header column filter restricts the table.
+        """
+
+        if self.ui.lineEdit_search_files.text() != "":
+            return True
+        return any(self.header_filters.values())
+
+    def row_hidden_by_criteria(self, row):
+        """
+        True when a rows_hidden criterion (context menu or loaded display) hides this row.
+        Criteria are 'colname \t operator \t value'; unknown columns are skipped.
+        """
+
+        for criterion in self.rows_hidden:
+            try:
+                colname, operator, value = criterion.split("\t")
+            except ValueError:
+                continue
+            col_idx = None
+            for c in range(self.ui.tableWidget.columnCount()):
+                if self.ui.tableWidget.horizontalHeaderItem(c).text() == colname:
+                    col_idx = c
+                    break
+            if col_idx is None:
+                continue
+            item = self.ui.tableWidget.item(row, col_idx)
+            text_ = item.text() if item is not None else ""
+            if operator == "like" and text_.find(value) == -1:
+                return True
+            if operator == "=" and text_ != value:
+                return True
+            if operator == "hide" and text_.find(value) != -1:
+                return True
+        return False
+
+    def apply_file_filter(self):
+        """
+        Hide rows not matching the search text, the header column filters and
+        any context menu / loaded display criteria. Hidden rows are deselected
+        so selection based actions only act on visible rows.
+        """
+
+        active = self.file_filter_active()
+        selection_model = self.ui.tableWidget.selectionModel()
+        for row, data in enumerate(self.source):
+            if row >= self.ui.tableWidget.rowCount():
+                break
+            self.ui.tableWidget.setRowHidden(row, not self.row_passes_filters(row, data))
+        if selection_model is not None:
+            for index in selection_model.selectedIndexes():
+                if self.ui.tableWidget.isRowHidden(index.row()):
+                    selection_model.select(index, QtCore.QItemSelectionModel.SelectionFlag.Deselect)
+        if active:
+            self.ui.pushButton_clear_filter.setVisible(True)
+            self.ui.pushButton_clear_filter.setStyleSheet("background-color: #1e90ff; color: white;")
+        else:
+            self.ui.pushButton_clear_filter.setVisible(False)
+            self.ui.pushButton_clear_filter.setStyleSheet("")
+        self.update_label_file_count()
+
+    def visible_selected_rows(self):
+        """
+        Selected row numbers excluding rows hidden by any filter
+        """
+
+        rows = {index.row() for index in self.ui.tableWidget.selectionModel().selectedIndexes()}
+        return sorted(r for r in rows if not self.ui.tableWidget.isRowHidden(r))
+
+    def clear_file_filter(self):
+        """
+        Reset the search text and every header column filter. Context menu
+        criteria in rows_hidden stay applied; Ctrl+A or Show all rows clears those
+        """
+
+        self.ui.lineEdit_search_files.blockSignals(True)
+        self.ui.lineEdit_search_files.clear()
+        self.ui.lineEdit_search_files.blockSignals(False)
+        self.header_filters = {}
+        self.update_header_filter_icons()
+        self.apply_file_filter()
 
     def pseudonyms(self):
         """ Pseudonymisation, data de-identification.
@@ -321,8 +825,7 @@ class DialogManageFiles(QtWidgets.QDialog):
         self.rows_hidden = []
         for rpl in row_parameters_list:
             self.rows_hidden.append(rpl)
-        # Convert the column name to its header index
-        col_index_parameters_list = []
+        # Warn about criteria whose column no longer exists
         if row_parameters_list:
             msg += _("Row settings:") + "\n"
         warning = ""
@@ -332,7 +835,6 @@ class DialogManageFiles(QtWidgets.QDialog):
             found = False
             for c in range(0, self.ui.tableWidget.columnCount()):
                 if self.ui.tableWidget.horizontalHeaderItem(c).text() == colname:
-                    col_index_parameters_list.append({'col_idx': c, 'operator': operator, 'value': value})
                     found = True
                     break
             if not found:
@@ -340,19 +842,8 @@ class DialogManageFiles(QtWidgets.QDialog):
         if warning:
             Message(self.app, _("Table column not present"), warning).exec()
 
-        # Now hide the rows
-        for row in range(0, self.ui.tableWidget.rowCount()):
-            self.ui.tableWidget.setRowHidden(row, False)
-        for param in col_index_parameters_list:
-            for r in range(0, self.ui.tableWidget.rowCount()):
-                if param['operator'] == 'like' and self.ui.tableWidget.item(r, param['col_idx']).text().find(
-                        param['value']) == -1:
-                    self.ui.tableWidget.setRowHidden(r, True)
-                if param['operator'] == '=' and self.ui.tableWidget.item(r, param['col_idx']).text() != param['value']:
-                    self.ui.tableWidget.setRowHidden(r, True)
-                if param['operator'] == 'hide' and self.ui.tableWidget.item(r, param['col_idx']).text().find(
-                        param['value']) != -1:
-                    self.ui.tableWidget.setRowHidden(r, True)
+        # Now hide the rows, combined with any active toolbar filter
+        self.apply_file_filter()
         self.ui.pushButton_display_load.setToolTip(msg)
 
     def table_display_delete(self):
@@ -438,9 +929,8 @@ class DialogManageFiles(QtWidgets.QDialog):
             key = event.key()
             mod = event.modifiers()
             if key == QtCore.Qt.Key.Key_A and mod == QtCore.Qt.KeyboardModifier.ControlModifier:
-                for r in range(0, self.ui.tableWidget.rowCount()):
-                    self.ui.tableWidget.setRowHidden(r, False)
                 self.rows_hidden = []
+                self.clear_file_filter()
                 return True
             if key == QtCore.Qt.Key.Key_Delete and self.ui.tableWidget.currentColumn() == 0:
                 self.delete()
@@ -500,8 +990,8 @@ class DialogManageFiles(QtWidgets.QDialog):
         else:
             item_text = cell.text()
         # Use these next few lines to use for moving a linked file into or an internal file out of the project folder
-        mediapath = None
-        risid = None
+        mediapath:str|None = None
+        risid:int|None = None
         try:
             id_ = int(self.ui.tableWidget.item(row, self.ID_COLUMN).text())
         except AttributeError:
@@ -511,17 +1001,29 @@ class DialogManageFiles(QtWidgets.QDialog):
             if s['id'] == id_:
                 mediapath = s['mediapath']
                 risid = s['risid']
+        # Check and get all selected indexes
+        selected_indexes = self.ui.tableWidget.selectionModel().selectedIndexes()
         # Action cannot be None otherwise may default to one of the actions below depending on column clicked
         menu = QtWidgets.QMenu()
         menu.setStyleSheet(f"QMenu {{font-size:{self.app.settings['fontsize']}pt}} ")
         action_view = menu.addAction(_("View"))
+        # Import a transcription from an external file (e.g. a noScribe .txt or .html export)
+        # into the empty .txt transcription auto-created for an audio/video file.
+        action_import_transcription = None
+        if mediapath is not None and len(mediapath) > 5 and \
+                mediapath[:6] in ("/audio", "audio:", "/video", "video:"):
+            action_import_transcription = menu.addAction(_("Import transcription from file"))
         action_view_original_text = None
         action_pdf_to_images = None
+        action_extract_pdf_text = None
         if mediapath is not None and len(mediapath) > 6 and (mediapath[:6] == '/docs/' or mediapath[:5] == 'docs:'):
             action_view_original_text = menu.addAction(_("View original text file"))
         if mediapath is not None and len(mediapath) > 6 and (mediapath[:6] == '/docs/' or mediapath[:5] == 'docs:') \
                 and mediapath[-4:].lower() == ".pdf":
             action_pdf_to_images = menu.addAction(_("Pdf pages to images"))
+            # Editable copy of the PDF text as a new text source: the stored fulltext
+            # of a PDF is not editable, this copy is the way to edit its text.
+            action_extract_pdf_text = menu.addAction(_("Extract pdf text to new file"))
         action_filename_asc = None
         action_filename_desc = None
         action_type = None
@@ -540,7 +1042,7 @@ class DialogManageFiles(QtWidgets.QDialog):
         if col == self.CASE_COLUMN:
             action_casename_asc = menu.addAction(_("Order ascending"))
             action_casename_desc = menu.addAction(_("Order descending"))
-            action_assign_case = menu.addAction(_("Assign case to file"))
+            action_assign_case = menu.addAction(_("Assign files to case"))
         action_show_values_like = None
         action_hide_values_like = None
         if col != self.MEMO_COLUMN:
@@ -552,6 +1054,7 @@ class DialogManageFiles(QtWidgets.QDialog):
         action_date_picker = None
         action_ref_apa = None
         action_ref_vancouver = None
+        action_multiple_cells_value = None
         if col > self.CASE_COLUMN:
             action_order_by_value_asc = menu.addAction(_("Order ascending"))
             action_order_by_value_desc = menu.addAction(_("Order descending"))
@@ -566,6 +1069,8 @@ class DialogManageFiles(QtWidgets.QDialog):
             if self.header_labels[col] in ("Ref_Authors", "Ref_Title", "Ref_Journal", "Ref_Type", "Ref_Year"):
                 action_ref_apa = menu.addAction(_("Copy reference to clipboard. APA"))
                 action_ref_vancouver = menu.addAction(_("Copy reference to clipboard. Vancouver"))
+            if len(selected_indexes) > 1:
+                action_multiple_cells_value = menu.addAction(_("Set value of selected cells"))
         action_rename = None
         action_export = None
         action_delete = None
@@ -588,14 +1093,22 @@ class DialogManageFiles(QtWidgets.QDialog):
         if self.rows_hidden:
             action_show_all = menu.addAction(_("Show all rows Ctrl A"))
         action_url = None
-        url_test = urlparse(item_text)
-        if all([url_test.scheme, url_test.netloc]):
+        # Regex HTTP HTTPS protocol
+        regex_http = QtCore.QRegularExpression(
+            r"^https?:\/\/(?:www\.)?[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,63}\b(?:[-a-zA-Z0-9()@:%_\+.~#?&\/=]*)$")
+        # Regex Protocol optional
+        regex_no_protocol = QtCore.QRegularExpression(r"^www\.[a-zA-Z0-9()]{1,63}\b(?:[-a-zA-Z0-9()@:%_\+.~#?&\/=]*)$")
+        if regex_no_protocol.match(item_text).hasMatch() or regex_http.match(item_text).hasMatch():
             action_url = menu.addAction(_("Open URL"))
+
         action = menu.exec(self.ui.tableWidget.mapToGlobal(position))
         if action is None:
             return
         if action == action_view:
             self.view()
+            return
+        if action == action_import_transcription:
+            self.import_transcription_from_file(id_)
             return
         if action == action_view_original_text:
             bad_link = bad_link = self.app.check_bad_file_links(id_)  # List is returned
@@ -610,8 +1123,13 @@ class DialogManageFiles(QtWidgets.QDialog):
         if action == action_pdf_to_images:
             self.pdf_to_images(mediapath)
             return
+        if action == action_extract_pdf_text:
+            self.extract_pdf_text_copy(row)
+            return
         if self.av_dialog_open is not None:
-            self.av_dialog_open.mediaplayer.stop()
+            # Guard: a dialog that failed mid-init can leave mediaplayer as None
+            if getattr(self.av_dialog_open, 'mediaplayer', None) is not None:
+                self.av_dialog_open.mediaplayer.stop()
             self.av_dialog_open = None
             return
         if action == action_import_linked:
@@ -625,7 +1143,7 @@ class DialogManageFiles(QtWidgets.QDialog):
         if action == action_rename:
             self.rename_database_entry()
         if action == action_assign_case:
-            self.assign_case_to_file()
+            self.assign_cases_to_file()
         if action == action_filename_asc:
             self.load_file_data()
         if action == action_filename_desc:
@@ -648,39 +1166,26 @@ class DialogManageFiles(QtWidgets.QDialog):
             # Hide rows that do not match this value
             item_to_compare = self.ui.tableWidget.item(row, col)
             compare_text = item_to_compare.text()
-            for r in range(0, self.ui.tableWidget.rowCount()):
-                item = self.ui.tableWidget.item(r, col)
-                text_ = item.text()
-                if compare_text != text_:
-                    self.ui.tableWidget.setRowHidden(r, True)
             self.rows_hidden.append(f'{self.ui.tableWidget.horizontalHeaderItem(col).text()}\t=\t{compare_text}')
-            self.update_label_file_count()  # REMOVE ALL label_fcount REFERENCES
+            self.apply_file_filter()
             return
         if action == action_show_values_like:
             text_value, ok = QtWidgets.QInputDialog.getText(self, _("Text filter"), _("Show values like:"),
                                                             QtWidgets.QLineEdit.EchoMode.Normal)
-            self.rows_hidden.append(f'{self.ui.tableWidget.horizontalHeaderItem(col).text()}\tlike\t{text_value}')
             if ok and text_value != '':
-                for r in range(0, self.ui.tableWidget.rowCount()):
-                    if self.ui.tableWidget.item(r, col).text().find(text_value) == -1:
-                        self.ui.tableWidget.setRowHidden(r, True)
-            self.update_label_file_count()
+                self.rows_hidden.append(f'{self.ui.tableWidget.horizontalHeaderItem(col).text()}\tlike\t{text_value}')
+                self.apply_file_filter()
             return
         if action == action_hide_values_like:
             text_value, ok = QtWidgets.QInputDialog.getText(self, _("Text filter"), _("Hide values like:"),
                                                             QtWidgets.QLineEdit.EchoMode.Normal)
-            self.rows_hidden.append(f'{self.ui.tableWidget.horizontalHeaderItem(col).text()}\thide\t{text_value}')
             if ok and text_value != '':
-                for r in range(0, self.ui.tableWidget.rowCount()):
-                    if self.ui.tableWidget.item(r, col).text().find(text_value) != -1:
-                        self.ui.tableWidget.setRowHidden(r, True)
-            self.update_label_file_count()
+                self.rows_hidden.append(f'{self.ui.tableWidget.horizontalHeaderItem(col).text()}\thide\t{text_value}')
+                self.apply_file_filter()
             return
         if action == action_show_all:
-            for r in range(0, self.ui.tableWidget.rowCount()):
-                self.ui.tableWidget.setRowHidden(r, False)
             self.rows_hidden = []
-            self.update_label_file_count()
+            self.apply_file_filter()
             self.ui.pushButton_display_load.setToolTip(_("Load table display settings"))
             return
         if action == action_url:
@@ -714,8 +1219,62 @@ class DialogManageFiles(QtWidgets.QDialog):
             cb.setText(vancouver[0]['vancouver'].replace("\n", " "))
         if action == action_mark_speakers:
             self.mark_speakers()
+        if action == action_multiple_cells_value:
+            self.multiple_cells_value()
 
-    def update_file_path(self, id_, bad_link):
+    def multiple_cells_value(self):
+        """ Assign a value to all selected cells.
+         If column > CASE_COLUMN. """
+
+        value, ok = QtWidgets.QInputDialog.getText(self, _("Selected cells"), _("Set value:"),
+                                                        QtWidgets.QLineEdit.EchoMode.Normal)
+        if not ok: return
+        msg = ""
+        value = value.strip()
+        selected_indexes = self.ui.tableWidget.selectionModel().selectedIndexes()
+        for i in selected_indexes:
+            col, row =  i.column(), i.row()
+            if self.ui.tableWidget.isRowHidden(row):
+                continue
+            # Check if cell it an editable attribute
+            if col > self.CASE_COLUMN and self.header_labels[col] not in ("Ref_Authors", "Ref_Journal","Ref_Title","Ref_Type","Ref_Year"):
+                try:
+                    prev_value = str(self.ui.tableWidget.item(row, col).text()).strip()
+                except AttributeError:
+                    prev_value = ""
+                attribute_name = self.header_labels[col]
+                cur = self.app.conn.cursor()
+                # Check numeric for numeric attributes, clear "" if it cannot be cast
+                cur.execute("select valuetype from attribute_type where caseOrFile='file' and name=?",
+                            (attribute_name,))
+                result = cur.fetchone()
+                if result is None:
+                    return
+                if result[0] == "numeric" and value != "":
+                    try:
+                        float(value)
+                    except ValueError:
+                        value = prev_value
+                        msg = _("Value must be numeric")
+                cur.execute("update attribute set value=? where id=? and name=? and attr_type='file'",
+                            (value, self.source[row]['id'], attribute_name))
+                item = QtWidgets.QTableWidgetItem(value)
+                self.ui.tableWidget.blockSignals(True)  # Otherwise, cell_modified() is called
+                self.ui.tableWidget.setItem(row,col, item)
+                self.ui.tableWidget.blockSignals(False)
+                # Keep the loaded sources in sync for the header filters
+                att_pos = col - self.ATTRIBUTE_START_COLUMN
+                if 0 <= att_pos < len(self.source[row]['attributes']):
+                    self.source[row]['attributes'][att_pos] = value
+            self.app.conn.commit()
+        self._emit_project_table_changes(["attribute"])
+        if self.file_filter_active():
+            # An edited value may now be excluded by a header filter
+            self.apply_file_filter()
+        if msg != "":
+            Message(self.app, _("Value error"), msg).exec()
+
+    def update_file_path(self, id_: int, bad_link: dict[str, Any]):
         """ Update the File Not Found file path to another path.
          Args:
              id_ : Integer source.id
@@ -739,45 +1298,137 @@ class DialogManageFiles(QtWidgets.QDialog):
             self.load_file_data()
             self.app.delete_backup = False
             self.update_files_in_dialogs()
+            self._emit_project_table_changes(['source'])
 
-    def pdf_to_images(self, mediapath):
-        """ Turn pdf to an image for each page. """
+    def extract_pdf_text_copy(self, row:int):
+        """ Creates a new TEXT source with a copy of the PDF's fulltext (the one already
+        extracted and stored at import, no re-extraction). The stored fulltext of a
+        PDF is not editable, so this copy is the way to work with and edit its text,
+        without touching the PDF's fulltext or breaking the page mapping.
+        Args:
+            row: table row of the pdf source, Integer
+        """
 
-        filepath = ""
-        filename = ""
-        if mediapath[:6] == '/docs/':
-            filepath = os.path.join(self.app.project_path, "documents", mediapath[6:])
-            filename = mediapath[6:]
-        if mediapath[:5] == 'docs:':
-            filepath = mediapath[5:]
-            filename = os.path.split(filepath)[1]
-        if filepath == "" or filename == "":
+        cur = self.app.conn.cursor()
+        cur.execute("select name, fulltext from source where id=?", [self.source[row]['id']])
+        res = cur.fetchone()
+        if res is None:
             return
-
-        fitz_pdf = fitz.open(filepath)  # Use pymupdf to get page image
-        for i in range(len(fitz_pdf)):
-            fitz_page = fitz_pdf.load_page(i)
-            # fitz_page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)  # Do not touch images
-            pymypdf_pixmap = fitz_page.get_pixmap()
-            image_filename = filename + f"_p{i + 1}.jpg"
-            # Not using os.path.join. Other methods 'might' look for the forward slash.
-            destination = f"{self.app.project_path}/images/{image_filename}"
-            # print(destination)
-            pymypdf_pixmap.save(destination)
-            self.load_media_reference(f"/images/{image_filename}")
-            self.parent_text_edit.append(_("Image loaded from pdf: ") + image_filename)
+        fulltext = res[1] if res[1] is not None else ""
+        if fulltext.strip() == "":
+            Message(self.app, _("Extract pdf text"),
+                    _("This PDF has no stored text (scanned PDF?)."), "warning").exec()
+            return
+        # Unique name: name.pdf.txt, with _n suffix if it already exists.
+        base_name = res[0] + ".txt"
+        new_name = base_name
+        existing_names = {s['name'] for s in self.source}
+        n = 1
+        while new_name in existing_names:
+            new_name = f"{res[0]}_{n}.txt"
+            n += 1
+        now_ = datetime.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
+        entry = {'name': new_name, 'id': -1, 'fulltext': fulltext, 'mediapath': None,
+                 'memo': _("Text extracted from pdf: ") + res[0],
+                 'owner': self.app.settings['codername'], 'date': now_, 'risid': None}
+        cur.execute("insert into source(name,fulltext,mediapath,memo,owner,date) values(?,?,?,?,?,?)",
+                    (entry['name'], entry['fulltext'], entry['mediapath'], entry['memo'],
+                     entry['owner'], entry['date']))
+        self.app.conn.commit()
+        cur.execute("select last_insert_rowid()")
+        id_ = cur.fetchone()[0]
+        entry['id'] = id_
+        # File attribute placeholders, as in create_text_file.
+        cur.execute('select name from attribute_type where caseOrFile ="file"')
+        attr_types = cur.fetchall()
+        insert_sql = "insert into attribute (name, attr_type, value, id, date, owner) values(?,'file','',?,?,?)"
+        for a in attr_types:
+            cur.execute(insert_sql, [a[0], id_, now_, self.app.settings['codername']])
+        self.app.conn.commit()
+        if self.app.settings['ai_enable'] == 'True':
+            self.app.ai.sources_vectorstore.import_document(id_, entry['name'], entry['fulltext'])
+        self.parent_text_edit.append(_("Text extracted from pdf to new file: ") + new_name)
         self.load_file_data()
         self.fill_table()
         self.app.delete_backup = False
         self.update_files_in_dialogs()
+        self._emit_project_table_changes(['source', 'attribute'])
 
-    def view_original_text_file(self, mediapath):
+    def pdf_to_images(self, mediapath:str):
+        """ Turn pdf pages into an image for each page.
+        With a page range dialog, preview and resolution; skips duplicate names
+        without per-page modal warnings, shows progress and closes the document
+        (the handle previously stayed open).
+        Args:
+            mediapath : String
+        """
+
+        filepath = ""
+        filename = ""
+        pages_imported = 0
+        if mediapath[:6] == '/docs/':
+            filepath = Path(self.app.project_path) / "documents" / mediapath[6:]
+            filename = mediapath[6:]
+        if mediapath[:5] == 'docs:':
+            filepath = mediapath[5:]
+            filename = Path(filepath).name
+        if filepath == "" or filename == "":
+            return
+        ui = DialogPdfPagesToImages(self.app, filepath, filename, self)
+        if ui.total_pages == 0:
+            Message(self.app, _("Image Error"), _("Cannot open: ") + filepath, "warning").exec()
+            return
+        if ui.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+        page_from, page_to, dpi = ui.get_range_and_dpi()
+        existing_names = {s['name'] for s in self.source}
+        matrix = pymupdf.Matrix(dpi / 72.0, dpi / 72.0)
+        progress_ = QtWidgets.QProgressDialog(_("Converting pages"), None, page_from,
+                                              page_to + 1, self)
+        progress_.setWindowModality(QtCore.Qt.WindowModality.WindowModal)
+        try:
+            pymu_pdf = pymupdf.open(filepath)
+            try:
+                for i in range(page_from, page_to + 1):
+                    progress_.setValue(i)
+                    QtCore.QCoreApplication.processEvents()
+                    image_filename = filename + f"_p{i + 1}.jpg"
+                    if image_filename in existing_names:
+                        # No QMessageBox for each repeated page (large ranges).
+                        self.parent_text_edit.append(_("Skipped duplicate image: ") + image_filename)
+                        continue
+                    pymu_page = pymu_pdf.load_page(i)
+                    pymypdf_pixmap = pymu_page.get_pixmap(matrix=matrix)
+                    # Other methods 'might' look for the forward slash. CC - ?
+                    destination = Path(self.app.project_path) / "images" / image_filename
+                    pymypdf_pixmap.save(destination)
+                    # Silenced per page: one event after the whole page range
+                    self.load_media_reference(f"/images/{image_filename}", notify=False)
+                    pages_imported += 1
+                    self.parent_text_edit.append(_("Image loaded from pdf: ") + image_filename)
+            finally:
+                pymu_pdf.close()
+        except Exception as err:
+            logger.warning(f"pdf_to_images: {filepath} {err}")
+            Message(self.app, _("Image Error"), _("Cannot open: ") + f"{filepath}\n{err}",
+                    "warning").exec()
+        progress_.setValue(page_to + 1)
+        self.load_file_data()
+        self.fill_table()
+        self.app.delete_backup = False
+        self.update_files_in_dialogs()
+        if pages_imported > 0:
+            # One event for the whole page range, not one per page
+            self._emit_project_table_changes(['source', 'attribute'])
+
+    def view_original_text_file(self, mediapath: str):
         """ View original text file.
-         param:
-         mediapath: String '/docs/' for internal 'docs:/' for external """
+         Args:
+            mediapath: String '/docs/' for internal 'docs:/' for external """
 
         if mediapath[:6] == "/docs/":
-            media_path = self.app.project_path + "/documents/" + mediapath[6:]
+            #media_path = self.app.project_path + "/documents/" + mediapath[6:]
+            media_path = str(Path(self.app.project_path) / "documents" / mediapath[6:])
             webbrowser.open(media_path)
             return
         if mediapath[:5] == "docs:":
@@ -787,13 +1438,18 @@ class DialogManageFiles(QtWidgets.QDialog):
         logger.error("Cannot open text file in browser " + mediapath)
         print(f"manage_files.view_original_text_file. Cannot open text file in browser {mediapath}")
 
-    def assign_case_to_file(self):
+    def assign_cases_to_file(self):
         """ Assign one or more cases to file. """
 
-        row = self.ui.tableWidget.currentRow()
-        fid = int(self.ui.tableWidget.item(row, self.ID_COLUMN).text())
+        '''row = self.ui.tableWidget.currentRow()
+        fid = int(self.ui.tableWidget.item(row, self.ID_COLUMN).text())'''
+        file_ids = []
+        for row in self.visible_selected_rows():
+            file_ids.append([int(self.ui.tableWidget.item(row, self.ID_COLUMN).text()), row])
+        if not file_ids:
+            return
         casenames = self.app.get_casenames()
-        ui = DialogSelectItems(self.app, casenames, _("Delete files"), "multi")
+        ui = DialogSelectItems(self.app, casenames, _("Assign files"), "multi")
         ok = ui.exec()
         if not ok:
             return
@@ -801,24 +1457,30 @@ class DialogManageFiles(QtWidgets.QDialog):
         if not selection:
             return
         cur = self.app.conn.cursor()
-        cur.execute("select fulltext from source where id=?", [fid])
-        res = cur.fetchone()
-        len_text = 0
-        if res is not None and res[0] is not None:
-            len_text = len(res[0])
-        for case_ in selection:
-            # Check if already linked file to case
-            cur.execute("select * from case_text where caseid = ? and fid=? and pos0=? and pos1=?",
-                        (case_['id'], fid, 0, len_text))
-            result = cur.fetchall()
-            if len(result) == 0:
-                sql = "insert into case_text (caseid, fid, pos0, pos1, owner, date, memo) values(?,?,?,?,?,?,?)"
-                cur.execute(sql, (case_['id'], fid, 0, len_text, self.app.settings['codername'],
-                                  datetime.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S"), ""))
-                self.app.conn.commit()
-        # Visual feedback
-        cases_text = self.get_cases_by_filename(self.ui.tableWidget.item(row, self.NAME_COLUMN).text())
-        self.ui.tableWidget.item(row, self.CASE_COLUMN).setText(cases_text)
+        for item in file_ids:
+            fid, row = item[0], item[1]
+            cur.execute("select fulltext from source where id=?", [fid])
+            res = cur.fetchone()
+            len_text = 0
+            if res is not None and res[0] is not None:
+                len_text = len(res[0])
+            for case_ in selection:
+                # Check if already linked file to case
+                cur.execute("select * from case_text where caseid = ? and fid=? and pos0=? and pos1=?",
+                            (case_['id'], fid, 0, len_text))
+                result = cur.fetchall()
+                if len(result) == 0:
+                    sql = "insert into case_text (caseid, fid, pos0, pos1, owner, date, memo) values(?,?,?,?,?,?,?)"
+                    cur.execute(sql, (case_['id'], fid, 0, len_text, self.app.settings['codername'],
+                                      datetime.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S"), ""))
+                    self.app.conn.commit()
+                # Visual feedback, keeping the loaded sources in sync for the header filters
+                cases_text = self.get_cases_by_filename(self.ui.tableWidget.item(row, self.NAME_COLUMN).text())
+                self.ui.tableWidget.item(row, self.CASE_COLUMN).setText(cases_text)
+                self.source[row]['case'] = cases_text
+        self._emit_project_table_changes(['case_text'])
+        if self.file_filter_active():
+            self.apply_file_filter()
 
     def rename_database_entry(self):
         """ Rename the database entry of the file. """
@@ -847,6 +1509,7 @@ class DialogManageFiles(QtWidgets.QDialog):
         self.load_file_data()
         self.app.delete_backup = False
         self.update_files_in_dialogs()
+        self._emit_project_table_changes(['source'])
         # update doc in vectorstore
         id_ = int(self.ui.tableWidget.item(row, self.ID_COLUMN).text())
         if self.app.settings['ai_enable'] == 'True':
@@ -884,6 +1547,7 @@ class DialogManageFiles(QtWidgets.QDialog):
         if self.app.settings['ai_enable'] == 'True':
             self.app.ai.sources_vectorstore.update_vectorstore()
         self.files_renamed = [x for x in self.files_renamed if not (selection['fid'] == x.get('fid'))]
+        self._emit_project_table_changes(['source'])
         if len(self.files_renamed) == 0:
             self.ui.pushButton_undo.setEnabled(False)
 
@@ -932,6 +1596,7 @@ class DialogManageFiles(QtWidgets.QDialog):
             entry = {'old_name': existing_name, 'name': new_name, 'fid': fid}
             self.files_renamed.append(entry)
         self.parent_text_edit.append(msg + err_msg)
+        self._emit_project_table_changes(['source'])
         # Updating vectorstore
         if self.app.settings['ai_enable'] == 'True':
             self.app.ai.sources_vectorstore.update_vectorstore()
@@ -946,7 +1611,9 @@ class DialogManageFiles(QtWidgets.QDialog):
          Only to work with an exportable file. """
 
         if self.av_dialog_open is not None:
-            self.av_dialog_open.mediaplayer.stop()
+            # Guard: a dialog that failed mid-init can leave mediaplayer as None
+            if getattr(self.av_dialog_open, 'mediaplayer', None) is not None:
+                self.av_dialog_open.mediaplayer.stop()
             self.av_dialog_open = None
         row = self.ui.tableWidget.currentRow()
         if row == -1:
@@ -961,18 +1628,20 @@ class DialogManageFiles(QtWidgets.QDialog):
         if mediapath is None or (mediapath is not None and mediapath[0] == "/"):
             self.export_file_as_linked_file(id_, mediapath)
 
-    def export_file_as_linked_file(self, id_, mediapath):
+    def export_file_as_linked_file(self, id_:int, mediapath:str):
         """ Move an internal project file into an external location as a linked file.
-        #TODO Do not export text files as linked files. e.g. internally created in database, or
+        # Do not export text files as linked files. e.g. internally created in database, or
         docx, txt, md, odt files.
 
-        params:
+        Args:
             id_ : the file id, Integer
             mediapath: stored path to media, will be None for text files, or String
         """
 
         if self.av_dialog_open is not None:
-            self.av_dialog_open.mediaplayer.stop()
+            # Guard: a dialog that failed mid-init can leave mediaplayer as None
+            if getattr(self.av_dialog_open, 'mediaplayer', None) is not None:
+                self.av_dialog_open.mediaplayer.stop()
             self.av_dialog_open = None
         options = QtWidgets.QFileDialog.Option.DontResolveSymlinks | QtWidgets.QFileDialog.Option.ShowDirsOnly
         directory = QtWidgets.QFileDialog.getExistingDirectory(None,
@@ -996,7 +1665,7 @@ class DialogManageFiles(QtWidgets.QDialog):
             name = cur.fetchone()[0]
             file_directory = "documents"
             mediapath = "/documents/" + name
-            destination = os.path.join(directory, name)
+            destination = Path(directory) / name
         msg = f'{_("Export to")} {destination}\n'
         try:
             move(self.app.project_path + mediapath, destination)
@@ -1020,13 +1689,16 @@ class DialogManageFiles(QtWidgets.QDialog):
         self.update_files_in_dialogs()
         self.load_file_data()
         self.app.delete_backup = False
+        self._emit_project_table_changes(['source'])
 
     def button_import_linked_file(self):
         """ User presses button to import a linked file into the project folder.
         Only to work with an importable file. """
 
         if self.av_dialog_open is not None:
-            self.av_dialog_open.mediaplayer.stop()
+            # Guard: a dialog that failed mid-init can leave mediaplayer as None
+            if getattr(self.av_dialog_open, 'mediaplayer', None) is not None:
+                self.av_dialog_open.mediaplayer.stop()
             self.av_dialog_open = None
         row = self.ui.tableWidget.currentRow()
         if row == -1:
@@ -1041,26 +1713,32 @@ class DialogManageFiles(QtWidgets.QDialog):
         if mediapath is not None and mediapath[0] != "/":
             self.import_linked_file(id_, mediapath)
 
-    def import_linked_file(self, id_, mediapath):
-        """ Import a linked file into the project folder, and change mediapath details. """
+    def import_linked_file(self, id_:int, mediapath:str):
+        """ Import a linked file into the project folder, and change mediapath details.
+        Args:
+            id_ : Integer
+            mediapath : String
+        """
 
         if self.av_dialog_open is not None:
-            self.av_dialog_open.mediaplayer.stop()
+            # Guard: a dialog that failed mid-init can leave mediaplayer as None
+            if getattr(self.av_dialog_open, 'mediaplayer', None) is not None:
+                self.av_dialog_open.mediaplayer.stop()
             self.av_dialog_open = None
         name_split1 = mediapath.split(":")[1]
         filename = name_split1.split('/')[-1]
         if mediapath[0:6] == "audio:":
-            copyfile(mediapath[6:], os.path.join(self.app.project_path, "audio", filename))
+            copyfile(mediapath[6:], Path(self.app.project_path)/ "audio" / filename)
             mediapath = '/audio/' + filename
         if mediapath[0:6] == "video:":
-            copyfile(mediapath[6:], os.path.join(self.app.project_path, "video", filename))
+            copyfile(mediapath[6:], Path(self.app.project_path) / "video" / filename)
             mediapath = '/video/' + filename
         if mediapath[0:7] == "images:":
-            copyfile(mediapath[7:], os.path.join(self.app.project_path, "images", filename))
+            copyfile(mediapath[7:], Path(self.app.project_path) / "images" / filename)
             mediapath = '/images/' + filename
         # This must be the last if statement as mediapath can be None
         if mediapath[0:5] == "docs:":
-            copyfile(mediapath[5:], os.path.join(self.app.project_path, "documents", filename))
+            copyfile(mediapath[5:], Path(self.app.project_path) / "documents" / filename)
             mediapath = None
         cur = self.app.conn.cursor()
         cur.execute("update source set mediapath=? where id=?", [mediapath, id_])
@@ -1068,23 +1746,50 @@ class DialogManageFiles(QtWidgets.QDialog):
         self.update_files_in_dialogs()
         self.load_file_data()
         self.app.delete_backup = False
+        self._emit_project_table_changes(['source'])
 
     def mark_speakers(self):
         """ Mark the speakers in text files.
-         Note: User generated files (not loaded files) have medipath None.
-         When text file found open the text coding pane. """
+         Note: User generated files (not loaded files) have mediapath None.
+         Preselection rules (Van's feedback):
+         - Every selected AND VISIBLE text file carries over to the speakers dialog,
+           not just the last selected one.
+         - If nothing usable is selected (no selection, or the selection is hidden by
+           the current filter), all VISIBLE text files become the preselection, which
+           also carries over an active filter.
+         When text files are found the text coding pane opens. """
 
-        try:
-            row = self.ui.tableWidget.currentRow()
-            if row == -1:
-                raise ValueError()
-            id_ = int(self.ui.tableWidget.item(row, self.ID_COLUMN).text())
-            text_item = next((item for item in self.source if item['id'] == id_ and item['fulltext']), None)
-            if not text_item:
-                raise ValueError()
-            self.main_window.text_coding(task='mark_speakers', doc_id=int(id_))
-        except (AttributeError, ValueError):
+        text_ids = {item['id'] for item in self.source if item['fulltext']}
+
+        def row_text_file_id(row:int):
+            """ id of the text file at a visible row, else None. """
+            if self.ui.tableWidget.isRowHidden(row):
+                return None  # hidden by the current filter: not usable
+            id_item = self.ui.tableWidget.item(row, self.ID_COLUMN)
+            if id_item is None:
+                return None
+            try:
+                id_ = int(id_item.text())
+            except ValueError:
+                return None
+            return id_ if id_ in text_ids else None
+
+        ids = []
+        selected_rows = sorted({index.row() for index in self.ui.tableWidget.selectedIndexes()})
+        for row in selected_rows:
+            id_ = row_text_file_id(row)
+            if id_ is not None and id_ not in ids:
+                ids.append(id_)
+        if not ids:
+            # Fallback: every visible text file (respects the active filter)
+            for row in range(self.ui.tableWidget.rowCount()):
+                id_ = row_text_file_id(row)
+                if id_ is not None and id_ not in ids:
+                    ids.append(id_)
+        if not ids:
             Message(self.app, _('Mark speakers'), _('No text file selected.'), 'critical').exec()
+            return
+        self.main_window.text_coding(task='mark_speakers', doc_id=ids[0], doc_ids=ids)
 
     def check_attribute_placeholders(self):
         """ Files can be added after attributes are in the project.
@@ -1118,12 +1823,16 @@ class DialogManageFiles(QtWidgets.QDialog):
         for r in res:
             cur.execute("delete from attribute where attr_type='file' and id=?", [r[0], ])
             self.app.conn.commit()
+        # No event here: the callers that reach this on a user action (delete,
+        # delete_button_multiple_files) already include 'attribute' in their payload.
 
     def export_attributes(self):
         """ Export attributes from table to an Excel file. """
 
         if self.av_dialog_open is not None:
-            self.av_dialog_open.mediaplayer.stop()
+            # Guard: a dialog that failed mid-init can leave mediaplayer as None
+            if getattr(self.av_dialog_open, 'mediaplayer', None) is not None:
+                self.av_dialog_open.mediaplayer.stop()
             self.av_dialog_open = None
         shortname = self.app.project_name.split(".qda")[0]
         filename = f"{shortname}_file_attributes.xlsx"
@@ -1140,21 +1849,25 @@ class DialogManageFiles(QtWidgets.QDialog):
         for col, col_name in enumerate(header):
             h_cell = ws.cell(row=1, column=col + 1)
             h_cell.value = col_name
+        out_row = 2
         for row in range(rows):
+            if self.ui.tableWidget.isRowHidden(row):
+                continue
             for col in range(cols):
-                cell = ws.cell(row=row + 2, column=col + 1)
+                cell = ws.cell(row=out_row, column=col + 1)
                 data = ""
                 try:
                     data = self.ui.tableWidget.item(row, col).text()
                 except AttributeError:
                     pass
                 cell.value = data
+            out_row += 1
         wb.save(filepath)
         msg = _("File attributes exported to: ") + filepath
         Message(self.app, _('File Export'), msg).exec()
         self.parent_text_edit.append(msg)
 
-    def load_file_data(self, order_by=""):
+    def load_file_data(self, order_by :str=""):
         """ Documents images and audio contain the filetype suffix.
         No suffix implies the 'file' was imported from a survey question or created internally.
         This also fills out the table header labels with file attribute names.
@@ -1163,7 +1876,7 @@ class DialogManageFiles(QtWidgets.QDialog):
         Db version 5+: av_text_id links the text file to the audio/video
         Obtain some file metadata to use in table tooltip.
         Fills table after data is loaded.
-        param:
+        Args:
             order_by: string ""= name asc, "filename desc" = name desc,
             "date asc" = date ascending, "date desc" = date descending, "filetype" = mediapath,
                 "casename asc" = by alphabetic casename ascending
@@ -1172,7 +1885,6 @@ class DialogManageFiles(QtWidgets.QDialog):
                 "attribute desc: attribute name ttribute - descending
         """
 
-        # TODO add progress dialog
         # Check a placeholder attribute is present for the file, add if missing
         self.check_attribute_placeholders()
         self.source = []
@@ -1257,6 +1969,8 @@ class DialogManageFiles(QtWidgets.QDialog):
                 self.app.conn.commit()
                 self.parent_text_edit.append(_("Auto-renamed invalid file: ") + f"'{s['name']}' -> {new_name}")
                 s['name'] = new_name
+        # No event here: this runs on every refresh and sort, including refreshes
+        # triggered by the bus itself. The user actions that write source emit.
         self.header_labels = [_("Name"), _("Memo"), _("Date"), _("Id"), _("Case")]
         # Attributes
         sql = "select name from attribute_type where caseOrFile='file' order by upper(name)"
@@ -1280,12 +1994,13 @@ class DialogManageFiles(QtWidgets.QDialog):
                     if att_name == "Ref_authors":
                         tmp = tmp.replace(";", "\n")
                     s['attributes'].append(tmp)
+        self.prune_header_filters()
         self.fill_table()
 
-    def get_icon_and_metadata(self, id_):
+    def get_icon_and_metadata(self, id_:int):
         """ Get metadata used in table tooltip.
         Called by: create_text_file, load_file_data
-        param:
+        Args:
             id_  : integer source.id
         """
 
@@ -1358,17 +2073,18 @@ class DialogManageFiles(QtWidgets.QDialog):
         if res[2][:6] == "audio:":
             icon = QtGui.QIcon(qta.icon('mdi6.play-protected-content', options=[{'scale_factor': 1.2}]))
         if res[2][:6] in ("/audio", "audio:", "/video", "video:"):
-            if not os.path.exists(abs_path):
+            if not Path(abs_path).exists():
                 metadata += _("Cannot locate media. ") + abs_path
                 return icon, metadata, "Not found Error"
             if vlc:
                 try:
                     try:
-                        instance = vlc.Instance()
+                        from .media_player_qt import metadata_vlc_instance
+                        instance = metadata_vlc_instance(vlc)  # cached: metadata only
                     except NameError as name_err:
                         # NameError: no function 'libvlc_new'
                         logger.error(f"vlc.Instance: {name_err}")
-                        return icon, f"Cannot use vlc. {name_err}"
+                        return icon, metadata, f"Cannot use vlc. {name_err}"
                     media = instance.media_new(abs_path)
                     media.parse()
                     msecs = media.get_duration()
@@ -1384,9 +2100,9 @@ class DialogManageFiles(QtWidgets.QDialog):
                 return icon, metadata, "Other error"
         bytes_ = 0
         try:
-            bytes_ = os.path.getsize(abs_path)
+            bytes_ = Path(abs_path).stat().st_size
         except OSError as e_:
-            print(e_)
+            logger.warning(str(e_))
         metadata += f"\nBytes: {bytes_}"
         if 1024 < bytes_ < 1024 * 1024:
             metadata += f"  {int(bytes_ / 1024)}KB"
@@ -1398,9 +2114,10 @@ class DialogManageFiles(QtWidgets.QDialog):
             metadata += f'\n{_("Case linked:")}\n{txt}'
         return icon, metadata, ""
 
-    def get_cases_by_filename(self, name):
+    def get_cases_by_filename(self, name: str):
         """ Called by get_icon_and_metadata, get_file_data
-        param: name String of filename """
+        Args:
+            name String of filename """
 
         cur = self.app.conn.cursor()
         # Case_text is the table, but this also links av and images
@@ -1429,7 +2146,9 @@ class DialogManageFiles(QtWidgets.QDialog):
         """
 
         if self.av_dialog_open is not None:
-            self.av_dialog_open.mediaplayer.stop()
+            # Guard: a dialog that failed mid-init can leave mediaplayer as None
+            if getattr(self.av_dialog_open, 'mediaplayer', None) is not None:
+                self.av_dialog_open.mediaplayer.stop()
             self.av_dialog_open = None
         ui = DialogAddAttribute(self.app)
         ok = ui.exec()
@@ -1485,33 +2204,38 @@ class DialogManageFiles(QtWidgets.QDialog):
             # Need to dynamically get the memo text in case it has been changed in a coding dialog
             cur.execute('select memo from source where id=?', [self.source[x]['id']])
             self.source[x]['memo'] = cur.fetchone()[0]
+            previous_memo = self.source[x]['memo']
             if name[-5:] == ".jpeg" or name[-4:] in ('.jpg', '.png', '.gif'):
                 ui = DialogMemo(self.app, _("Memo for file ") + self.source[x]['name'],
-                                self.source[x]['memo'])
+                                self.source[x]['memo'], entity_type="file", entity_id=self.source[x]['id'])
                 ui.exec()
                 self.source[x]['memo'] = ui.memo
                 cur.execute('update source set memo=? where id=?', (ui.memo, self.source[x]['id']))
                 self.app.conn.commit()
             else:
                 ui = DialogMemo(self.app, _("Memo for file ") + self.source[x]['name'],
-                                self.source[x]['memo'])
+                                self.source[x]['memo'], entity_type="file", entity_id=self.source[x]['id'])
                 ui.exec()
                 self.source[x]['memo'] = ui.memo
                 cur = self.app.conn.cursor()
                 cur.execute('update source set memo=? where id=?', (ui.memo, self.source[x]['id']))
                 self.app.conn.commit()
+            if self.source[x]['memo'] != previous_memo:
+                # Opening a memo to read it must not wake up the other dialogs
+                self._emit_project_table_changes(['source'])
             if self.source[x]['memo'] == "":
                 self.ui.tableWidget.setItem(x, self.MEMO_COLUMN, QtWidgets.QTableWidgetItem())
             else:
                 self.ui.tableWidget.setItem(x, self.MEMO_COLUMN, QtWidgets.QTableWidgetItem("Memo"))
+            if self.file_filter_active():
+                # The changed memo may now be excluded by a header filter
+                self.apply_file_filter()
 
     def cell_modified(self):
-        """ Attribute values can be changed.
-        """
+        """ Attribute values can be changed.  """
 
         x = self.ui.tableWidget.currentRow()
         y = self.ui.tableWidget.currentColumn()
-
         # Update attribute value
         if y > self.CASE_COLUMN:
             value = str(self.ui.tableWidget.item(x, y).text()).strip()
@@ -1522,7 +2246,7 @@ class DialogManageFiles(QtWidgets.QDialog):
             result = cur.fetchone()
             if result is None:
                 return
-            if result[0] == "numeric":
+            if result[0] == "numeric" and value != "":
                 try:
                     float(value)
                 except ValueError:
@@ -1551,13 +2275,18 @@ class DialogManageFiles(QtWidgets.QDialog):
 
             self.app.delete_backup = False
             self.ui.tableWidget.resizeColumnsToContents()
+            if self.file_filter_active():
+                # The edited value may now be excluded by a header filter
+                self.apply_file_filter()
 
     def view(self):
         """ View and edit text file contents.
         Alternatively view an image, audio or video media. """
 
         if self.av_dialog_open is not None:
-            self.av_dialog_open.mediaplayer.stop()
+            # Guard: a dialog that failed mid-init can leave mediaplayer as None
+            if getattr(self.av_dialog_open, 'mediaplayer', None) is not None:
+                self.av_dialog_open.mediaplayer.stop()
             self.av_dialog_open = None
         x = self.ui.tableWidget.currentRow()
         self.ui.tableWidget.selectRow(x)
@@ -1571,6 +2300,22 @@ class DialogManageFiles(QtWidgets.QDialog):
             if len(self.source[x]['mediapath']) > 5 and self.source[x]['mediapath'][:6] in ("/audio", "audio:"):
                 self.view_av(x)
                 return
+        # PDF fulltext is not editable (it must match the page extraction);
+        # "Convert to txt" creates an editable copy as a new text source.
+        mediapath_ = self.source[x]['mediapath']
+        if mediapath_ is not None and mediapath_.lower().endswith(".pdf") and \
+                (mediapath_[0:6] == '/docs/' or mediapath_[0:5] == 'docs:'):
+            if mediapath_[0:6] == '/docs/':
+                pdf_filepath = Path(self.app.project_path) / "documents" / mediapath_[6:]
+            else:
+                pdf_filepath = mediapath_[5:]
+            preview = DialogPdfPreview(self.app, pdf_filepath, self.source[x]['name'], self)
+            preview.exec()
+            if preview.convert_txt_requested:
+                # Reuses the context-menu extraction (name uniqueness, scanned
+                # PDFs, attributes, vectorstore).
+                self.extract_pdf_text_copy(x)
+            return
         ui = DialogEditTextFile(self.app, self.source[x]['id'])
         ui.exec()
         # Get fulltext if changed (for metadata)
@@ -1581,27 +2326,29 @@ class DialogManageFiles(QtWidgets.QDialog):
         if res is not None:
             fulltext = res[0]
         self.source[x]['fulltext'] = fulltext
+        # DialogEditTextFile.accept() notifies the bus itself, so open coding dialogs
+        # (code_text, code_pdf) reload and do not keep stale positions. Emitting again
+        # here would dispatch the same change twice.
 
-    def view_av(self, x):
+    def view_av(self, x: int):
         """ View an audio or video file. Edit the memo. Edit the transcript file.
         Added try block in case VLC bindings do not work.
         Uses a non-modal dialog.
-
-        param:
+        Args:
             x  :  row number Integer
         """
 
-        if not vlc:
-            msg = _("VLC not installed cannot play audio or video.")
-            Message(self.app, _('View AV error'), msg, "warning").exec()
-            return
+        if not vlc and self.app.settings.get('av_player', 'vlc') != 'qt':
+            # Without python-vlc the Qt Multimedia backend still plays media
+            self.app.settings['av_player'] = 'qt'
+            self.app.write_config_ini(self.app.settings, self.app.ai_models)
         # Check media exists
         abs_path = ""
         if self.source[x]['mediapath'][0:6] in ('/audio', '/video'):
             abs_path = self.app.project_path + self.source[x]['mediapath']
         if self.source[x]['mediapath'][0:6] in ('audio:', 'video:'):
             abs_path = self.source[x]['mediapath'][6:]
-        if not os.path.exists(abs_path):
+        if not Path(abs_path).exists():
             self.parent_text_edit.append(_("Bad link or non-existent file ") + abs_path)
             return
         try:
@@ -1620,10 +2367,189 @@ class DialogManageFiles(QtWidgets.QDialog):
             self.av_dialog_open = None
             return
 
-    def view_image(self, x):
-        """ View an image file and edit the image memo.
+    def create_transcription_for_av(self, av_id, av_name):
+        """ Create an empty transcription text source for an audio/video file and link it
+        through av_text_id. Used when the original transcription was deleted (leaving a
+        dangling av_text_id) or never existed. Mirrors the transcription-creation block
+        in load_media_reference.
 
         param:
+            av_id: source id of the audio/video file, Integer
+            av_name: name of the audio/video file, String
+
+        returns:
+            (tr_id, tr_name) of the new transcription text source, or (None, None) on duplicate
+        """
+
+        tr_name = av_name + ".txt"
+        if any(s['name'] == tr_name for s in self.source):
+            QtWidgets.QMessageBox.warning(self, _('Duplicate file'),
+                                          _("Duplicate filename.\nFile not created"))
+            return None, None
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        entry = {'name': tr_name, 'id': -1, 'fulltext': "", 'mediapath': None, 'memo': "",
+                 'owner': self.app.settings['codername'], 'date': now, 'av_text_id': None}
+        cur = self.app.conn.cursor()
+        cur.execute("insert into source(name,fulltext,mediapath,memo,owner,date) values(?,?,?,?,?,?)",
+                    (entry['name'], entry['fulltext'], entry['mediapath'], entry['memo'], entry['owner'],
+                     entry['date']))
+        self.app.conn.commit()
+        cur.execute("select last_insert_rowid()")
+        tr_id = cur.fetchone()[0]
+        entry['id'] = tr_id
+        # Link the av file entry to this text file
+        cur.execute("update source set av_text_id=? where id=?", [tr_id, av_id])
+        self.app.conn.commit()
+
+        # add doc to vectorstore
+        if self.app.settings['ai_enable'] == 'True':
+            self.app.ai.sources_vectorstore.import_document(entry['id'], entry['name'], entry['fulltext'])
+
+        # Add file attribute placeholders
+        cur.execute('select name from attribute_type where caseOrFile ="file"')
+        attr_types = cur.fetchall()
+        insert_sql = "insert into attribute (name, attr_type, value, id, date, owner) values(?,'file','',?,?,?)"
+        for a in attr_types:
+            cur.execute(insert_sql, [a[0], tr_id, now, self.app.settings['codername']])
+        self.app.conn.commit()
+        self._emit_project_table_changes(["source", "attribute"])  #
+
+        self.source.append(entry)
+        self.parent_text_edit.append(tr_name + _(" created."))
+        return tr_id, tr_name
+
+    def import_transcription_from_file(self, id_):
+        """ Load transcript text from an external file (e.g. a noScribe .txt or .html export)
+        into the .txt transcription that QualCoder auto-creates for an audio or video file.
+
+        The audio/video source row stores the linked transcription text source id in av_text_id
+        (see load_media_reference). The content of the chosen file replaces that transcription's
+        fulltext. Reading mirrors load_file_text so behaviour matches a normal text import:
+        charset detection for plain text, html_to_text for html/htm, line-ending normalisation
+        and pseudonym substitution. Warns before overwriting an existing transcription, codings
+        or annotations.
+
+        param:
+            id_: source id of the selected audio/video file, Integer
+        """
+
+        # Release the media file if an AV dialog is open
+        if self.av_dialog_open is not None:
+            # Guard: a dialog that failed mid-init can leave mediaplayer as None
+            if getattr(self.av_dialog_open, 'mediaplayer', None) is not None:
+                self.av_dialog_open.mediaplayer.stop()
+            self.av_dialog_open = None
+
+        av_source = next((s for s in self.source if s['id'] == id_), None)
+        if av_source is None:
+            return
+
+        # --- Locate the linked transcription text source via av_text_id
+        cur = self.app.conn.cursor()
+        cur.execute("select av_text_id from source where id=?", [id_])
+        res = cur.fetchone()
+        tr_id = res[0] if res is not None else None
+        # The link may be stale: the transcription source could have been deleted while
+        # av_text_id still points to its old id. Confirm the row actually exists.
+        tr_name = None
+        if tr_id is not None:
+            cur.execute("select name from source where id=?", [tr_id])
+            res = cur.fetchone()
+            if res is None:
+                tr_id = None  # dangling link -> treat as missing
+            else:
+                tr_name = res[0]
+        # Fallback for older projects with no link: match a text source named "<av name>.txt"
+        if tr_id is None:
+            cur.execute("select id, name from source where name=? and mediapath is null",
+                        [av_source['name'] + ".txt"])
+            res = cur.fetchone()
+            if res is not None:
+                tr_id, tr_name = res[0], res[1]
+                cur.execute("update source set av_text_id=? where id=?", [tr_id, id_])
+                self.app.conn.commit()
+        # Still nothing: recreate an empty transcription and link it (mirrors load_media_reference)
+        if tr_id is None:
+            tr_id, tr_name = self.create_transcription_for_av(id_, av_source['name'])
+            if tr_id is None:
+                return
+
+        # --- Choose the transcription file
+        start_dir = str(Path(self.app.project_path).parent)
+        filepath, _filter = QtWidgets.QFileDialog.getOpenFileName(
+            self, _("Select transcription file"), start_dir,
+            _("Transcript files") + " (*.txt *.srt *.vtt *.md *.html *.htm);;" + _("All files") + " (*.*)")
+        if not filepath:
+            return
+
+        # --- Read the file (same logic as load_file_text for txt and html)
+        text_ = ""
+        try:
+            if filepath[-5:].lower() == ".html" or filepath[-4:].lower() == ".htm":
+                with open(filepath, "r", encoding="utf-8", errors="surrogateescape") as sourcefile:
+                    html_text = sourcefile.read()
+                text_ = html_to_text(html_text)
+            else:
+                text_, detected_encoding = self.decode_text_with_best_encoding(filepath)
+                logger.debug(f"Import transcription from {filepath} decoded as {detected_encoding}")
+        except Exception as err:
+            logger.warning(str(err))
+            Message(self.app, _("Warning"), _("Cannot read file") + f"\n{filepath}\n{err}", "warning").exec()
+            return
+        if text_ is None:
+            text_ = ""
+        # Normalise line endings and strip BOM so stored positions match the editor (see load_file_text)
+        text_ = text_.replace("\r\n", "\n").replace("\r", "\n")
+        if text_ and text_[0] == "\ufeff":
+            text_ = text_[1:]
+        if text_.strip() == "":
+            Message(self.app, _("Warning"),
+                    _("The selected file has no readable text.") + f"\n{filepath}", "warning").exec()
+            return
+
+        # --- Apply pseudonyms, consistent with text import
+        for pseudonym in self.load_pseudonyms():
+            text_ = re.sub(rf"(?<!\w){re.escape(pseudonym['original'])}(?!\w)", pseudonym['pseudonym'], text_)
+
+        # --- Warn before overwriting existing transcription, codings or annotations
+        cur.execute("select length(ifnull(fulltext,'')) from source where id=?", [tr_id])
+        existing_len = cur.fetchone()[0]
+        cur.execute("select count(*) from code_text where fid=?", [tr_id])
+        codings = cur.fetchone()[0]
+        cur.execute("select count(*) from annotation where fid=?", [tr_id])
+        annotations = cur.fetchone()[0]
+        if existing_len > 0 or codings > 0 or annotations > 0:
+            warn = _("The transcription already contains text.") + "\n"
+            warn += _("Codings: ") + str(codings) + "    " + _("Annotations: ") + str(annotations) + "\n\n"
+            warn += _("Replacing it may shift or remove existing codings and annotations. Continue?")
+            reply = QtWidgets.QMessageBox.question(
+                self, _("Overwrite transcription"), warn,
+                QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+                QtWidgets.QMessageBox.StandardButton.No)
+            if reply == QtWidgets.QMessageBox.StandardButton.No:
+                return
+
+        # --- Store the transcription
+        cur.execute("update source set fulltext=? where id=?", [text_, tr_id])
+        self.app.conn.commit()
+        for s in self.source:
+            if s['id'] == tr_id:
+                s['fulltext'] = text_
+                break
+
+        # Update the AI vectorstore if enabled
+        if self.app.settings['ai_enable'] == 'True':
+            self.app.ai.sources_vectorstore.import_document(tr_id, tr_name, text_)
+
+        self.parent_text_edit.append(_("Transcription imported into ") + tr_name)
+        self.load_file_data()
+        self._emit_project_table_changes(["source"])  # notify other open dialogs
+        Message(self.app, _("Transcription imported"),
+                _("Transcription loaded into: ") + tr_name).exec()
+
+    def view_image(self, x:int):
+        """ View an image file and edit the image memo.
+        Args:
             x  :  row number Integer
         """
 
@@ -1633,7 +2559,7 @@ class DialogManageFiles(QtWidgets.QDialog):
             abs_path = self.source[x]['mediapath'][7:]
         else:
             abs_path = self.app.project_path + self.source[x]['mediapath']
-        if not os.path.exists(abs_path):
+        if not Path(abs_path).exists():
             self.parent_text_edit.append(_("Bad link or non-existent file ") + abs_path)
             return
         ui = DialogViewImage(self.app, self.source[x])
@@ -1645,6 +2571,7 @@ class DialogManageFiles(QtWidgets.QDialog):
             cur.execute('update source set memo=? where id=?', (self.source[x]['memo'],
                                                                 self.source[x]['id']))
             self.app.conn.commit()
+            self._emit_project_table_changes(['source'])
         if self.source[x]['memo'] == "":
             self.ui.tableWidget.setItem(x, self.MEMO_COLUMN, QtWidgets.QTableWidgetItem())
         else:
@@ -1655,7 +2582,9 @@ class DialogManageFiles(QtWidgets.QDialog):
         Implements the QtDesigner memo dialog. """
 
         if self.av_dialog_open is not None:
-            self.av_dialog_open.mediaplayer.stop()
+            # Guard: a dialog that failed mid-init can leave mediaplayer as None
+            if getattr(self.av_dialog_open, 'mediaplayer', None) is not None:
+                self.av_dialog_open.mediaplayer.stop()
             self.av_dialog_open = None
         ui = DialogAddItemName(self.app, self.source, _('New File'), _('Enter file name'))
         ui.exec()
@@ -1682,6 +2611,7 @@ class DialogManageFiles(QtWidgets.QDialog):
         id_ = cur.fetchone()[0]
         item['id'] = id_
         ui = DialogEditTextFile(self.app, id_)
+        ui.ui.textEdit.setAcceptRichText(False)
         ui.exec()
         icon, metadata, err_ = self.get_icon_and_metadata(id_)
         item['icon'] = icon
@@ -1704,31 +2634,32 @@ class DialogManageFiles(QtWidgets.QDialog):
         self.source.append(item)
         self.fill_table()
         self.app.delete_backup = False
+        self._emit_project_table_changes(['source', 'attribute'])
 
     def link_files(self):
         """ Trigger to link to file location. """
 
         if self.av_dialog_open is not None:
-            self.av_dialog_open.mediaplayer.stop()
+            # Guard: a dialog that failed mid-init can leave mediaplayer as None
+            if getattr(self.av_dialog_open, 'mediaplayer', None) is not None:
+                self.av_dialog_open.mediaplayer.stop()
             self.av_dialog_open = None
         self.import_files(True)
 
     def import_survey(self):
         """ Import from CSV/TSV/ODS/XLSX Header row to contain column headings.
-        Process Qual Texts, Cases, Attributes and optional assign autocoding.
+        Process Qualitative Texts, Cases, Attributes and optional assign autocoding.
         Can assign attributes to either files or cases.
-
-        The Case name can be absent. Or cand be from one primary column, or can also collate values from additional columns.
-
-        Qualitative texts from multiple columns are collated int one file.
-        The header for each block if text is the columns name from the survey
+        The Case name can be absent. Or can be from one primary column, or can also collate values from additional columns.
+        Qualitative texts from multiple columns are collated into one file.
+        The header for each block of text is the column name from the survey.
         """
 
         filepath, filter_type = QtWidgets.QFileDialog.getOpenFileName(None, _("Select Survey"), "",
                                                                       _("Data files") + " (*.csv *.CSV *.tsv *.TSV *.ods *.ODS *.xlsx *.XLSX *.xls *.XLS)")
         if not filepath: return
 
-        msg = _("Import from survey: ") + f"{filepath}\n"
+        msg = _("Import from survey: ") + f"{filepath}"
         if filepath.lower().endswith('.csv') or filepath.lower().endswith('.tsv'):
             delimiter = ','
             try:
@@ -1760,21 +2691,19 @@ class DialogManageFiles(QtWidgets.QDialog):
         columns = [str(c) for c in df.columns]
         dialog = DialogSurveyImport(columns, self)
         if not dialog.exec(): return
-
         text_cols, case_cols, attr_cols = dialog.get_selections()
         #filename_col = dialog.get_filename_column()
         autocode_enabled = dialog.get_autocode_setting()
         attr_file_or_case = "case"
         if not dialog.get_case_setting() or not case_cols:
             attr_file_or_case = "file"
-
+        popup_msg = ""
         if not text_cols:
-            Message(self.app, _("Notice"), _("Select at least one Qualitative Text column to analyse.")).exec()
-            return
-
+            popup_msg = _("No columns assigned as qualitative.")
+            msg += _("\nNo columns assigned as qualitative.")
+            #msg += _("\nEmpty files will be created with attributes assigned to them.")
         cur = self.app.conn.cursor()
         now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
         new_attributes = {}  # Change from character to numeric attribute_type after checking when loading data
         for col in attr_cols:
             cur.execute("select name from attribute_type where name=?", [col])
@@ -1783,35 +2712,36 @@ class DialogManageFiles(QtWidgets.QDialog):
                             (col, now, self.app.settings['codername'], "", attr_file_or_case, "character"))
                 new_attributes[col] = 'numeric'
 
-        def sanitize_name(name_str):
+        def sanitize_name(name_str:str):
             return re.sub(r'[\\/:*?"<>|]', '-', str(name_str)).strip()
+
+        # Get existing database filenames and source/ids
+        # Needed for matching an updated data set to existing survey rows
+        existing_files = self.app.get_text_filenames()
 
         count = 0
         for index, row in df.iterrows():
-            text_content = ""
+            fulltext = ""
             code_positions = []
 
             for t_col in text_cols:
                 val = str(row[t_col]) if pd.notna(row[t_col]) else ""
                 if val.strip():
-                    if text_content:
-                        text_content += "\n\n"
-
+                    if fulltext:
+                        fulltext += "\n\n"
                     header = f"[{t_col}]:\n"
                     val_clean = val.strip()
-                    current_len = len(text_content)
-                    text_content += header + val_clean
+                    current_len = len(fulltext)
+                    fulltext += header + val_clean
                     start_pos = current_len + len(header)
                     end_pos = start_pos + len(val_clean)
                     code_positions.append((t_col, start_pos, end_pos, val_clean))
-
-            if not text_content.strip(): continue
+            # if not fulltext.strip(): continue
 
             case_name = ""
             if case_cols:
                 c_vals = [str(row[c]) for c in case_cols if pd.notna(row[c])]
                 case_name = sanitize_name("_".join(c_vals))
-
             '''if filename_col and pd.notna(row[filename_col]):
                 base_filename = sanitize_name(row[filename_col])'''
             if case_name:
@@ -1830,13 +2760,16 @@ class DialogManageFiles(QtWidgets.QDialog):
                 filename = f"{base_filename}_{suffix}"
                 suffix += 1
 
-            filepath_save = os.path.join(self.app.project_path, "documents", filename + ".txt")
-            with open(filepath_save, 'w', encoding='utf-8') as f:
-                f.write(text_content)
-
-            cur.execute("insert into source(name, fulltext, mediapath, memo, owner, date) values(?,?,?,?,?,?)",
-                        (filename, text_content, None, "", self.app.settings['codername'], now))
-            file_id = cur.lastrowid
+            if text_cols:
+                filename_txt = filename + ".txt"
+                filepath_save = Path(self.app.project_path) / "documents" / filename_txt
+                with open(filepath_save, 'w', encoding='utf-8') as f:
+                    f.write(fulltext)
+                cur.execute("insert into source(name, fulltext, mediapath, memo, owner, date) values(?,?,?,?,?,?)",
+                            (filename, fulltext, None, "", self.app.settings['codername'], now))
+                file_id = cur.lastrowid
+            else:
+                file_id = None
 
             if autocode_enabled:
                 for col_name, start_pos, end_pos, text_chunk in code_positions:
@@ -1850,10 +2783,10 @@ class DialogManageFiles(QtWidgets.QDialog):
                         cur.execute("insert into code_name (name, memo, owner, date, color) values(?,?,?,?,?)",
                                     (col_name, "", self.app.settings['codername'], now, color))
                         cid = cur.lastrowid
-
-                    cur.execute("insert into code_text (cid, fid, seltext, pos0, pos1, owner, date, memo) values(?,?,?,?,?,?,?,?)",
+                    if text_cols:
+                        cur.execute("insert into code_text (cid, fid, seltext, pos0, pos1, owner, date, memo) values(?,?,?,?,?,?,?,?)",
                                 (cid, file_id, text_chunk, start_pos, end_pos, self.app.settings['codername'], now, ""))
-            #  Correct posiciones de autocodificación (aun sin resolver)
+            #  Correct auto-code positions, posiciones de autocodificación (aun sin resolver)
             case_id = -1
             if case_name:
                 cur.execute("select caseid from cases where name=?", [case_name])
@@ -1864,11 +2797,12 @@ class DialogManageFiles(QtWidgets.QDialog):
                     cur.execute("insert into cases (name, memo, owner, date) values(?,?,?,?)",
                                 (case_name, "", self.app.settings['codername'], now))
                     case_id = cur.lastrowid
-
-                cur.execute("insert into case_text (caseid, fid, pos0, pos1, owner, date, memo) values(?,?,?,?,?,?,?)",
-                            (case_id, file_id, 0, len(text_content), self.app.settings['codername'], now, ""))
+                if text_cols:
+                    cur.execute("insert into case_text (caseid, fid, pos0, pos1, owner, date, memo) values(?,?,?,?,?,?,?)",
+                            (case_id, file_id, 0, len(fulltext), self.app.settings['codername'], now, ""))
 
             # Insert file or case attributes from survey, and check if character or numeric
+            updated_data = False
             for i, col in enumerate(attr_cols):
                 val = str(row[col]) if pd.notna(row[col]) else ""
                 if val != "":
@@ -1882,20 +2816,34 @@ class DialogManageFiles(QtWidgets.QDialog):
                 file_or_case_id = file_id
                 if attr_file_or_case == "case":
                     file_or_case_id = case_id
+                # Check if fid is None, try getting from a file name match
+                if attr_file_or_case == "file":
+                    for item in existing_files:
+                        if item['name'] == base_filename:
+                            file_or_case_id = item['id']
+                            break
+
                 try:
+                    # print(f"Insert name:{col}, value:{val}, Fid/Cid:{file_or_case_id}, F/C:{attr_file_or_case}")
                     cur.execute("insert into attribute (name, value, id, attr_type, date, owner) values(?,?,?,?,?,?)",
                                 (col, val, file_or_case_id, attr_file_or_case, now, self.app.settings['codername']))
                 except sqlite3.IntegrityError as err:
-                    print(err, "\n", col,val,file_or_case_id,attr_file_or_case)
-                    logger.error(f"Insert into attribute(name, value, id, attr_type, date, owner) {err} {col},{val},{file_or_case_id},{attr_file_or_case}")
+                    # Replace existing file or case attribute data with new data
+                    try:
+                        cur.execute("update attribute set value=?, date=? where name=? and id=? and attr_type=?",
+                                    (val, now, col, file_or_case_id, attr_file_or_case))
+                        updated_data = True
+                    except Exception as update_err:
+                        print("Update survey data:", update_err)
+                        logger.error(f"update survey data: {update_err}")
+    
             count += 1
 
         # Update attribute type for new attributes, if values were all numeric, default was character
-        msg += "\n" + _("Attributes ") + " (" + attr_file_or_case + "):"
+        msg += "\n" + _("Attributes") + " → (" + attr_file_or_case + "):"
         for key, value in new_attributes.items():
             cur.execute("update attribute_type set valuetype=? where name=?", [value, key])
-            msg += f"\n{key} - {value}"
-
+            msg += f"\n    {key} - {value}"
         self.app.conn.commit()
         changed_tables = {"source"}
         if attr_cols:
@@ -1905,30 +2853,39 @@ class DialogManageFiles(QtWidgets.QDialog):
         if autocode_enabled:
             changed_tables.update({"code_name", "code_text"})
         self._emit_project_table_changes(sorted(changed_tables))
+        if updated_data:
+            msg += "\n" + _("Some existing data updated.")
         msg += f"\n{count} " + _("rows imported.")
+        msg += "\n" + "▔" * 20  # U2594
         self.app.delete_backup = False
         self.update_files_in_dialogs()
         self.load_file_data()
-        Message(self.app, _("Import successful."), _("{} rows imported.").format(count)).exec()
+        self.parent_text_edit.append("<h2>" + _("Survey Import") + "</h2>")
         self.parent_text_edit.append(msg)
+        dlg_msg = popup_msg + "\n" + _("{} rows imported.").format(count) + " " * 10
+        if updated_data:
+            dlg_msg += "\n" + _("Some existing data updated")
+        Message(self.app, _("Import successful."), dlg_msg).exec()
 
-    def import_files(self, link=False):
+    def import_files(self, link:bool=False):
         """ Import files and store into relevant directories (documents, images, audio, video).
         Convert documents to plain text and store this in data.qda
-        Can import from plain text files, also import from html, odt, docx, rtf, and md.
+        Can import from plain text files, also import from html, odt, docx, rtf, tex, and md.
         md is text Markdown format.
-        Note importing from html, odt, docx, rtf all formatting is lost.
+        Note importing from html, odt, docx, rtf, tex all formatting is lost.
         Imports images as jpg, jpeg, png which are stored in an images directory.
         Imports audio as flac, mp3, wav, ogg, m4a which are stored in an audio directory.
         Imports video as mp4, mov, wmv, webm, m4v which are stored in a video directory.
 
-        param:
+        Args:
             link:   False - files are imported into project folder,
                     True - files are linked and not imported
         """
 
         if self.av_dialog_open is not None:
-            self.av_dialog_open.mediaplayer.stop()
+            # Guard: a dialog that failed mid-init can leave mediaplayer as None
+            if getattr(self.av_dialog_open, 'mediaplayer', None) is not None:
+                self.av_dialog_open.mediaplayer.stop()
             self.av_dialog_open = None
         response = QtWidgets.QFileDialog.getOpenFileNames(
             None, 
@@ -1941,99 +2898,146 @@ class DialogManageFiles(QtWidgets.QDialog):
 
         steps = len(imports)
         file_number = 0
-        first_filename = os.path.basename(imports[0])
+        first_filename = Path(imports[0]).name
         progress = QtWidgets.QProgressDialog(first_filename, None, file_number, steps, self)
         progress.setWindowModality(QtCore.Qt.WindowModality.WindowModal)
         progress.setWindowTitle(_("Importing"))
         progress.setMinimumDuration(0)  # Show immediately
+        # Without these, QProgressDialog auto-hides at maximum: with a single
+        # file it closed before the page-by-page extraction started.
+        progress.setAutoReset(False)
+        progress.setAutoClose(False)
         progress.show()
-        known_file_type = False
-        self.default_import_directory = os.path.dirname(imports[0])
+        self.default_import_directory = str(Path(imports[0]).parent)
         pdf_msg = ""
+        # Highlight coding option, asked ONCE per batch and only when the first PDF
+        # with highlight annotations is detected (tri-state: None = not asked yet).
+        self.pdf_import_code_highlights = None
         for import_path in imports:
+            known_file_type = False
             link_path = ""
             if link:
                 link_path = import_path
             # Check file size, any files over 2Gb are linked and not imported internally
-            fileinfo = os.stat(import_path)
+            fileinfo = Path(import_path).stat()
             if fileinfo.st_size >= 2147483647:
                 link_path = import_path
             # Need process events, if many large files are imported, leaves the FileDialog open and covering the screen.
             QtWidgets.QApplication.processEvents()
-            filename = os.path.basename(import_path)
+            filename = Path(import_path).name
             progress.setValue(file_number + 1)
             progress.setLabelText(filename)
+            # Duplicate: check BEFORE copying and extracting. Previously the file was copied
+            # and, for large PDFs, all the text was extracted only to be rejected at the end.
+            if any(d['name'] == filename for d in self.source):
+                QtWidgets.QMessageBox.warning(self, _('Duplicate file'),
+                                              _("Duplicate filename.\nFile not imported") + f"\n{filename}")
+                file_number += 1
+                continue
+            suffix = Path(import_path).suffix.lower()
+            # Base destination path, extended per file type below
             destination = self.app.project_path
-            if os.path.splitext(import_path)[1].lower() in ('.docx', '.odt', '.rtf', '.txt', '.htm', '.html', '.epub', '.md'):
+            if suffix in ('.docx', '.odt', '.rtf', '.tex', '.txt', '.htm', '.html', '.epub', '.md'):
+                if suffix == '.tex':
+                    try:
+                        imported_ok = self.load_file_text(import_path, f"docs:{import_path}", notify=False)
+                    except LatexImportError as err:
+                        logger.warning(f"LaTeX import error: {filename} {err}")
+                        Message(self.app, _("Cannot import LaTeX file"),
+                                _("Could not convert LaTeX to readable text") + f":\n{filename}",
+                                "warning").exec()
+                        continue
+                    if not imported_ok:
+                        continue
+                    known_file_type = True
+                    file_number += 1
+                    continue
                 destination += f"/documents/{filename}"
                 if link_path == "":
                     try:
                         copyfile(import_path, destination)
-                        self.load_file_text(import_path)
+                        imported_ok = self.load_file_text(import_path, notify=False)
                     except PermissionError as e_:
                         msg = _("Cannot copy file: ") + f"{filename}\n" + _(
                             "Is the file open?\nIs there a permission restriction?") + f"\n{e_}"
                         Message(self.app, _("Copy file permission error"), msg).exec()
                         continue
+                    if not imported_ok:
+                        # Import failed (duplicate, empty, error): remove the copy
+                        # so no residual files are left in /documents.
+                        try:
+                            Path(destination).unlink()
+                        except FileNotFoundError as err:
+                            logger.warning(_("Removing failed import copy: ") + str(err))
+                        continue
                 else:
-                    self.load_file_text(import_path, f"docs:{link_path}")
+                    self.load_file_text(import_path, f"docs:{link_path}", notify=False)
                 known_file_type = True
-            if os.path.splitext(import_path)[1].lower() == '.pdf':
+            if suffix == '.pdf':
                 destination += f"/documents/{filename}"
                 if link_path == "":
                     try:
                         copyfile(import_path, destination)
-                        self.load_file_text(import_path, "", progress)
+                        imported_ok = self.load_file_text(import_path, "", progress, notify=False)
                     except PermissionError as e_:
                         msg = _("Cannot copy file: ") + f"{filename}\n" + _(
                             "Is the file open?\nIs there a permission restriction?") + f"\n{e_}"
                         Message(self.app, _("Copy file permission error"), msg).exec()
                         continue
+                    if not imported_ok:
+                        # Rejected PDF (protected, damaged, duplicate): remove the copy
+                        # so no residual files are left in /documents.
+                        try:
+                            Path(destination).unlink()
+                        except FileNotFoundError as err:
+                            logger.warning(_("Removing failed import copy: ") + str(err))
+                        continue
                 else:
-                    self.load_file_text(import_path, f"docs:{link_path}")
+                    # Progress also applies to linked PDFs (extraction takes just as long).
+                    self.load_file_text(import_path, f"docs:{link_path}", progress, notify=False)
                 known_file_type = True
             # Media files
-            if os.path.splitext(import_path)[1].lower() in ('.jpg', '.jpeg', '.png'):
+            if Path(import_path).suffix.lower() in ('.jpg', '.jpeg', '.png'):
                 if link_path == "":
                     destination += f"/images/{filename}"
                     try:
                         copyfile(import_path, destination)
-                        self.load_media_reference(f"/images/{filename}")
+                        self.load_media_reference(f"/images/{filename}", notify=False)
                     except PermissionError as e_:
                         msg = _("Cannot copy file: ") + f"{filename}\n" + _(
                             "Is the file open?\nIs there a permission restriction?") + f"\n{e_}"
                         Message(self.app, _("Copy file permission error"), msg).exec()
                         continue
                 else:
-                    self.load_media_reference(f"images:{link_path}")
+                    self.load_media_reference(f"images:{link_path}", notify=False)
                 known_file_type = True
-            if os.path.splitext(import_path)[1].lower() in ('.flac', '.m4a', '.mp3',  '.ogg', '.wav'):
+            if Path(import_path).suffix.lower() in ('.flac', '.m4a', '.mp3',  '.ogg', '.wav'):
                 if link_path == "":
                     destination += f"/audio/{filename}"
                     try:
                         copyfile(import_path, destination)
-                        self.load_media_reference(f"/audio/{filename}")
+                        self.load_media_reference(f"/audio/{filename}", notify=False)
                     except PermissionError as e_:
                         msg = _("Cannot copy file: ") + f"{filename}\n" + _(
                             "Is the file open?\nIs there a permission restriction?") + f"\n{e_}"
                         Message(self.app, _("Copy file permission error"), msg).exec()
                         continue
                 else:
-                    self.load_media_reference(f"audio:{link_path}")
+                    self.load_media_reference(f"audio:{link_path}", notify=False)
                 known_file_type = True
-            if os.path.splitext(import_path)[1].lower() in ('.mkv', '.mov', '.mp4', '.m4v', '.wmv', '.webm'):
+            if Path(import_path).suffix.lower() in ('.mkv', '.mov', '.mp4', '.m4v', '.wmv', '.webm'):
                 if link_path == "":
                     destination += f"/video/{filename}"
                     try:
                         copyfile(import_path, destination)
-                        self.load_media_reference(f"/video/{filename}")
+                        self.load_media_reference(f"/video/{filename}", notify=False)
                     except PermissionError as e_:
                         msg = _("Cannot copy file: ") + f"{filename}\n" + _(
                             "Is the file open?\nIs there a permission restriction?") + f"\n{e_}"
                         Message(self.app, _("Copy file permission error"), msg).exec()
                         continue
                 else:
-                    self.load_media_reference(f"video:{link_path}")
+                    self.load_media_reference(f"video:{link_path}", notify=False)
                 known_file_type = True
             if not known_file_type:
                 Message(self.app, _('Not supported file type'),
@@ -2042,12 +3046,16 @@ class DialogManageFiles(QtWidgets.QDialog):
 
             file_number += 1
 
+        progress.close()
         if pdf_msg != "":
             self.parent_text_edit.append(pdf_msg)
         self.load_file_data()
         self.fill_table()
         self.app.delete_backup = False
         self.update_files_in_dialogs()
+        if file_number > 0:
+            # One event for the whole batch, not one per imported file
+            self._emit_project_table_changes(['source', 'attribute'])
 
     def update_files_in_dialogs(self):
         """ Update files list in any opened dialogs:
@@ -2073,16 +3081,51 @@ class DialogManageFiles(QtWidgets.QDialog):
                 if isinstance(c, DialogReportCodes):
                     c.get_files_and_cases()
 
-    def load_media_reference(self, mediapath):
+    def create_waveform_png(self, file_id, mediapath):
+        """ Pre-build the waveform image for an audio or video file, stored as
+        audio/waveform_<id>.png, so the AV coding dialog can reuse it instead of regenerating
+        it each time. For video the waveform is drawn from its audio track. Skipped on Linux
+        (ffmpeg showwavespic can segfault on some distros). Requires ffmpeg installed. """
+
+        if platform.system() == "Linux" or mediapath is None:
+            return
+        if not waveform_backend_available():
+            # ffmpeg not installed: skip silently. Playback (VLC) and coding still work;
+            # the coding dialog will show a "waveform unavailable" hint instead.
+            return
+        if mediapath[0:6] in ("/audio", "/video"):
+            abs_path = self.app.project_path + mediapath
+        elif mediapath[0:6] in ("audio:", "video:"):
+            abs_path = mediapath[6:]
+        else:
+            return
+        waveform_path = str(Path(self.app.project_path) / "audio" / f"waveform_{file_id}.png")
+        # Fire-and-forget worker thread so importing long media does not freeze the UI.
+        # Runs are serialised in the helper; the coding dialog waits if still pending.
+        generate_waveform_png_async(abs_path, waveform_path,
+                                    waveform_colour(self.app.settings['stylesheet']))
+
+    def remove_waveform_png(self, file_id):
+        """ Remove the cached waveform image for a deleted media file, to avoid residual files. """
+
+        waveform_path = str(Path(self.app.project_path) / "audio" / f"waveform_{file_id}.png")
+        try:
+            if Path(waveform_path).exists():
+                Path(waveform_path).unlink()
+        except OSError as err:
+            logger.warning(_("Deleting waveform error: ") + str(err))
+
+    def load_media_reference(self, mediapath:str, notify:bool=True):
         """ Load media reference information for all file types.
 
-        param:
+        Args:
             mediapath: QualCoder project folder path OR external link path to file
                        External link path contains prefix 'docs:', 'images:, 'audio:', 'video:'
         """
 
         # Check for duplicated filename and update model, widget and database
-        head_path, filename = os.path.split(mediapath)
+        path_obj = Path(mediapath)
+        head_path, filename = str(path_obj.parent), path_obj.name
         if any(d['name'] == filename for d in self.source):
             QtWidgets.QMessageBox.warning(self, _('Duplicate file'), _("Duplicate filename.\nFile not imported"))
             return
@@ -2105,6 +3148,10 @@ class DialogManageFiles(QtWidgets.QDialog):
             msg += _(" imported.")
         self.parent_text_edit.append(msg)
         self.source.append(entry)
+
+        # Pre-build the waveform image for audio and video files so the coding dialog loads faster
+        if mediapath[:6] in ("/audio", "audio:", "/video", "video:"):
+            self.create_waveform_png(id_, mediapath)
 
         # Create an empty transcription file for audio and video
         if mediapath[:6] in ("/audio", "audio:", "/video", "video:"):
@@ -2141,6 +3188,8 @@ class DialogManageFiles(QtWidgets.QDialog):
 
             self.parent_text_edit.append(entry['name'] + _(" created."))
             self.source.append(entry)
+        if notify:
+            self._emit_project_table_changes(['source', 'attribute'])
 
     def load_pseudonyms(self):
         """ Pseudonyms stored in pseudonyms.json in qda data folder.
@@ -2148,79 +3197,63 @@ class DialogManageFiles(QtWidgets.QDialog):
         """
 
         pseudonyms = []
-        pseudonyms_filepath = os.path.join(self.app.project_path, "pseudonyms.json")
+        pseudonyms_filepath = Path(self.app.project_path) / "pseudonyms.json"
         try:
             with open(pseudonyms_filepath, "r") as f:
                 pseudonyms = json.load(f)
-        except FileNotFoundError as err:
+        except FileNotFoundError:
             pass
         return pseudonyms
 
-    def decode_text_with_best_encoding(self, import_file):
-        """Decode text file bytes using robust encoding detection and fallbacks."""
+    def decode_text_with_best_encoding(self, import_file:str):
+        """ Decode text file bytes using robust encoding detection and fallbacks. """
 
-        with open(import_file, "rb") as sourcefile:
-            raw_bytes = sourcefile.read()
-        if not raw_bytes:
-            return "", "empty"
+        return decode_text_with_best_encoding_helper(import_file)
 
-        # try Unicode first, with and without BOM
-        decode_order = ("utf-8-sig", "utf-8")
-        for encoding in decode_order:
-            try:
-                return raw_bytes.decode(encoding), encoding
-            except UnicodeDecodeError:
-                pass
-
-        # no Unicode, try to detect charset with charset-normalizer, then fall back to common encodings
-        best_match = from_bytes(raw_bytes).best()
-        if best_match is not None:
-            detected_encoding = best_match.encoding if best_match.encoding else "unknown"
-            return str(best_match), detected_encoding
-
-        for encoding in ("cp1252", "latin-1"):
-            try:
-                return raw_bytes.decode(encoding), encoding
-            except UnicodeDecodeError:
-                pass
-
-        return raw_bytes.decode("utf-8", errors="backslashreplace"), "utf-8(backslashreplace)"
-
-    def load_file_text(self, import_file, link_path="", progress_ = None):
+    def load_file_text(self, import_file:str, link_path:str="", progress_:QProgressDialog|None=None,
+                       notify:bool=True):
         """ Import from file types of odt, docx, rtf, pdf, epub, txt, html, htm.
         Implement character detection for txt imports.
         Loading pdf text. I have removed additional line breaks. See commented sections below.
         Removing these allows the pdf to be coded in Code_text and Code_pdf without positional shifting problems.
-
         If pseudonyms.json is present in the qda folder, apply the pseudonyms to the words / phrases on import.
-
-        param:
+        Args:
             import_file: filepath of file to be imported, String
             link_path:  filepath of file to be linked, String
+            progress_: None or QProgressDialog
         """
 
         if self.av_dialog_open is not None:
-            self.av_dialog_open.mediaplayer.stop()
+            # Guard: a dialog that failed mid-init can leave mediaplayer as None
+            if getattr(self.av_dialog_open, 'mediaplayer', None) is not None:
+                self.av_dialog_open.mediaplayer.stop()
             self.av_dialog_open = None
+        # Duplicate: check BEFORE extracting (extraction is expensive for large PDFs).
+        # The check used to sit at the end, after all the extraction time was wasted.
+        filename = Path(import_file).name
+        if any(d['name'] == filename for d in self.source):
+            QtWidgets.QMessageBox.warning(self, _('Duplicate file'),
+                                          _("Duplicate filename.\nFile not imported"))
+            return False
         text_ = ""
+        suffix = Path(import_file).suffix.lower()
         # Import from odt
-        if import_file[-4:].lower() == ".odt":
+        if suffix == ".odt":
             text_ = self.convert_odt_to_text(import_file)
             text_ = text_.replace("\n", "\n\n")  # add line to paragraph spacing for visual format
         # Import from docx
         html_text_ = None
-        if import_file[-5:].lower() == ".docx":
-            document, docx_zip = opendocx(import_file)
-            text_ = "\n\n".join(getdocumenttext(document))
-            html_text_ = getdocumenttext_html(document, docx_zip)
-            docx_zip.close()
+        if suffix == ".docx":
+            document = opendocx(import_file)
+            with zipfile.ZipFile(import_file) as docx_zip:
+                html_text_ = getdocumenttext_html(document, docx_zip)
             # Derive plain text from HTML so positions match what QTextEdit.toPlainText() returns
             from PyQt6.QtGui import QTextDocument
             _doc = QTextDocument()
             _doc.setHtml(html_text_)
             text_ = _doc.toPlainText()
         # Import from rtf
-        if import_file[-4:].lower() == ".rtf":
+        if suffix == ".rtf":
             # text_ = rtf_to_text(import_file, encoding="latin-1", errors="replace")
             with open(import_file, "r", encoding="latin-1") as sourcefile:
                 text_ = ""
@@ -2233,16 +3266,10 @@ class DialogManageFiles(QtWidgets.QDialog):
                     Message(self.app, "rtf to text error", msg).exec()
         # Import from epub
         if import_file[-5:].lower() == ".epub":
-            book = epub.read_epub(import_file)
-            for d in book.get_items_of_type(ebooklib.ITEM_DOCUMENT):
-                try:
-                    bytes_ = d.get_body_content()
-                    string = bytes_.decode('utf-8')
-                    text_ += html_to_text(string) + "\n\n"  # Add line to paragraph spacing for visual format
-                except TypeError as err:
-                    logger.debug(f"ebooklib get_body_content error: {err}")
+            # Extraction shared with the reference attachment import.
+            text_ = extract_epub_fulltext(import_file)
         # Import from html
-        if import_file[-5:].lower() == ".html" or import_file[-4:].lower() == ".htm":
+        if suffix in (".html", ".htm"):
             import_errors = 0
             with open(import_file, "r", encoding="utf-8", errors="surrogateescape") as sourcefile:
                 html_text = ""
@@ -2265,29 +3292,50 @@ class DialogManageFiles(QtWidgets.QDialog):
                 if import_errors > 0:
                     Message(self.app, _("Warning"), str(import_errors) + _(" lines not imported"), "warning").exec()
         # Import PDF
-        if os.path.splitext(import_file)[1].lower() == '.pdf':
-            pdf_file = open(import_file, 'rb')
-            resource_manager = PDFResourceManager()
-            laparams = LAParams()
-            device = PDFPageAggregator(resource_manager, laparams=laparams)
-            interpreter = PDFPageInterpreter(resource_manager, device)
-            pages_generator = PDFPage.get_pages(pdf_file)  # Generator PDFpage objects
-            text_ = ""
-            # Can be very slow with large PDFs and older computers
-            for i, page in enumerate(pages_generator):
-                name_and_page = f"{os.path.basename(import_file)} p:{i}"
-                progress_.setLabelText(name_and_page)
-                QtCore.QCoreApplication.processEvents()  # Trial this to see if it prevents 'App not responding'
-                self.pdf_page_text = ""
-                interpreter.process_page(page)
-                layout = device.get_result()
-                for lobj in layout:
-                    self.get_item_and_hierarchy(page, lobj)
-                text_ += self.pdf_page_text
-        # Try importing as a plain text file.
-        if text_ == "":
+        if suffix == '.pdf':
+            # Extraction with the SAME extractor as the viewer (code_pdf.extract_pdf_fulltext),
+            # otherwise coding positions do not map onto the PDF pages.
+            def pdf_progress(current_page, total_pages):
+                if progress_ is not None:
+                    progress_.setLabelText(f"{Path(import_file).name} p:{current_page}/{total_pages}")
+                QtCore.QCoreApplication.processEvents()
             try:
-                text_, detected_encoding = self.decode_text_with_best_encoding(import_file)
+                # Paragraph layout; the viewer also verifies the classic line
+                # layout, so older imports keep working.
+                text_ = extract_pdf_fulltext(import_file, pdf_progress, join_lines=True)
+            except ValueError as err:
+                Message(self.app, _("Cannot import PDF"),
+                        f"{Path(import_file).name}\n{err}", "warning").exec()
+                return False
+            except Exception as err:
+                # Damaged or unreadable PDF
+                logger.warning(f"PDF import error: {import_file} {err}")
+                Message(self.app, _("Cannot import PDF"),
+                        _("Damaged or unreadable PDF") + f":\n{Path(import_file).name}\n{err}",
+                        "warning").exec()
+                return False
+            if text_.strip() == "":
+                # No text layer (scanned PDF): imported anyway, with page markers,
+                # so AREA coding works in the PDF viewer.
+                msg = _("No text layer detected (scanned PDF?).") + "\n"
+                msg += _("Area coding will be available in the PDF view, "
+                         "but text coding and text search will not.")
+                Message(self.app, _("PDF without text"),
+                        f"{Path(import_file).name}\n{msg}", "warning").exec()
+        if suffix == ".tex":
+            try:
+                text_ = tex_file_to_plain_text(import_file)
+            except LatexImportError as err:
+                logger.warning(f"LaTeX import error: {Path(import_file).name} {err}")
+                Message(self.app, _("Cannot import LaTeX file"),
+                        _("Could not convert LaTeX to readable text") + f":\n{Path(import_file).name}",
+                        "warning").exec()
+                return False
+        # Try importing as a plain text file.
+        # Never decode a PDF as plain text (it would produce unreadable binary).
+        if text_ == "" and suffix not in ('.pdf', '.tex'):
+            try:
+                text_, detected_encoding = decode_text_with_best_encoding_helper(import_file)
                 logger.debug(f"Importing plain text file: {import_file} decoded as {detected_encoding}")
                 if text_ and text_[0] == "\ufeff":  # associated with notepad files
                     text_ = text_[1:]
@@ -2295,34 +3343,25 @@ class DialogManageFiles(QtWidgets.QDialog):
                 logger.warning(str(err))
                 Message(self.app, _("Warning"), _("Cannot import") + f"{import_file}\n{err}",
                         "warning").exec()
-                return
+                return False
         # Import of text file did not work
         if text_ == "":
             Message(self.app, _("Warning"),
                     _("Cannot import ") + str(import_file) + "\nPlease check if the file is empty.", "warning").exec()
-            return
-        # normalise line endings and strip BOM so the stored fulltext matches
-        # exactly what QPlainTextEdit will display. Qt converts \r\n and lone \r
-        # into \n on setPlainText(), and a leftover BOM adds a char; either makes
-        # stored positions drift past the editor length (setPosition out of range,
-        # frozen highlight on resize). <- L
-        if os.path.splitext(import_file)[1].lower() != '.pdf': # skip PDF 
+            return False
+        # Normalise line endings and strip BOM: Qt converts \r\n/\r to \n on
+        # setPlainText, so mismatches make stored positions drift.
+        if suffix != '.pdf': # skip PDF
             text_ = text_.replace("\r\n", "\n").replace("\r", "\n")
             if text_ and text_[0] == "\ufeff":
                 text_ = text_[1:]
-        # Final checks: check for duplicated filename and update model, widget and database
-        name_split = import_file.split("/")
-        filename = name_split[-1]
-        if any(d['name'] == filename for d in self.source):
-            QtWidgets.QMessageBox.warning(self, _('Duplicate file'),
-                                          _("Duplicate filename.\nFile not imported"))
-            return
+        # Name and duplicate were already checked at the start, before extracting.
 
         # Apply pseudonym text replacement
         pseudonyms = self.load_pseudonyms()
-        if import_file[-4:].lower() != '.pdf':
+        if suffix != '.pdf':
             for pseudonym in pseudonyms:
-                pseudonymised = re.sub(rf"\b{pseudonym['original']}\b", pseudonym['pseudonym'], text_)
+                pseudonymised = re.sub(rf"(?<!\w){re.escape(pseudonym['original'])}(?!\w)", pseudonym['pseudonym'], text_)
                 text_ = pseudonymised
 
         # Internal storage
@@ -2366,26 +3405,37 @@ class DialogManageFiles(QtWidgets.QDialog):
             msg += _(" linked")
         self.parent_text_edit.append(msg)
         self.source.append(entry)
+        if notify:
+            self._emit_project_table_changes(['source', 'attribute'])
+        # Offer once per batch to code highlights/underlines; not painted in the
+        # coding view (annots=False).
+        if suffix == '.pdf':
+            # Non-markup annotations with text are appended to the file memo.
+            entry['memo'] = pdf_annotations_to_file_memo(self.app, self.parent_text_edit, entry['id'],
+                                                         import_file, entry['memo'])
+            try:
+                highlights = extract_pdf_highlights(import_file)
+            except Exception as err:
+                logger.warning(f"Markup detection: {import_file} {err}")
+                highlights = []
+            if highlights:
+                if self.pdf_import_code_highlights is None:
+                    reply = QtWidgets.QMessageBox.question(
+                        self, _("PDF highlights"), pdf_markups_question_text(highlights),
+                        QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+                        QtWidgets.QMessageBox.StandardButton.Yes)
+                    self.pdf_import_code_highlights = reply == QtWidgets.QMessageBox.StandardButton.Yes
+                if self.pdf_import_code_highlights:
+                    # Reuses the batch import dialog; the phase only shows after acceptance.
+                    code_pdf_highlights(self.app, self.parent_text_edit, entry['id'], import_file,
+                                        entry['fulltext'], highlights, progress_, self)
+        return True  # Import completed; lets import_files clean up failed copies
 
-    # Pdf loading method
-    def get_item_and_hierarchy(self, page, lobj: Any):
-        """ Get text item details add to page_dict, with descendants.
-        Use LTextLine as this object can be parsed in Code_pdf for font size and colour.
-        """
-
-        if isinstance(lobj, LTTextLine):  # Do not use LTTextBox
-            obj_text = lobj.get_text()
-            # Fix Pdfminer recognising invalid unicode characters.
-            obj_text = obj_text.replace(u"\uE002", "Th")
-            obj_text = obj_text.replace(u"\uFB01", "fi")
-            self.pdf_page_text += obj_text
-        if isinstance(lobj, Iterable):
-            for obj in lobj:
-                self.get_item_and_hierarchy(page, obj)
-
-    def convert_odt_to_text(self, import_file):
+    def convert_odt_to_text(self, import_file:str):
         """ Convert odt to very rough equivalent with headings, list items and tables for
-        html display in qTextEdits. """
+        html display in qTextEdits.
+        Args:
+            import_file: String """
 
         odt_file = zipfile.ZipFile(import_file)
         data = str(odt_file.read('content.xml'))  # bytes class to string
@@ -2442,11 +3492,11 @@ class DialogManageFiles(QtWidgets.QDialog):
         """
 
         if self.av_dialog_open is not None:
-            self.av_dialog_open.mediaplayer.stop()
+            # Guard: a dialog that failed mid-init can leave mediaplayer as None
+            if getattr(self.av_dialog_open, 'mediaplayer', None) is not None:
+                self.av_dialog_open.mediaplayer.stop()
             self.av_dialog_open = None
-        index_list = self.ui.tableWidget.selectionModel().selectedIndexes()
-        rows = [i.row() for i in index_list]
-        rows = list(set(rows))  # duplicate rows due to multiple columns
+        rows = self.visible_selected_rows()
         if len(rows) == 0:
             return
 
@@ -2469,16 +3519,16 @@ class DialogManageFiles(QtWidgets.QDialog):
                 filedata = self.source[row]['fulltext']
                 if not filename.endswith(".txt"):
                     filename += ".txt"
-                path = os.path.join(destination, filename)
+                path = Path(destination)/ filename
                 with open(path, 'w', encoding='utf-8-sig') as textfile:
                     textfile.write(filedata)
                 continue
             # Export audio, video, picture files
             if mediapath is not None and mediapath[0:6] != "/docs/":
-                # Note: [1:] must remove leading slash for os.path.join
-                file_path = os.path.join(self.app.project_path, mediapath[1:])
+                # Note: [1:] must remove leading slash
+                file_path = Path(self.app.project_path) / mediapath[1:]
                 try:
-                    copyfile(file_path, os.path.join(destination, filename))
+                    copyfile(file_path, Path(destination)/ filename)
                     if filename != mediapath[6:]:
                         export_msg += f"{filename} ({mediapath[6:]}) " + _("exported.") + "\n"
                     else:
@@ -2494,22 +3544,22 @@ class DialogManageFiles(QtWidgets.QDialog):
                 filedata = self.source[row]['fulltext']
                 if not filename.endswith(".txt"):
                     filename += ".txt"
-                path = os.path.join(destination, filename)
+                path = Path(destination) / filename
                 with open(path, 'w', encoding='utf-8-sig') as textfile:
                     textfile.write(filedata)
                 continue
 
             # Export md, pdf, docx, odt, epub, html files with text rep. if located in documents directory
-            source_path = os.path.join(self.app.project_path, "documents", mediapath[6:])  # 0-6 is /docs/
-            document_exists = os.path.exists(source_path)
+            source_path = Path(self.app.project_path) / "documents" / mediapath[6:]  # 0-6 is /docs/
+            document_exists = Path(source_path).exists()
             if document_exists:
                 try:
                     # Remove '/docs/' from start of mediapath string
-                    copyfile(source_path, os.path.join(destination, mediapath[6:]))
+                    copyfile(source_path, Path(destination) / mediapath[6:])
                     filedata = self.source[row]['fulltext']
                     if not filename.endswith(".txt"):
                         filename += ".txt"
-                    path = os.path.join(destination, filename)
+                    path = Path(destination) / filename
                     with open(path, 'w', encoding='utf-8-sig') as file_:
                         file_.write(filedata)
                     if filename != mediapath[6:]:
@@ -2531,6 +3581,94 @@ class DialogManageFiles(QtWidgets.QDialog):
         export_msg += "\n" + msg
         self.parent_text_edit.append(export_msg)
 
+    def release_files_in_coding_dialogs(self):
+        """
+        Releases file handles held by open coding dialogs. DialogCodePdf workers
+        (render and text) keep the PDF open while coding; on Windows that blocks
+        removing the file and the file would remain as a residual. Call ALWAYS before
+        deleting project files.
+        """
+
+        contents = self.tab_coding.layout()
+        if contents is None:
+            return
+        for i in reversed(range(contents.count())):
+            c = contents.itemAt(i).widget()
+            if isinstance(c, DialogCodePdf):
+                try:
+                    c.stop_workers()
+                except (AttributeError, RuntimeError):
+                    pass
+
+    def vectorstore_delete_document_safe(self, fid:int):
+        """
+        Removes the document from the AI index without letting a vectorstore lock
+        abort the project file deletion (e.g. "database is locked" when an embeddings
+        worker is writing to search.sqlite in the background). The index is derived
+        data: the next update_vectorstore prunes ids no longer in source, so failing
+        soft here is safe and self-repairing.
+
+        Args:
+            fid: source id, Integer
+        """
+
+        if self.app.settings['ai_enable'] != 'True':
+            return
+        try:
+            self.app.ai.sources_vectorstore.delete_document(fid)
+        except Exception as err:
+            logger.warning(f"vectorstore delete_document fid {fid}: {err}")
+            self.parent_text_edit.append(
+                _("AI index is busy; the deleted file will be removed from the index "
+                  "on the next update."))
+
+    def _unlink_media_with_retry(self, filepath):
+        """ Players free the file handle asynchronously, so an immediate unlink
+        can still hit WinError 32: retry briefly, then warn. """
+        last_err = None
+        for _attempt in range(12):
+            try:
+                Path(filepath).unlink()
+                return True
+            except FileNotFoundError as err:
+                logger.warning(_("Deleting file error: ") + str(err))
+                return True
+            except PermissionError as err:
+                last_err = err
+                self._release_media_players_for(filepath)
+                QtWidgets.QApplication.processEvents()
+                time.sleep(0.15)
+        logger.warning(f"Locked media file, could not delete: {filepath} {last_err}")
+        Message(self.app, _("Cannot delete file"),
+                _("The file is in use by another program and was not deleted:") +
+                f"\n{filepath}", "warning").exec()
+        return False
+
+    def _release_media_players_for(self, filepath):
+        """ Ask every live player holding this file to let go before unlink
+        (an open handle raises WinError 32 on Windows). """
+        try:
+            target = str(Path(filepath).resolve())
+        except Exception:
+            target = str(filepath)
+        for w in QtWidgets.QApplication.allWidgets():
+            mp = getattr(w, 'mediaplayer', None)
+            if mp is None:
+                continue
+            try:
+                if type(mp).__module__.endswith('media_player_qt'):
+                    src = mp.player.source().toLocalFile()
+                    if src and str(Path(src).resolve()) == target:
+                        mp.release()
+                else:
+                    med = mp.get_media()
+                    if med is not None and target.replace("\\", "/") in \
+                            str(med.get_mrl() or "").replace("%20", " "):
+                        mp.stop()
+                        mp.set_media(None)  # stop alone may keep the handle a moment
+            except Exception:
+                pass
+
     def delete_button_multiple_files(self):
         """ Delete files from database and update model and widget.
         Also, delete files from sub-directories, if not externally linked.
@@ -2539,9 +3677,19 @@ class DialogManageFiles(QtWidgets.QDialog):
         """
 
         if self.av_dialog_open is not None:
-            self.av_dialog_open.mediaplayer.stop()
+            # Guard: a dialog that failed mid-init can leave mediaplayer as None
+            if getattr(self.av_dialog_open, 'mediaplayer', None) is not None:
+                self.av_dialog_open.mediaplayer.stop()
+                if type(self.av_dialog_open.mediaplayer).__module__.endswith('media_player_qt'):
+                    self.av_dialog_open.mediaplayer.release()  # free handle before unlink
+            self.av_dialog_open.close()
             self.av_dialog_open = None
-        ui = DialogSelectItems(self.app, self.source, _("Delete files"), "multi")
+        # Respect active filters: only visible files are offered for deletion
+        visible_sources = [s for r, s in enumerate(self.source)
+                           if not self.ui.tableWidget.isRowHidden(r)]
+        if not visible_sources:
+            return
+        ui = DialogSelectItems(self.app, visible_sources, _("Delete files"), "multi")
         ok = ui.exec()
         if not ok:
             return
@@ -2556,6 +3704,8 @@ class DialogManageFiles(QtWidgets.QDialog):
         if not ok:
             return
 
+        # Release PDFs open in coding tabs before deleting on disk.
+        self.release_files_in_coding_dialogs()
         msg = ""
         cur = self.app.conn.cursor()
         for s in selection:
@@ -2564,23 +3714,38 @@ class DialogManageFiles(QtWidgets.QDialog):
             # Delete text source
             if s['mediapath'] is None or s['mediapath'][0:5] == 'docs:' or s['mediapath'][0:6] == '/docs/':
                 try:
+                    # Relative parts: an absolute "/documents/" segment dropped the
+                    # project path, so unlink never found the file.
+                    docs_dir = (Path(self.app.project_path) / "documents").resolve()
+                    p = None
                     if s['mediapath'] is None:
                         # Legacy for older < 3.4 QualCoder projects
-                        os.remove(self.app.project_path + "/documents/" + s['name'])
-                    if s['mediapath'][0:6] == '/docs/':
-                        os.remove(self.app.project_path + "/documents/" + s['name'][6:])
+                        p = (docs_dir / s['name']).resolve()
+                    elif s['mediapath'][0:6] == '/docs/':
+                        # elif: None cannot be sliced. Previously sliced s['name'][6:].
+                        p = (docs_dir / s['mediapath'][6:]).resolve()
+                    # Never unlink outside the project documents folder (../ guard).
+                    if p is not None and docs_dir in p.parents:
+                        p.unlink()
+                    elif p is not None:
+                        logger.warning(f"Refused to delete outside documents folder: {p}")
                 except OSError as err:
+                    # Includes PermissionError: log and continue, DB rows must still go.
                     logger.warning(_("Deleting file error: ") + str(err))
                 # Delete stored coded sections and source details
                 cur.execute("delete from source where id = ?", [s['id']])
                 cur.execute("delete from code_text where fid = ?", [s['id']])
+                # Coded areas over PDF pages (code_image with pdf_page); orphaned without this.
+                cur.execute("delete from code_image where id = ?", [s['id']])
                 cur.execute("delete from annotation where fid = ?", [s['id']])
                 cur.execute("delete from case_text where fid = ?", [s['id']])
                 cur.execute("delete from attribute where attr_type ='file' and id=?", [s['id']])
+                # Clear stale transcript links: SQLite reuses row ids and a later
+                # import could inherit this id, becoming a ghost transcript
+                cur.execute("update source set av_text_id=null where av_text_id=?", [s['id']])
                 self.app.conn.commit()
                 # Delete from vectorstore
-                if self.app.settings['ai_enable'] == 'True':
-                    self.app.ai.sources_vectorstore.delete_document(s['id'])
+                self.vectorstore_delete_document_safe(s['id'])
 
                     # Delete image, audio or video source
             if s['mediapath'] is not None and s['mediapath'][0:5] != 'docs:' and s['mediapath'][0:6] != '/docs/':
@@ -2599,10 +3764,10 @@ class DialogManageFiles(QtWidgets.QDialog):
                 # Remove project folder file, if internally stored
                 if ':' not in s['mediapath']:
                     filepath = self.app.project_path + s['mediapath']
-                    try:
-                        os.remove(filepath)
-                    except OSError as err:
-                        logger.warning(_("Deleting file error: ") + str(err))
+                    self._release_media_players_for(filepath)
+                    self._unlink_media_with_retry(filepath)
+                # Remove the cached waveform image, if any
+                self.remove_waveform_png(s['id'])
                 # Delete stored coded sections and source details
                 cur.execute("delete from source where id = ?", [s['id']])
                 cur.execute("delete from code_image where id = ?", [s['id']])
@@ -2610,6 +3775,7 @@ class DialogManageFiles(QtWidgets.QDialog):
                 cur.execute("delete from attribute where attr_type='file' and id=?", [s['id']])
                 # Just in case, added this line
                 cur.execute("delete from case_text where fid = ?", [s['id']])
+                cur.execute("update source set av_text_id=null where av_text_id=?", [s['id']])
                 self.app.conn.commit()
 
                 # Delete linked transcription text file
@@ -2620,9 +3786,8 @@ class DialogManageFiles(QtWidgets.QDialog):
                     cur.execute("delete from case_text where fid = ?", [res[0]])
                     cur.execute("delete from attribute where attr_type ='file' and id=?", [res[0]])
                     self.app.conn.commit()
-                    # Delete from vectorstore
-                    if self.app.settings['ai_enable'] == 'True':
-                        self.app.ai.sources_vectorstore.delete_document(res[0])
+                    # Delete from vectorstore; the safe helper survives index locks
+                    self.vectorstore_delete_document_safe(res[0])
 
         self.update_files_in_dialogs()
         self.check_attribute_placeholders()
@@ -2630,6 +3795,7 @@ class DialogManageFiles(QtWidgets.QDialog):
         self.load_file_data()
         self.fill_table()
         self.app.delete_backup = False
+        self._emit_project_table_changes(['source', 'code_text', 'code_image', 'code_av', 'annotation', 'case_text', 'attribute'])
 
     def delete(self):
         """ Delete files from database and update model and widget.
@@ -2638,11 +3804,14 @@ class DialogManageFiles(QtWidgets.QDialog):
         """
 
         if self.av_dialog_open is not None:
-            self.av_dialog_open.mediaplayer.stop()
+            # Guard: a dialog that failed mid-init can leave mediaplayer as None
+            if getattr(self.av_dialog_open, 'mediaplayer', None) is not None:
+                self.av_dialog_open.mediaplayer.stop()
+                if type(self.av_dialog_open.mediaplayer).__module__.endswith('media_player_qt'):
+                    self.av_dialog_open.mediaplayer.release()  # free handle before unlink
+            self.av_dialog_open.close()
             self.av_dialog_open = None
-        index_list = self.ui.tableWidget.selectionModel().selectedIndexes()
-        rows = [i.row() for i in index_list]
-        rows = list(set(rows))  # duplicate rows due to multiple columns
+        rows = self.visible_selected_rows()
         if len(rows) == 0:
             return
         filenames = ""
@@ -2653,6 +3822,8 @@ class DialogManageFiles(QtWidgets.QDialog):
         if not ok:
             return
 
+        # Release PDFs open in coding tabs before deleting on disk.
+        self.release_files_in_coding_dialogs()
         cur = self.app.conn.cursor()
         for row in rows:
             file_id = self.source[row]['id']
@@ -2660,23 +3831,36 @@ class DialogManageFiles(QtWidgets.QDialog):
             if self.source[row]['mediapath'] is None or self.source[row]['mediapath'][0:5] == 'docs:' or \
                     self.source[row]['mediapath'][0:6] == '/docs/':
                 try:
-                    if self.source[row]['mediapath']:
+                    # Relative parts: an absolute "/documents/" segment dropped the
+                    # project path, so unlink never found the file.
+                    docs_dir = (Path(self.app.project_path) / "documents").resolve()
+                    p = None
+                    if self.source[row]['mediapath'] is None:
                         # Legacy for older QualCoder Projects < 3.3
-                        os.remove(self.app.project_path + "/documents/" + self.source[row]['name'])
-                    if self.source[row]['mediapath'] is not None and self.source[row]['mediapath'][0:6] == '/docs/':
-                        os.remove(self.app.project_path + "/documents/" + self.source[row]['mediapath'][6:])
+                        # The condition was inverted (deleted when mediapath was present).
+                        p = (docs_dir / self.source[row]['name']).resolve()
+                    elif self.source[row]['mediapath'][0:6] == '/docs/':
+                        p = (docs_dir / self.source[row]['mediapath'][6:]).resolve()
+                    # Never unlink outside the project documents folder (../ guard).
+                    if p is not None and docs_dir in p.parents:
+                        p.unlink()
+                    elif p is not None:
+                        logger.warning(f"Refused to delete outside documents folder: {p}")
                 except OSError as err:
+                    # Includes PermissionError: log and continue, DB rows must still go.
                     logger.warning(_("Deleting file error: ") + str(err))
                 # Delete stored coded sections and source details
                 cur.execute("delete from source where id = ?", [file_id])
                 cur.execute("delete from code_text where fid = ?", [file_id])
+                # Coded areas over PDF pages (code_image with pdf_page); orphaned without this.
+                cur.execute("delete from code_image where id = ?", [file_id])
                 cur.execute("delete from annotation where fid = ?", [file_id])
                 cur.execute("delete from case_text where fid = ?", [file_id])
                 cur.execute("delete from attribute where attr_type ='file' and id=?", [file_id])
+                cur.execute("update source set av_text_id=null where av_text_id=?", [file_id])
                 self.app.conn.commit()
                 # Delete from vectorstore
-                if self.app.settings['ai_enable'] == 'True':
-                    self.app.ai.sources_vectorstore.delete_document(file_id)
+                self.vectorstore_delete_document_safe(file_id)
 
             else:  # Delete image, audio or video source
                 # Get linked transcript file id
@@ -2694,19 +3878,18 @@ class DialogManageFiles(QtWidgets.QDialog):
                 # Remove folder file, if internally stored
                 if ':' not in self.source[row]['mediapath']:
                     filepath = self.app.project_path + self.source[row]['mediapath']
-                    try:
-                        os.remove(filepath)
-                    except OSError as err:
-                        logger.warning(_("Deleting file error: ") + str(err))
+                    self._release_media_players_for(filepath)
+                    self._unlink_media_with_retry(filepath)
+                # Remove the cached waveform image, if any
+                self.remove_waveform_png(file_id)
                 # Delete stored coded sections and source details
                 cur.execute("delete from source where id = ?", [file_id])
                 cur.execute("delete from code_image where id = ?", [file_id])
                 cur.execute("delete from code_av where id = ?", [file_id])
                 cur.execute("delete from attribute where attr_type='file' and id=?", [file_id])
                 self.app.conn.commit()
-                # Delete from vectorstore (this should not be necessary since it's not a text file, but just to be sure...)
-                if self.app.settings['ai_enable'] == 'True':
-                    self.app.ai.sources_vectorstore.delete_document(file_id)
+                # Not expected for non-text files; the safe helper survives index locks
+                self.vectorstore_delete_document_safe(file_id)
 
                 # Delete transcription text file
                 if av_text_id is not None:
@@ -2716,9 +3899,8 @@ class DialogManageFiles(QtWidgets.QDialog):
                     cur.execute("delete from case_text where fid = ?", [res[0]])
                     cur.execute("delete from attribute where attr_type ='file' and id=?", [res[0]])
                     self.app.conn.commit()
-                    # Delete from vectorstore
-                    if self.app.settings['ai_enable'] == 'True':
-                        self.app.ai.sources_vectorstore.delete_document(res[0])
+                    # Delete from vectorstore; the safe helper survives index locks
+                    self.vectorstore_delete_document_safe(res[0])
 
             self.files_renamed = [x for x in self.files_renamed if not (file_id == x.get('fid'))]
         self.update_files_in_dialogs()
@@ -2726,10 +3908,12 @@ class DialogManageFiles(QtWidgets.QDialog):
         self.parent_text_edit.append(_("Deleted: ") + filenames)
         self.load_file_data()
         self.app.delete_backup = False
+        self._emit_project_table_changes(['source', 'code_text', 'code_image', 'code_av', 'annotation', 'case_text', 'attribute'])
 
-    def get_tooltip_values(self, attribute_name):
+    def get_tooltip_values(self, attribute_name:str):
         """ Get values to display in tooltips for the value list column.
-        param: attribute_name : String """
+        Args:
+            attribute_name : String """
 
         tt = ""
         cur = self.app.conn.cursor()
@@ -2800,7 +3984,8 @@ class DialogManageFiles(QtWidgets.QDialog):
                     name_tt += f"\nORIGINAL FILE NOT FOUND"
             name_item.setToolTip(name_tt)
             self.ui.tableWidget.setItem(row, self.NAME_COLUMN, name_item)
-            date_item = QtWidgets.QTableWidgetItem(data['date'])
+            trimmed_date = data['date'].split()[0]
+            date_item = QtWidgets.QTableWidgetItem(trimmed_date)
             date_item.setFlags(date_item.flags() ^ QtCore.Qt.ItemFlag.ItemIsEditable)
             self.ui.tableWidget.setItem(row, self.DATE_COLUMN, date_item)
             memo_string = ""
@@ -2844,19 +4029,21 @@ class DialogManageFiles(QtWidgets.QDialog):
             self.ui.tableWidget.horizontalHeaderItem(self.ATTRIBUTE_START_COLUMN + i).setToolTip(
                 _("Right click header row to hide columns") + "\n" + tt)
 
-        self.update_label_file_count() # ---
+        self.update_label_file_count()
+        if getattr(self, "header_filters", None) is not None and \
+                (self.file_filter_active() or self.rows_hidden):
+            self.apply_file_filter()
         self.ui.tableWidget.blockSignals(False)
 
 
 class DialogSurveyImport(QtWidgets.QDialog):
     """ Survey import dialog. To assign cases, attributes and qualitative text. """
 
-    def __init__(self, columns, parent=None):
+    def __init__(self, columns:list[str], parent=None):
         super().__init__(parent)
         self.setWindowTitle(_("Survey Import Assistant"))
-        self.resize(780, 580) 
+        self.resize(780, 500)
         self.setMaximumWidth(850) 
-        
         main_layout = QtWidgets.QVBoxLayout(self)
         
         # File Name Selector
@@ -2932,7 +4119,6 @@ class DialogSurveyImport(QtWidgets.QDialog):
         self.list_text.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
         ttip2 = _("Multiple qualitative columns will be collated into one file.") + "\n"
         ttip2 += _("The column name is a header preceding each block of text.")
-
         text_block, self.btn_text_add, self.btn_text_rem = create_target_block(_("3. Qualitative Texts:"), self.list_text, 70, ttip2)
         right_layout.addLayout(text_block)
         
@@ -2960,10 +4146,10 @@ class DialogSurveyImport(QtWidgets.QDialog):
         # Button connections
         self.btn_case_add.clicked.connect(lambda: self.move_items(self.list_available, self.list_case))
         self.btn_case_rem.clicked.connect(lambda: self.move_items(self.list_case, self.list_available))
-        
+
         self.btn_attr_add.clicked.connect(lambda: self.move_items(self.list_available, self.list_attr))
         self.btn_attr_rem.clicked.connect(lambda: self.move_items(self.list_attr, self.list_available))
-        
+
         self.btn_text_add.clicked.connect(lambda: self.move_items(self.list_available, self.list_text))
         self.btn_text_rem.clicked.connect(lambda: self.move_items(self.list_text, self.list_available))
 
@@ -2982,11 +4168,6 @@ class DialogSurveyImport(QtWidgets.QDialog):
         cases = [self.list_case.item(i).text() for i in range(self.list_case.count())]
         attrs = [self.list_attr.item(i).text() for i in range(self.list_attr.count())]
         return texts, cases, attrs
-        
-    '''def get_filename_column(self):
-        if self.combo_filename.currentIndex() == 0:
-            return None
-        return self.combo_filename.currentText()'''
         
     def get_autocode_setting(self):
         return self.cb_autocode.isChecked()

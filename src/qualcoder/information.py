@@ -14,7 +14,7 @@ See the GNU General Public License for more details.
 You should have received a copy of the GNU Lesser General Public License along with QualCoder.
 If not, see <https://www.gnu.org/licenses/>.
 
-Author: Colin Curtain (ccbogel)
+Author: Colin Curtain C, Kai Dröge, Justin Missaghieh--Poncet, Lorenzo Salomón
 https://github.com/ccbogel/QualCoder
 https://qualcoder.wordpress.com/
 https://qualcoder-org.github.io
@@ -24,14 +24,15 @@ https://qualcoder.org/
 import html
 from markdown_it import MarkdownIt
 from PyQt6 import QtWidgets, QtCore, QtGui
-import os
+from pathlib import Path
 import logging
 import qtawesome as qta
 import re
 
 from .GUI.ui_dialog_information import Ui_Dialog_information
 
-path = os.path.abspath(os.path.dirname(__file__))
+path = Path(__file__).resolve().parent
+
 logger = logging.getLogger(__name__)
 tab_info_markdown_renderer = MarkdownIt("commonmark")
 help_link_pattern = re.compile(r'(<a href="qualcoder://help/[^"]*">)', re.IGNORECASE)
@@ -71,8 +72,7 @@ def render_tab_info_markdown(
         doc_font_family,
         heading_icon_name=None,
         link_text_color=None):
-    """Render placeholder tab Markdown to HTML, including link decoration, etc.
-    """
+    """Render placeholder tab Markdown to HTML, including link decoration, etc. """
 
     icon_size = round(doc_font_size * 2)
     rendered_html = tab_info_markdown_renderer.render(markdown_text)
@@ -138,7 +138,7 @@ class DialogInformation(QtWidgets.QDialog):
          view_graph_original.ViewGraphOriginal.circular_graph.TextGraphicsItem
     """
 
-    def __init__(self, app, title, html_string=""):
+    def __init__(self, app, title:str, html_string:str=""):
         """Display information text in dialog.
         If no html is given, fill with About html.
         Args:
@@ -157,9 +157,8 @@ class DialogInformation(QtWidgets.QDialog):
         self.information = ""
         self.setWindowTitle(title)
         if html_string == "":
-            qualcoder_tag = app.version.split("QualCoder ")[1]
-            about_modifed = about.replace("QualCoderVersion", app.version)
-            about_modifed = about_modifed.replace("QualCoderTag", qualcoder_tag)
+            about_modifed = about.replace("qualcoder_version", app.version)
+            about_modifed = about_modifed.replace("qualcoder_citation", app.citation)
             self.setHtml(about_modifed)
         else:
             self.setHtml(html_string)
@@ -181,11 +180,10 @@ class DialogInformation(QtWidgets.QDialog):
 
 
 about = f'<h1 class="western">{_("About")} QualCoder</h1>\
-<h2 class="western">Version:</h2>\
-<p>QualCoderVersion</p>\
+<h2 class="western">Version: qualcoder_version</h2>\
 <p>{_("Optional: Install VLC for audio and video coding.")}<br /> \
 {_("Optional: Install ffmpeg for waveform images.")}</p>\
-<p>Tested on: Windows 11.</p>\
+<p>Tested on: Windows 11, Linux Mint 22.3.</p>\
 <p></p>\
 <h2 class="western">{_("Acknowledgements")}</h2>\
 <p>Ronggui Huang, Zhang Gehao - {_("Created RQDA - inspiration for QualCoder.")}<br /> \
@@ -198,8 +196,7 @@ Lorenzo Salomón - {_("Programming and Spanish translations.")}<br /> \
 Jofen Kihlstrom for past Swedish translations.<br /> \
 {_("To the many members on Github for supporting this project.")}</p>\
 <h2>Citation</h2>\
-<p>Curtain C, Dröge K, Missaghieh--Poncet J, Salomón L. (2026) QualCoder Version [Computer software]. \
-Retrieved from https://github.com/ccbogel/QualCoder/releases/tag/QualCoderTag</p>\
+<p>qualcoder_citation</p>\
 <h2 class="western">Other details</h2> \
 <p>The qda data folder contains folders for imported documents, \
 images, audio and video. It also contains the sqlite database, named data.qda, which stores the coding data.<br /> \
@@ -331,6 +328,20 @@ F2 {_("When tree item selected - Rename code or category")}<br /><br />'
 
 menu_shortcuts_display = menu_shortcuts + manage_section_shortcuts + view_av_shortcuts
 
+code_tree_shortcuts = f'<h2>Code tree</h2>\
+When coding. Click on codes / categories in code tree to activate these options<br />\
+F2 {_("Rename code or category")}<br />\
+F3 {_("Edit memo")}<br />\
+DEL {_("Delete code or category")}<br />\
+F5 {_("Change code coloury")}<br />\
+F6 {_("Move code or category")}<br />\
+F7 {_("Move multiple codes")}<br />\
+F8 {_("Merge code into code or category into category")}<br />\
+F9 {_("Show codes like")}<br />\
+F10 {_("Show codes by colour")}<br />\
+F11 {_("Sort ascending")}<br />\
+F12 {_("Sort descending")}<br />'
+
 coding_text_shortcuts = f'<h2>{_("Code text key shortcuts")}</h2>\
 Ctrl 1 {_("Next file")}<br />\
 Ctrl 2 {_("File with latest coding")}<br />\
@@ -366,8 +377,7 @@ V {_("assign in vivo code to selected text")}<br />\
 {_("Shift Left arrow.Extend coding to the left")}<br />\
 {_("Shift Right arrow.Extend coding to the right")}<br />\
 ! {_("Describes clicked text character position")}<br />\
-$ {_("Shift all coding positions after a clicked position by X characters (negative numbers shift left)")}<br />\
-F2 {_("When tree item selected - Rename code or category")}'
+$ {_("Shift all coding positions after a clicked position by X characters (negative numbers shift left)")}<br />'
 
 coding_pdf_shortcuts = f'<h2>{_("Code PDF key shortcuts")}</h2>\
 Ctrl 0 {_("Help - opens in browser")}<br />\
@@ -391,8 +401,7 @@ V {_("assign in vivo code to selected text")}<br />\
 Ctrl Z {_("The last code is unmarked, undo and restore that coding")}<br />\
 Minus {_("Zoom out")}<br />\
 Plus {_("Zoom in")}<br />\
-! {_("Describes clicked text character position")}<br />\
-F2 {_("When tree item selected - Rename code or category")}'
+! {_("Describes clicked text character position")}<br />'
 
 coding_image_shortcuts = f'<h2>{_("Code image key shortcuts")}</h2>\
 Ctrl 1 {_("Next file")}<br />\
@@ -407,8 +416,7 @@ Ctrl Z {_("The last code is unmarked, undo and restore that coding")}<br />\
 Ctrl G {_("Create a grayed-out image with coloured coded highlights (Wait a few seconds)")}<br />\
 Minus or Q {_("Zoom out")}<br />\
 Plus or W {_("Zoom in")}<br />\
-{_("Right - click on image for menu to rotate image")}<br />\
-F2 {_("When tree item selected - Rename code or category")}'
+{_("Right - click on image for menu to rotate image")}<br />'
 
 coding_av_shortcuts = f'<h2>{_("Code audio/video key shortcuts")}</h2>\
 Ctrl 1 {_("Next file")}<br />\
@@ -418,8 +426,8 @@ Ctrl 4 {_("Filter files by attributes")}<br />\
 Ctrl 9 {_("Show codes marked important")}<br />\
 Ctrl 0 {_("Help - opens in browser")}<br />\
 A {_("Annotate - for current selection")}<br />\
-B <br />\
-Shift B <br />\
+B {_("Set Bookmark in text for this audio/video file")}<br />\
+Shift B {_("Open file and move to bookmarked text position")}<br />\
 C {_("Create new category. If a category is already selected, the new category will be underneath")}<br />\
 G {_("Assign segment to currently selected code, and open memo for segment.")}<br />\
 I {_("Tag important")}<br />\
@@ -439,13 +447,13 @@ Ctrl P {_("Play / pause.On start rewind slightly")}<br />\
 Ctrl D {_("Play / pause.On start rewind slightly")}<br />\
 Ctrl S {_("Start and stop av segment creation")}<br />\
 Ctrl Shift &gt; {_("Increase play rate")}<br />\
-Ctrl Shift &lt; {_("Decrease play rate")}<br />\n\
-F2 {_("When tree item selected - Rename code or category")}'
+Ctrl Shift &lt; {_("Decrease play rate")}<br />'
 
 database_queries_shortcuts = f'<h2>{_("Database Queries key shortcuts")}</h2>\
 Ctrl + Enter {_("Run SQL query")}<br />'
 
-coding_shortcuts_display = coding_text_shortcuts + coding_pdf_shortcuts + coding_image_shortcuts + coding_av_shortcuts
+coding_shortcuts_display = coding_text_shortcuts + coding_pdf_shortcuts
+coding_shortcuts_display += coding_image_shortcuts + coding_av_shortcuts + code_tree_shortcuts
 coding_shortcuts_display += database_queries_shortcuts
 
 def manage_tab_info():

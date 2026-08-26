@@ -14,21 +14,23 @@ See the GNU General Public License for more details.
 You should have received a copy of the GNU Lesser General Public License along with QualCoder.
 If not, see <https://www.gnu.org/licenses/>.
 
-Author: Colin Curtain (ccbogel)
+Authors: Colin Curtain C, Kai Dröge, Justin Missaghieh--Poncet, Lorenzo Salomón
 https://github.com/ccbogel/QualCoder
 https://qualcoder.wordpress.com/
+https://qualcoder-org.github.io
 https://qualcoder.org/
 """
 
 from PyQt6 import QtCore, QtWidgets, QtGui
 import datetime
-import os
+from pathlib import Path
 import re
 import logging
 # from spellchecker import SpellChecker
 import qtawesome as qta  # see: https://pictogrammers.com/library/mdi/
 from odf.opendocument import OpenDocumentText  # For ODT export
 from odf.text import P as OdfParagraph  # For ODT export
+import webbrowser
 from .add_item_name import DialogAddItemName
 from .add_attribute import DialogAddAttribute
 from .confirm_delete import DialogConfirmDelete
@@ -36,7 +38,6 @@ from .GUI.ui_dialog_journals import Ui_Dialog_journals
 from .helpers import Message, ExportDirectoryPathDialog, MarkdownHighlighter
 from .memo import DialogMemo
 
-path = os.path.abspath(os.path.dirname(__file__))
 logger = logging.getLogger(__name__)
 
 NAME_COLUMN = 0
@@ -114,7 +115,9 @@ class DialogJournals(QtWidgets.QDialog):
         self.ui.lineEdit_search.textEdited.connect(self.search_for_text)
         self.ui.checkBox_search_all_journals.stateChanged.connect(self.search_for_text)
         self.ui.textEdit.textChanged.connect(self.text_changed)
-        self.ui.textEdit.installEventFilter(self)
+        #self.ui.textEdit.installEventFilter(self)
+        self.ui.textEdit.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
+        self.ui.textEdit.customContextMenuRequested.connect(self.text_edit_menu)
         self.ui.textEdit.setTabChangesFocus(True)
         # spell = SpellChecker()  # Was testing this out Dont use
         highlighter = MarkdownHighlighter(self.ui.textEdit, self.app)
@@ -127,6 +130,12 @@ class DialogJournals(QtWidgets.QDialog):
 
         self.ui.textEdit.hide()
         self.attribute_names = []  # For AddAttribute dialog
+
+    def _emit_project_table_changes(self, tables):
+        """Notify other open dialogs about changed project tables."""
+
+        if getattr(self.app, "project_events", None) is not None:
+            self.app.project_events.emit_table_changes(tables, source=self)
 
     def load_journals(self, order="name asc"):
         """ Load journals.
@@ -236,6 +245,7 @@ class DialogJournals(QtWidgets.QDialog):
         self.load_journals()
         self.fill_table()
         self.parent_text_edit.append(f'{_("Attribute added to journals:")} {name}, {_("type")}: {value_type}')
+        self._emit_project_table_changes(['attribute_type', 'attribute'])
 
     def check_attribute_placeholders(self):
         """ Journals can be added after attributes are in the project.
@@ -243,6 +253,7 @@ class DialogJournals(QtWidgets.QDialog):
          Also,if a journal is deleted, check and remove any isolated attribute values. """
 
         cur = self.app.conn.cursor()
+        changed = False
         sql = "select jid from journal "
         cur.execute(sql)
         journal_jids_res = cur.fetchall()
@@ -259,6 +270,7 @@ class DialogJournals(QtWidgets.QDialog):
                     placeholders = [attribute[0], jid[0], datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                                     self.app.settings['codername']]
                     cur.execute(insert_sql, placeholders)
+                    changed = True
         self.app.conn.commit()
 
         # Check and delete attribute values where journal has been deleted
@@ -269,6 +281,9 @@ class DialogJournals(QtWidgets.QDialog):
         for r in res:
             cur.execute("delete from attribute where attr_type='journal' and id=?", [r[0], ])
             self.app.conn.commit()
+            changed = True
+        if changed:
+            self._emit_project_table_changes(['attribute'])
 
     def help(self):
         """ Open help for transcribe section in browser. """
@@ -300,6 +315,47 @@ class DialogJournals(QtWidgets.QDialog):
             if key == QtCore.Qt.Key.Key_0:
                 self.help()
                 return
+
+    def text_edit_menu(self, position):
+        """ Context menu for textEdit. """
+
+        if self.ui.textEdit.toPlainText() == "":
+            return
+        cursor = self.ui.textEdit.cursorForPosition(position)
+        url = self.check_if_url(cursor.position())
+        if not url:
+            return
+        menu = QtWidgets.QMenu()
+        menu.setStyleSheet(f"font-size:{self.app.settings['fontsize']}pt")
+        action_url = QtGui.QAction(_("Open URL"))
+        menu.addAction(action_url)
+        action = menu.exec(self.ui.textEdit.mapToGlobal(position))
+        if action is None:
+            return
+        if action == action_url:
+            webbrowser.open(url)
+
+    def check_if_url(self, pos):
+            """ Check if the line is a url """
+    
+            # Regex HTTP HTTPS protocol
+            regex_http = QtCore.QRegularExpression(r"https?:\/\/(?:www\.)?[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,63}\b(?:[-a-zA-Z0-9()@:%_\+.~#?&\/=]*)")
+            # Regex Protocol optional
+            regex_no_protocol = QtCore.QRegularExpression(r"www\.[a-zA-Z0-9()]{1,63}\b(?:[-a-zA-Z0-9()@:%_\+.~#?&\/=]*)")
+            matches = []
+            all_matches = []
+            text = self.ui.textEdit.toPlainText()
+            iterator = regex_http.globalMatch(text)
+            while iterator.hasNext():
+                matches.append(iterator.next())
+            iterator = regex_no_protocol.globalMatch(text)
+            while iterator.hasNext():
+                matches.append(iterator.next())
+            for m in matches:
+                if m.capturedStart() <= pos <= m.capturedEnd():
+                    return m.captured(0)
+            return None
+
 
     def fill_table(self):
         """ Fill journals table. Update journal count label. """
@@ -583,6 +639,7 @@ class DialogJournals(QtWidgets.QDialog):
                     (self.journals[self.ui.tableWidget.currentRow()]['jentry'], now_date, self.jid))
         self.app.conn.commit()
         self.app.delete_backup = False
+        self._emit_project_table_changes(['journal'])
 
     def text_changed(self):
         """ Used in combination with timer to update database entry. """
@@ -615,6 +672,7 @@ class DialogJournals(QtWidgets.QDialog):
         cur.execute("insert into journal(name,jentry,owner,date) values(?,?,?,?)",
                     (journal['name'], journal['jentry'], journal['owner'], journal['date']))
         self.app.conn.commit()
+        self._emit_project_table_changes(['journal'])
         cur.execute("select last_insert_rowid()")
         jid = cur.fetchone()[0]
         journal['jid'] = jid
@@ -677,6 +735,7 @@ class DialogJournals(QtWidgets.QDialog):
                     self.journals.remove(item)
             self.fill_table()
             self.parent_text_edit.append(_("Journal deleted: ") + journal_name)
+            self._emit_project_table_changes(['journal'])
         self.check_attribute_placeholders()
         self.app.delete_backup = False
 
@@ -740,6 +799,7 @@ class DialogJournals(QtWidgets.QDialog):
                     _("Journal name changed from: ") + f"{self.journals[row]['name']} -> {new_name}")
                 self.journals[row]['name'] = new_name
                 self.ui.label_jname.setText(_("Journal: ") + self.journals[row]['name'])
+                self._emit_project_table_changes(['journal'])
             else:  # Put the original text in the cell
                 self.ui.tableWidget.item(row, y).setText(self.journals[row]['name'])
 
@@ -767,6 +827,7 @@ class DialogJournals(QtWidgets.QDialog):
             cur.execute("update attribute set value=? where id=? and name=? and attr_type='journal'",
                         (value, self.journals[row]['jid'], attribute_name))
             self.app.conn.commit()
+            self._emit_project_table_changes(['attribute'])
 
             # Update self.journals[attributes]
             # Add list of attribute values to journals, order matches header columns
@@ -869,13 +930,13 @@ class DialogJournals(QtWidgets.QDialog):
                 suffix += 1
 
         # Determine the project documents directory
-        docs_dir = os.path.join(self.app.project_path, "documents")
-        if not os.path.exists(docs_dir):
-            os.makedirs(docs_dir)
+        docs_dir = Path(self.app.project_path) / "documents"
+        if not Path(docs_dir).is_dir():
+            Path(docs_dir).mkdir(exist_ok=True)
 
         # Write journal content using the resolved source_name
         source_filename = source_name + ".txt"
-        source_filepath = os.path.join(docs_dir, source_filename)
+        source_filepath = Path(docs_dir) / source_filename
         with open(source_filepath, 'w', encoding='utf-8-sig') as f:
             f.write(journal_text)
 
@@ -903,8 +964,8 @@ class DialogJournals(QtWidgets.QDialog):
                         [attr_name])
             existing = cur.fetchone()
             if existing is None:
-                # Create a new attribute_type for 'file' with a prefixed name to avoid UNIQUE conflict <- L
-                file_attr_name = f"j_{attr_name}"  # prefix to avoid UNIQUE constraint on name <- L
+                # Create a new attribute_type for 'file' with a prefixed name to avoid UNIQUE conflict
+                file_attr_name = f"j_{attr_name}"  # prefix to avoid UNIQUE constraint on name
                 # Also check that the prefixed name doesn't already exist <- L
                 cur.execute("select name from attribute_type where name=?", [file_attr_name])
                 if cur.fetchone() is None:
@@ -949,6 +1010,7 @@ class DialogJournals(QtWidgets.QDialog):
             except Exception as e:
                 logger.warning(_("Could not insert attribute: "), file_attr_name, str(e))
         self.app.conn.commit()
+        self._emit_project_table_changes(['source', 'attribute_type', 'attribute'])
 
         if self.app.settings['ai_enable'] == 'True' and getattr(self.app, 'ai', None) is not None:
             self.app.ai.sources_vectorstore.import_document(new_source_id, source_name, journal_text)

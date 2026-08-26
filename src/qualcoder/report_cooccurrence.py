@@ -14,9 +14,10 @@ See the GNU General Public License for more details.
 You should have received a copy of the GNU Lesser General Public License along with QualCoder.
 If not, see <https://www.gnu.org/licenses/>.
 
-Author: Colin Curtain (ccbogel)
+Authors: Colin Curtain C, Kai Dröge, Justin Missaghieh--Poncet, Lorenzo Salomón
 https://github.com/ccbogel/QualCoder
 https://qualcoder.wordpress.com/
+https://qualcoder-org.github.io
 https://qualcoder.org/
 """
 
@@ -27,17 +28,15 @@ import logging
 import openpyxl
 from openpyxl.utils import get_column_letter
 from openpyxl.styles import PatternFill
-import os
-import qtawesome as qta  # see: https://pictogrammers.com/library/mdi/
-
 from PyQt6 import QtCore, QtWidgets, QtGui
+import sqlite3
+import qtawesome as qta  # see: https://pictogrammers.com/library/mdi/
 
 from .GUI.ui_dialog_cooccurrence import Ui_Dialog_Coocurrence
 from .helpers import ExportDirectoryPathDialog, Message
 from .report_attributes import DialogSelectAttributeParameters
 from .select_items import DialogSelectItems
 
-path = os.path.abspath(os.path.dirname(__file__))
 logger = logging.getLogger(__name__)
 
 # --- Imports for static image export
@@ -47,7 +46,7 @@ from networkx.algorithms.community import louvain_communities, greedy_modularity
 import matplotlib
 matplotlib.use('Agg')  # Static engine to generate PNGs without a graphical interface
 import matplotlib.pyplot as plt
-import matplotlib.cm as cm  # Not used ?
+# import matplotlib.cm as cm  # Not used ?
     
 '''    HAS_NETWORK_LIBS = True
 except Exception as e:
@@ -60,15 +59,18 @@ class DialogReportCooccurrence(QtWidgets.QDialog):
      This shows overlapping and edge-connected codes against codes.
     """
 
-    app = None
-    parent_tetEdit = None
-    files = []
-    attributes = []
-
     def __init__(self, app, parent_text_edit):
         self.app = app
         self.parent_textEdit = parent_text_edit
         self.attributes = []
+        self.files = []
+        self.color_choice = 0 
+        self.colours = [
+            ["#F8E0E0", "#F6CECE", "#F5A9A9", "#F78181", "#FA5858"],
+            ["#e0f7fa", "#80d8ff", "#40c4ff", "#0091ea", "#01579b"],
+            ["#D2F2D4", "#7BE382", "#26CC00", "#22B600", "#009C1A"]
+        ]
+        self.transposed = False
         QtWidgets.QDialog.__init__(self)
         self.ui = Ui_Dialog_Coocurrence()
         self.ui.setupUi(self)
@@ -88,6 +90,10 @@ class DialogReportCooccurrence(QtWidgets.QDialog):
         self.ui.pushButton_select_codes.pressed.connect(self.select_codes)
         self.ui.pushButton_select_categories.setIcon(qta.icon('mdi6.file-tree', options=[{'scale_factor': 1.4}]))
         self.ui.pushButton_select_categories.pressed.connect(self.select_categories)
+        self.ui.pushButton_color.setIcon(qta.icon('mdi6.palette', options=[{'scale_factor': 1.4}]))
+        self.ui.pushButton_color.pressed.connect(self.change_highlight_color)
+        self.ui.pushButton_transpose.setIcon(qta.icon('mdi6.rotate-right', options=[{'scale_factor': 1.4}]))
+        self.ui.pushButton_transpose.pressed.connect(self.transpose_data)
         self.ui.checkBox_hide_blanks.stateChanged.connect(self.show_or_hide_empty_rows_and_cols)
         tablefont = f'font: 10pt "{self.app.settings["font"]}";'
         self.ui.tableWidget.setStyleSheet(tablefont)  # Should be smaller
@@ -153,9 +159,10 @@ class DialogReportCooccurrence(QtWidgets.QDialog):
     def _refresh_selected_codes_from_project(self):
         fresh_codes, fresh_categories = self.app.get_codes_categories()
         self.codes, self.categories = fresh_codes, fresh_categories
-
         if self.code_selection_mode == "all":
             self.selected_codes = deepcopy(self.codes)
+            if self.transposed:  # Keep the reversed view across external refreshes
+                self.selected_codes.reverse()
             self.selected_categories_string = ""
             self._rebuild_selected_code_strings()
             return
@@ -169,6 +176,8 @@ class DialogReportCooccurrence(QtWidgets.QDialog):
                     if code_ not in refreshed_codes:
                         refreshed_codes.append(code_)
             self.selected_codes = refreshed_codes
+            if self.transposed:  # Keep the reversed view across external refreshes
+                self.selected_codes.reverse()
             self._rebuild_selected_code_strings()
             return
 
@@ -199,7 +208,7 @@ class DialogReportCooccurrence(QtWidgets.QDialog):
         if source is self or not isinstance(tables, list):
             return
         tables = set(tables)
-        watched_tables = {"code_cat", "code_name", "code_text"}
+        watched_tables = {"code_cat", "code_name", "code_text", "code_image"}
         if watched_tables.isdisjoint(tables):
             return
 
@@ -444,15 +453,27 @@ class DialogReportCooccurrence(QtWidgets.QDialog):
                     changed = True
         return selected_codes
 
+    def change_highlight_color(self):
+        """ Button to change the highlight colour. for Reds, blues, greens. """
+
+        self.color_choice += 1
+        if self.color_choice > 2:
+            self.color_choice = 0
+        self.process_data()
+
     def process_data(self):
         """ Calculate the relations for selected codes for ALL coders.
         TODO only THIS coder.
-        For text codings only. """
+        Text codings (code_text) and image-area codings (code_image, including
+        areas on PDF pages) are both included. """
 
         self.ui.checkBox_hide_blanks.setChecked(False)
         self.ui.splitter.setSizes([500, 0])
+        # Keep names/ids strings aligned with selected_codes order
+        self._rebuild_selected_code_strings()
         self.result_relations = []
         self.calculate_relations(self.code_ids_str)
+        self.calculate_image_relations(self.code_ids_str)
 
         # Create data matrices zeroed, codes are ordered alphabetically by name
         self.data_counts = []
@@ -464,9 +485,13 @@ class DialogReportCooccurrence(QtWidgets.QDialog):
             self.data_details.append(["."] * len(self.selected_codes))
 
         self.max_count = 0
+        # Map by cid, code order changes after transpose or category selection
+        cid_positions = {c['cid']: i for i, c in enumerate(self.selected_codes)}
         for r in self.result_relations:
-            row_pos = self.code_names_list.index(r['c0_name'])
-            col_pos = self.code_names_list.index(r['c1_name'])
+            row_pos = cid_positions.get(r['cid0'])
+            col_pos = cid_positions.get(r['cid1'])
+            if row_pos is None or col_pos is None:
+                continue
             self.data_counts[row_pos][col_pos] += 1
             if self.data_counts[row_pos][col_pos] > self.max_count:
                 self.max_count = self.data_counts[row_pos][col_pos]
@@ -474,14 +499,15 @@ class DialogReportCooccurrence(QtWidgets.QDialog):
                   r['owners'], r['c0_pos0'], r['c0_pos1'], r['c1_pos0'], r['c1_pos1'])'''
             res_list = [r['cid0'], r['c0_name'], r['ctid0'], r['cid1'], r['c1_name'], r['ctid1'], r['fid'],
                         r['file_name'], r['owners'], r['c0_pos0'], r['c0_pos1'], r['c1_pos0'], r['c1_pos1'],
-                        r['text_before'], r['text_overlap'], r['text_after'], r['relation']]
+                        r['text_before'], r['text_overlap'], r['text_after'], r['relation'],
+                        r.get('kind', 'text'), r.get('image_merge')]
             if self.data_details[row_pos][col_pos] == ".":
                 self.data_details[row_pos][col_pos] = [res_list]
             else:
                 self.data_details[row_pos][col_pos].append(res_list)
 
         # Color heat map for spread across 5 colours
-        colors = ["#F8E0E0", "#F6CECE", "#F5A9A9", "#F78181", "#FA5858"]  # Light to dark red
+        colors = self.colours[self.color_choice]
         for row, row_data in enumerate(self.data_counts):
             for col, item_data in enumerate(row_data):
                 if self.data_counts[row][col] > 0:
@@ -490,7 +516,6 @@ class DialogReportCooccurrence(QtWidgets.QDialog):
                         color_range_index = 0
                     self.data_colors[row][col] = colors[color_range_index]
         self.fill_table()
-
 
     def export_to_graphml(self):
         """ Export co-occurrence data to GraphML format for network analysis in Gephi. """
@@ -527,9 +552,10 @@ class DialogReportCooccurrence(QtWidgets.QDialog):
 
         # 2. Add Edges (Solo entre nodos visibles)
         edge_id = 0
-        for row in visible_indices:
-            for col in visible_indices:
-                count = self.data_counts[row][col]
+        # Upper triangle, both directions summed (add_edge overwrites weight)
+        for i, row in enumerate(visible_indices):
+            for col in visible_indices[i + 1:]:
+                count = self.data_counts[row][col] + self.data_counts[col][row]
                 if count > 0:
                     source_cid = self.selected_codes[row]['cid']
                     target_cid = self.selected_codes[col]['cid']
@@ -595,12 +621,13 @@ class DialogReportCooccurrence(QtWidgets.QDialog):
         graph = nx.Graph()
         for i in visible_indices:
             graph.add_node(self.selected_codes[i]['name'])
-        for row in visible_indices:
-            for col in visible_indices:
-                count = self.data_counts[row][col]
-                if count > 0 and row != col: 
+        # Upper triangle, both directions summed (add_edge overwrites weight)
+        for i, row in enumerate(visible_indices):
+            for col in visible_indices[i + 1:]:
+                count = self.data_counts[row][col] + self.data_counts[col][row]
+                if count > 0:
                     graph.add_edge(self.selected_codes[row]['name'], self.selected_codes[col]['name'], weight=count)
-                    
+
         if graph.number_of_nodes() == 0 or graph.number_of_edges() == 0:
             Message(self.app, _("No data"), _("There are no co-occurrences to plot.")).exec()
             return
@@ -702,10 +729,11 @@ class DialogReportCooccurrence(QtWidgets.QDialog):
 
         graph = nx.Graph()
         for i in visible_indices: graph.add_node(self.selected_codes[i]['name'])
-        for row in visible_indices:
-            for col in visible_indices:
-                count = self.data_counts[row][col]
-                if count > 0 and row != col:
+        # Upper triangle, both directions summed (add_edge overwrites weight)
+        for i, row in enumerate(visible_indices):
+            for col in visible_indices[i + 1:]:
+                count = self.data_counts[row][col] + self.data_counts[col][row]
+                if count > 0:
                     source = self.selected_codes[row]['name']
                     target = self.selected_codes[col]['name']
                     graph.add_edge(source, target, weight=count)
@@ -808,10 +836,11 @@ class DialogReportCooccurrence(QtWidgets.QDialog):
         graph = nx.Graph()
         for i in visible_indices:
             graph.add_node(self.selected_codes[i]['name'])
-        for row in visible_indices:
-            for col in visible_indices:
-                count = self.data_counts[row][col]
-                if count > 0 and row != col: 
+        # Upper triangle, both directions summed (add_edge overwrites weight)
+        for i, row in enumerate(visible_indices):
+            for col in visible_indices[i + 1:]:
+                count = self.data_counts[row][col] + self.data_counts[col][row]
+                if count > 0:
                     graph.add_edge(self.selected_codes[row]['name'], self.selected_codes[col]['name'], weight=count)
 
         if graph.number_of_nodes() == 0 or graph.number_of_edges() == 0:
@@ -836,42 +865,46 @@ class DialogReportCooccurrence(QtWidgets.QDialog):
         if filepath is None:
             return
 
-        # Excel vertical and horizontal headers
-        header = []
-        for code_ in self.selected_codes:  # self.codes:
-            name_split_50 = [code_['name'][y - 50:y] for y in range(50, len(code_['name']) + 50, 50)]
-            # header_labels.append(code_['name'])  # OLD, need line separators
-            header.append("\n".join(name_split_50))
+        # Export matches the current view: same order, hidden rows/columns excluded
+        n_codes = len(self.selected_codes)
+        visible_rows = [i for i in range(n_codes) if not self.ui.tableWidget.isRowHidden(i)]
+        visible_cols = [i for i in range(n_codes) if not self.ui.tableWidget.isColumnHidden(i)]
+        if not visible_rows or not visible_cols:
+            Message(self.app, _("No data"), _("No visible rows or columns to export.")).exec()
+            return
+
+        def wrapped_name(index):
+            # Line separators every 50 chars, as in the table headers
+            name = self.selected_codes[index]['name']
+            return "\n".join(name[y - 50:y] for y in range(50, len(name) + 50, 50))
+
         wb = openpyxl.Workbook()
         ws = wb.active
         ws.title = "Counts"
         wb.create_sheet("Details")
         ws2 = wb["Details"]
-        for col in range(len(self.codes)):
+        for col in range(len(visible_cols) + 1):  # Header column plus visible columns
             ws.column_dimensions[get_column_letter(col + 1)].width = 20
             ws2.column_dimensions[get_column_letter(col + 1)].width = 20
-        for col, col_name in enumerate(header):
-            h_cell = ws.cell(row=1, column=col + 2)
-            h_cell.value = col_name
-            h_cell2 = ws2.cell(row=1, column=col + 2)
-            h_cell2.value = col_name
-            v_cell = ws.cell(row=col + 2, column=1)
-            v_cell.value = col_name
-            v_cell2 = ws2.cell(row=col + 2, column=1)
-            v_cell2.value = col_name
+        for x, col_index in enumerate(visible_cols):
+            ws.cell(row=1, column=x + 2).value = wrapped_name(col_index)
+            ws2.cell(row=1, column=x + 2).value = wrapped_name(col_index)
+        for y, row_index in enumerate(visible_rows):
+            ws.cell(row=y + 2, column=1).value = wrapped_name(row_index)
+            ws2.cell(row=y + 2, column=1).value = wrapped_name(row_index)
         # Co-occurrence counts
-        for row, row_data in enumerate(self.data_counts):
-            for col, col_data in enumerate(row_data):
-                cell = ws.cell(row=row + 2, column=col + 2)
-                cell.value = col_data
-                if self.data_colors[row][col] != "":
-                    cell.fill = PatternFill(start_color=self.data_colors[row][col][1:],
-                                            end_color=self.data_colors[row][col][1:], fill_type="solid")
+        for y, row_index in enumerate(visible_rows):
+            for x, col_index in enumerate(visible_cols):
+                cell = ws.cell(row=y + 2, column=x + 2)
+                cell.value = self.data_counts[row_index][col_index]
+                if self.data_colors[row_index][col_index] != "":
+                    cell.fill = PatternFill(start_color=self.data_colors[row_index][col_index][1:],
+                                            end_color=self.data_colors[row_index][col_index][1:], fill_type="solid")
                 # Details list
-                if self.data_details[row][col] == ".":
+                if self.data_details[row_index][col_index] == ".":
                     continue
                 details = ""
-                for data in self.data_details[row][col]:
+                for data in self.data_details[row_index][col_index]:
                     '''
                     0 - 5 [r['cid0'], r['c0_name'], r['ctid0'], r['cid1'], r['c1_name'], r['ctid1'], 
                     6 - 8 r['fid'], r['file_name'], r['owners'], 
@@ -882,8 +915,7 @@ class DialogReportCooccurrence(QtWidgets.QDialog):
                     details += f"Coders: {data[8]}. (ctid0: {data[2]} | ctid1: {data[5]})\n"
                     details += f"File (fid {data[6]}): {data[7]}\n"
                     details += f"{data[13]}[[{data[14]}]]{data[15]}\n========\n"
-                d_cell = ws2.cell(row=row + 2, column=col + 2)
-                d_cell.value = details
+                ws2.cell(row=y + 2, column=x + 2).value = details
 
         wb.save(filepath)
         msg = _('Co-occurrence exported: ') + filepath
@@ -946,8 +978,10 @@ class DialogReportCooccurrence(QtWidgets.QDialog):
             self.ui.textEdit.append(msg)
 
             # Coded text highlights - yellow code 0, green overlap, blue code 1
-            start_pos_yellow = len(self.ui.textEdit.toPlainText())
-            end_pos_yellow = start_pos_yellow + len(data[13]) + 1
+            # +1 skips the newline that append() inserts, so each span is exact
+            # and an empty text_before no longer paints the previous line end
+            start_pos_yellow = len(self.ui.textEdit.toPlainText()) + 1
+            end_pos_yellow = start_pos_yellow + len(data[13])
             start_pos_green = end_pos_yellow
             end_pos_green = start_pos_green + len(data[14])
             start_pos_blue = end_pos_green
@@ -1039,6 +1073,21 @@ class DialogReportCooccurrence(QtWidgets.QDialog):
             13 - 16 text_before, text_overlap, text_after, relation
             '''
             for item in data_list:
+                # Image-area relations: the merged coding is the UNION rectangle
+                # stored in code_image.
+                if len(item) > 17 and item[17] == 'image':
+                    fid_, page_, ux, uy, uw, uh = item[18]
+                    try:
+                        cur.execute("insert into code_image (id,x1,y1,width,height,cid,memo,"
+                                    "date,owner,important,pdf_page) values(?,?,?,?,?,?,?,?,?,?,?)",
+                                    (fid_, ux, uy, uw, uh, new_code_cid, memo, now_date,
+                                     self.app.settings['codername'], None, page_))
+                        self.app.conn.commit()
+                    except sqlite3.IntegrityError:
+                        self.app.conn.rollback()  # Duplicate union area
+                    except Exception as e_:
+                        logger.debug(e_)
+                    continue
                 pos0 = min(item[9], item[11])
                 pos1 = max(item[10], item[12])
                 # Note substr() function started at 1, not 0, so + 1
@@ -1056,27 +1105,50 @@ class DialogReportCooccurrence(QtWidgets.QDialog):
                 except Exception as e_:
                     print(e_)
                     logger.debug(e_)
+            # Refresh this table and notify other dialogs of the new code/codings
+            self.app.project_events.emit_table_changes(["code_name", "code_text", "code_image"], source=self)
+            self._refresh_selected_codes_from_project()
+            self.process_data()
+
+    def transpose_data(self):
+        """ Reverse code name order for headings and table """
+
+        self.transposed = not self.transposed
+        self.ui.checkBox_hide_blanks.setChecked(False)  # fill_table resets row visibility
+        # Reverse, do not re-sort: current order may not be alphabetical
+        self.selected_codes.reverse()
+        self._rebuild_selected_code_strings()
+        for r in self.data_details:
+            r.reverse()
+        self.data_details.reverse()
+        for r in self.data_counts:
+            r.reverse()
+        self.data_counts.reverse()
+        for r in self.data_colors:
+            r.reverse()
+        self.data_colors.reverse()
+        self.fill_table()
 
     def fill_table(self):
         """ Fill table using code names alphabetically (case insensitive), using self.data """
 
+        # Setup
         rows = self.ui.tableWidget.rowCount()
         for r in range(0, rows):
             self.ui.tableWidget.removeRow(0)
         cols = self.ui.tableWidget.columnCount()
         for c in range(0, cols):
             self.ui.tableWidget.removeColumn(0)
-
         header_labels = []
-        # Wrong for selected codes
-        for code_ in self.selected_codes:  # self.codes:
+
+        for code_ in self.selected_codes: 
             name_split_50 = [code_['name'][y - 50:y] for y in range(50, len(code_['name']) + 50, 50)]
             header_labels.append("\n".join(name_split_50))
         self.ui.tableWidget.setColumnCount(len(header_labels))
         self.ui.tableWidget.setHorizontalHeaderLabels(header_labels)
         self.ui.tableWidget.setRowCount(len(header_labels))
         self.ui.tableWidget.setVerticalHeaderLabels(header_labels)
-        # tooltip with the full code name on each header using header items <- L
+        # Tooltip with the full code name on each header using header items
         for i, code_ in enumerate(self.selected_codes):
             h_item = self.ui.tableWidget.horizontalHeaderItem(i)
             if h_item is not None:
@@ -1084,6 +1156,7 @@ class DialogReportCooccurrence(QtWidgets.QDialog):
             v_item = self.ui.tableWidget.verticalHeaderItem(i)
             if v_item is not None:
                 v_item.setToolTip(code_['name'])
+        
         for row, row_data in enumerate(self.data_counts):
             for col, cell_data in enumerate(row_data):
                 item = QtWidgets.QTableWidgetItem()
@@ -1099,10 +1172,9 @@ class DialogReportCooccurrence(QtWidgets.QDialog):
         # self.ui.tableWidget.resizeColumnsToContents()  # Doesnt look great
         self.ui.tableWidget.resizeRowsToContents()
 
-    def calculate_relations(self, code_ids_str):
+    def calculate_relations(self, code_ids_str:str):
         """ Calculate the relations for selected codes for all coders.
         For codings in code_text only.
-
         id1, id2, overlapindex, unionindex, distance, whichmin, whichmax, fid
         relation is 1 character: Inclusion, Overlap, Exact, (Proximity - not used)
         owners is a combination of: owner of ctid0 pipe owner of ctid1
@@ -1123,8 +1195,7 @@ class DialogReportCooccurrence(QtWidgets.QDialog):
                   "join code_name on code_name.cid=code_text.cid where fid=? " \
                   "and code_text.cid in (" + code_ids_str + ") order by code_text.cid"
             cur.execute(sql, [fid['id']])
-            result = cur.fetchall()
-            coded = [row for row in result if row[0] == fid['id']]
+            coded = cur.fetchall()  # SQL already filters by fid
 
             # Look at each code again other codes, when done remove from list of codes
             cid = 1
@@ -1160,17 +1231,118 @@ class DialogReportCooccurrence(QtWidgets.QDialog):
                         if relation['relation'] in selected_relations:
                             self.result_relations.append(relation)
 
-    def relation(self, c0, c1):
+    def calculate_image_relations(self, code_ids_str: str):
+        """
+        Image-area co-occurrences: two coded areas of DIFFERENT codes co-occur when
+        their rectangles intersect on the same file (and, for PDF sources, on the
+        same page). Relation mirrors the text logic by geometry:
+        E exact same rectangle, I one rectangle inside the other, O partial overlap.
+        Args:
+            code_ids_str (String): comma separated code ids
+        """
+
+        selected_relations = ['E', 'I', 'O']
+        cur = self.app.conn.cursor()
+        sql = "select code_image.id, code_image.cid, x1, y1, width, height, imid, " \
+              "ifnull(code_image.memo,''), code_image.owner, ifnull(pdf_page,0), " \
+              "code_name.name, source.name from code_image " \
+              "join code_name on code_name.cid=code_image.cid " \
+              "join source on source.id=code_image.id " \
+              "where code_image.cid in (" + code_ids_str + ") " \
+              "order by code_image.id, pdf_page, code_image.cid"
+        cur.execute(sql)
+        groups = {}
+        for row in cur.fetchall():
+            groups.setdefault((row[0], row[9]), []).append(row)
+        fid_i, cid_i, x1_i, y1_i, w_i, h_i, imid_i, memo_i, owner_i, page_i, name_i, fname_i = range(12)
+        for (fid, page), coded in groups.items():
+            file_name = coded[0][fname_i]
+            is_pdf = coded[0][fname_i].lower().endswith(".pdf")
+            coded = list(coded)
+            while len(coded) > 0:
+                c0 = coded.pop()
+                for c1 in coded:
+                    if c0[cid_i] == c1[cid_i]:
+                        continue
+                    rel = self._image_relation(c0, c1)
+                    if rel is None or rel['relation'] not in selected_relations:
+                        continue
+                    overlap_pct = rel.pop('_overlap_pct')
+                    union = rel.pop('_union')
+                    desc = _("Image areas overlap") + f": {overlap_pct}% " + _("of the smaller area")
+                    if is_pdf:
+                        desc += f", {_('page')} {page + 1}"
+                    rel['c0_name'] = c0[name_i]
+                    rel['c1_name'] = c1[name_i]
+                    rel['fid'] = fid
+                    rel['file_name'] = file_name
+                    rel['c0_pos0'] = f"{int(c0[x1_i])},{int(c0[y1_i])}"
+                    rel['c0_pos1'] = f"{int(c0[x1_i] + c0[w_i])},{int(c0[y1_i] + c0[h_i])}"
+                    rel['c1_pos0'] = f"{int(c1[x1_i])},{int(c1[y1_i])}"
+                    rel['c1_pos1'] = f"{int(c1[x1_i] + c1[w_i])},{int(c1[y1_i] + c1[h_i])}"
+                    rel['owners'] = f"{c0[owner_i]}|{c1[owner_i]}"
+                    rel['ctid0'] = f"imid {c0[imid_i]}"
+                    rel['ctid0_text'] = ""
+                    rel['ctid1'] = f"imid {c1[imid_i]}"
+                    rel['ctid1_text'] = ""
+                    rel['coded_memo0'] = c0[memo_i]
+                    rel['coded_memo1'] = c1[memo_i]
+                    rel['text_before'] = ""
+                    rel['text_overlap'] = f"[{desc}]"
+                    rel['text_after'] = ""
+                    rel['kind'] = 'image'
+                    # Data needed if the user merges these codes: the UNION area.
+                    rel['image_merge'] = (fid, page if is_pdf else None,
+                                          union[0], union[1], union[2], union[3])
+                    self.result_relations.append(rel)
+
+    @staticmethod
+    def _image_relation(c0, c1):
+        """
+        Geometric relation of two coded areas (rows of calculate_image_relations).
+        Returns a dict with cid0, cid1, relation E/I/O, _overlap_pct (of the smaller
+        area) and _union rect (x, y, width, height), or None when they do not touch.
+        """
+
+        ax0, ay0 = float(c0[2]), float(c0[3])
+        ax1, ay1 = ax0 + float(c0[4]), ay0 + float(c0[5])
+        bx0, by0 = float(c1[2]), float(c1[3])
+        bx1, by1 = bx0 + float(c1[4]), by0 + float(c1[5])
+        inter_w = min(ax1, bx1) - max(ax0, bx0)
+        inter_h = min(ay1, by1) - max(ay0, by0)
+        if inter_w <= 0 or inter_h <= 0:
+            return None
+        tol = 0.5
+        same = (abs(ax0 - bx0) < tol and abs(ay0 - by0) < tol and
+                abs(ax1 - bx1) < tol and abs(ay1 - by1) < tol)
+        a_in_b = ax0 >= bx0 - tol and ay0 >= by0 - tol and ax1 <= bx1 + tol and ay1 <= by1 + tol
+        b_in_a = bx0 >= ax0 - tol and by0 >= ay0 - tol and bx1 <= ax1 + tol and by1 <= ay1 + tol
+        if same:
+            relation = "E"
+        elif a_in_b or b_in_a:
+            relation = "I"
+        else:
+            relation = "O"
+        inter_area = inter_w * inter_h
+        smaller = min((ax1 - ax0) * (ay1 - ay0), (bx1 - bx0) * (by1 - by0))
+        pct = int(round(100 * inter_area / smaller)) if smaller > 0 else 0
+        union = (min(ax0, bx0), min(ay0, by0),
+                 max(ax1, bx1) - min(ax0, bx0), max(ay1, by1) - min(ay0, by0))
+        return {"cid0": c0[1], "cid1": c1[1], "relation": relation,
+                "_overlap_pct": pct, "_union": union}
+
+    def relation(self, c0:list[int], c1:list[int]):
         """ Relation function as in RQDA
 
         whichmin is the code with the lowest pos0, or None if equal
         whichmax is the code with the highest pos1 or None if equal
         operlapindex is the combined lowest to the highest positions. Only used for E, O, P
         unionindex is the lowest and highest positions of the union of overlap. Only used for E, O
-
         Called by:
             calculate_relations_for_coder_and_selected_codes
-
+        Args:
+            c0 : List
+            c1 : List
         Returns:
         id1, id2, overlapindex, unionindex, distance, whichmin, min, whichmax, max, fid
         relation is 1 character: Inclusion, Overlap, Exact, Proximity
@@ -1186,7 +1358,6 @@ class DialogReportCooccurrence(QtWidgets.QDialog):
                   "text_before": "", "text_overlap": "", "text_after": ""}
 
         cur = self.app.conn.cursor()
-
         # Which min
         if c0[pos0] < c1[pos0]:
             result['whichmin'] = c0[cid]
@@ -1219,14 +1390,15 @@ class DialogReportCooccurrence(QtWidgets.QDialog):
             return result
 
         # Check for Proximity
-        if c0[pos1] < c1[pos0]:
+        # <= so touching segments (0 shared chars) are not counted as Overlap
+        if c0[pos1] <= c1[pos0]:
             result['relation'] = "P"
             result['distance'] = c1[pos0] - c0[pos1]
             result['text_overlap'] = ""
             result['text_before'] = ""
             result['text_after'] = ""
             return result
-        if c0[pos0] > c1[pos1]:
+        if c0[pos0] >= c1[pos1]:  # >= as above
             result['relation'] = "P"
             result['distance'] = c0[pos0] - c1[pos1]
             result['text_overlap'] = ""

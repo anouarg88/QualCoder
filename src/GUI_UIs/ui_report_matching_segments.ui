@@ -3,7 +3,7 @@
  <class>DialogMatchingTextSegments</class>
  <widget class="QDialog" name="DialogMatchingTextSegments">
   <property name="windowModality">
-   <enum>Qt::NonModal</enum>
+   <enum>Qt::WindowModality::NonModal</enum>
   </property>
   <property name="geometry">
    <rect>
@@ -43,13 +43,13 @@
      <property name="minimumSize">
       <size>
        <width>0</width>
-       <height>100</height>
+       <height>110</height>
       </size>
      </property>
      <property name="maximumSize">
       <size>
        <width>16777215</width>
-       <height>100</height>
+       <height>110</height>
       </size>
      </property>
      <property name="title">
@@ -58,9 +58,9 @@
      <widget class="QComboBox" name="comboBox_coders">
       <property name="geometry">
        <rect>
-        <x>450</x>
+        <x>410</x>
         <y>30</y>
-        <width>200</width>
+        <width>190</width>
         <height>26</height>
        </rect>
       </property>
@@ -72,25 +72,27 @@
       <property name="geometry">
        <rect>
         <x>10</x>
-        <y>-1</y>
+        <y>2</y>
         <width>291</width>
-        <height>31</height>
+        <height>26</height>
        </rect>
       </property>
       <property name="font">
        <font>
-        <weight>75</weight>
         <bold>true</bold>
        </font>
       </property>
       <property name="toolTip">
-       <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;&lt;br/&gt;&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+       <string/>
       </property>
       <property name="text">
        <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Exact match text segments report&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
       </property>
+      <property name="scaledContents">
+       <bool>true</bool>
+      </property>
       <property name="alignment">
-       <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignTop</set>
+       <set>Qt::AlignmentFlag::AlignLeading|Qt::AlignmentFlag::AlignLeft|Qt::AlignmentFlag::AlignTop</set>
       </property>
       <property name="wordWrap">
        <bool>true</bool>
@@ -99,24 +101,24 @@
      <widget class="QLabel" name="label_coder">
       <property name="geometry">
        <rect>
-        <x>340</x>
-        <y>28</y>
-        <width>109</width>
+        <x>370</x>
+        <y>30</y>
+        <width>30</width>
         <height>28</height>
        </rect>
       </property>
       <property name="toolTip">
-       <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Select coder. Blank for all&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+       <string>Select coder. Blank for all</string>
       </property>
       <property name="text">
-       <string>Coder</string>
+       <string/>
       </property>
      </widget>
      <widget class="QPushButton" name="pushButton_export">
       <property name="geometry">
        <rect>
-        <x>740</x>
-        <y>20</y>
+        <x>710</x>
+        <y>2</y>
         <width>32</width>
         <height>32</height>
        </rect>
@@ -131,8 +133,8 @@
      <widget class="QPushButton" name="pushButton_run">
       <property name="geometry">
        <rect>
-        <x>700</x>
-        <y>20</y>
+        <x>670</x>
+        <y>2</y>
         <width>32</width>
         <height>32</height>
        </rect>
@@ -147,40 +149,46 @@
      <widget class="QLabel" name="label_include">
       <property name="geometry">
        <rect>
-        <x>340</x>
-        <y>0</y>
-        <width>111</width>
-        <height>26</height>
+        <x>370</x>
+        <y>1</y>
+        <width>30</width>
+        <height>28</height>
        </rect>
       </property>
       <property name="toolTip">
-       <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Coded text must include the text here.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+       <string>Coded text filter. Must include this text.</string>
       </property>
       <property name="text">
-       <string>Include text</string>
+       <string/>
       </property>
      </widget>
      <widget class="QLineEdit" name="lineEdit_include">
       <property name="geometry">
        <rect>
-        <x>450</x>
+        <x>410</x>
         <y>2</y>
-        <width>201</width>
+        <width>190</width>
         <height>26</height>
        </rect>
+      </property>
+      <property name="toolTip">
+       <string>Coded text filter. Must include this text.</string>
       </property>
      </widget>
      <widget class="QLabel" name="label_instructions">
       <property name="geometry">
        <rect>
         <x>5</x>
-        <y>24</y>
-        <width>331</width>
-        <height>71</height>
+        <y>34</y>
+        <width>341</width>
+        <height>69</height>
        </rect>
       </property>
       <property name="text">
        <string>Select file(s), coder, 2 or more codes. Can exclude results by excluding a code (right click on code).</string>
+      </property>
+      <property name="scaledContents">
+       <bool>true</bool>
       </property>
       <property name="wordWrap">
        <bool>true</bool>
@@ -189,10 +197,10 @@
      <widget class="QCheckBox" name="checkBox_any_matches">
       <property name="geometry">
        <rect>
-        <x>340</x>
+        <x>400</x>
         <y>63</y>
         <width>621</width>
-        <height>31</height>
+        <height>41</height>
        </rect>
       </property>
       <property name="text">
@@ -203,9 +211,9 @@ Checked - any selected codes must match exactly.</string>
      <widget class="QCheckBox" name="checkBox_one_line">
       <property name="geometry">
        <rect>
-        <x>680</x>
-        <y>70</y>
-        <width>211</width>
+        <x>630</x>
+        <y>40</y>
+        <width>281</width>
         <height>20</height>
        </rect>
       </property>
@@ -219,14 +227,14 @@ Checked - any selected codes must match exactly.</string>
      <widget class="QPushButton" name="pushButton_file_filter">
       <property name="geometry">
        <rect>
-        <x>660</x>
-        <y>20</y>
+        <x>630</x>
+        <y>2</y>
         <width>32</width>
         <height>32</height>
        </rect>
       </property>
       <property name="toolTip">
-       <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;File attributes filter&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+       <string>File attributes filter</string>
       </property>
       <property name="text">
        <string/>
@@ -258,11 +266,11 @@ Checked - any selected codes must match exactly.</string>
       <item row="0" column="0">
        <widget class="QSplitter" name="splitter">
         <property name="orientation">
-         <enum>Qt::Horizontal</enum>
+         <enum>Qt::Orientation::Horizontal</enum>
         </property>
         <widget class="QSplitter" name="splitter_vert">
          <property name="orientation">
-          <enum>Qt::Vertical</enum>
+          <enum>Qt::Orientation::Vertical</enum>
          </property>
          <widget class="QListWidget" name="listWidget_files"/>
          <widget class="QTreeWidget" name="treeWidget">

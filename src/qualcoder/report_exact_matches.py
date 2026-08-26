@@ -14,8 +14,9 @@ See the GNU General Public License for more details.
 You should have received a copy of the GNU Lesser General Public License along with QualCoder.
 If not, see <https://www.gnu.org/licenses/>.
 
-Author: Colin Curtain (ccbogel)
+Author: Colin Curtain C, Kai Dröge, Justin Missaghieh--Poncet, Lorenzo Salomón
 https://github.com/ccbogel/QualCoder
+https://qualcoder-org.github.io
 https://qualcoder.wordpress.com/
 https://qualcoder.org/
 """
@@ -23,12 +24,10 @@ https://qualcoder.org/
 from copy import copy, deepcopy
 import logging
 import openpyxl
-import os
-import qtawesome as qta  # see: https://pictogrammers.com/library/mdi/
-
 from PyQt6 import QtGui, QtWidgets, QtCore
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QBrush
+import qtawesome as qta  # see: https://pictogrammers.com/library/mdi/
 
 from .code_in_all_files import DialogCodeInAllFiles
 from .color_selector import TextColor
@@ -36,7 +35,6 @@ from .GUI.ui_report_matching_segments import Ui_DialogMatchingTextSegments
 from .helpers import DialogCodeInText, Message, init_persistent_tree_header, restore_persistent_tree_widths
 from .report_attributes import DialogSelectAttributeParameters
 
-path = os.path.abspath(os.path.dirname(__file__))
 logger = logging.getLogger(__name__)
 
 
@@ -45,24 +43,11 @@ class DialogReportExactTextMatches(QtWidgets.QDialog):
     Show exact match code overlaps.
     This is for text coding only. """
 
-    app = None
-    parent_textEdit = None
-    coder_names = []
-    categories = []
-    codes = []
-    coders = []
-    files = []
-    results_display = []
-    excluded_codes = []
-    excluded_icon = None
-    attributes = []  # File selection by attributes
-
     def __init__(self, app, parent_textedit):
 
         self.results_display = []
         self.app = app
         self.parent_textEdit = parent_textedit
-
         QtWidgets.QDialog.__init__(self)
         self.ui = Ui_DialogMatchingTextSegments()
         self.ui.setupUi(self)
@@ -72,7 +57,18 @@ class DialogReportExactTextMatches(QtWidgets.QDialog):
         self.ui.pushButton_export.setIcon(qta.icon('mdi6.export', options=[{'scale_factor': 1.3}]))
         self.ui.pushButton_export.pressed.connect(self.export_excel_file)
         self.ui.pushButton_file_filter.setIcon(qta.icon('mdi6.variable', options=[{'scale_factor': 1.3}]))
+        self.ui.label_coder.setPixmap(qta.icon('mdi6.account').pixmap(26, 28))
+        self.ui.label_include.setPixmap(qta.icon('mdi6.text-search').pixmap(26, 28))
+
         self.excluded_icon = qta.icon('mdi6.window-close')
+        self.coder_names = []
+        self.categories = []
+        self.codes = []
+        self.coders = []
+        self.files = []
+        self.excluded_codes = []
+        self.excluded_icon = None
+        self.attributes = []  # File selection by attributes
         self.get_data()
 
         try:
@@ -110,8 +106,7 @@ class DialogReportExactTextMatches(QtWidgets.QDialog):
         self.app.project_events.project_data_changed.connect(self._on_project_data_changed)
 
     def get_data(self):
-        """ Called from init. gets code_names, categories and owner names.
-        """
+        """ Called from init. gets code_names, categories and owner names. """
 
         current_coder = ""
         if hasattr(self, "ui") and hasattr(self.ui, "comboBox_coders"):
@@ -247,8 +242,7 @@ class DialogReportExactTextMatches(QtWidgets.QDialog):
         """ Select files based on attribute selections.
         Attribute results are a dictionary of:
         first item is a Boolean AND or OR list item
-        Followed by each attribute list item
-        """
+        Followed by each attribute list item. """
 
         # Clear ui
         self.ui.pushButton_file_filter.setToolTip(_("Attributes"))
@@ -684,8 +678,7 @@ class DialogReportExactTextMatches(QtWidgets.QDialog):
                 break
 
     def fill_tree(self):
-        """ Fill tree widget, top level items are main categories and unlinked codes.
-        """
+        """ Fill tree widget, top level items are main categories and unlinked codes. """
 
         self.ui.treeWidget.clear()
         cats = copy(self.categories)

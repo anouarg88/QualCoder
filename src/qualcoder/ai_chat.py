@@ -26,6 +26,7 @@ import json
 import logging
 import math
 import os
+import platform
 import re
 import sqlite3
 import threading
@@ -48,7 +49,7 @@ from PyQt6.QtWidgets import QTextEdit
 import qtawesome as qta
 
 from .ai_agent_prompts import AiAgentPromptsCatalog, AgentPromptRecord, prompt_name_and_scope
-from .ai_llm import extract_ai_memo, ai_quote_search, strip_think_blocks, AICancelled
+from .ai_llm import extract_ai_memo, ai_quote_search, llm_content_to_text, strip_think_blocks, AICancelled
 from .ai_mcp_server import AiMcpServer
 from .ai_search_dialog import DialogAiSearch
 from .confirm_delete import DialogConfirmDelete
@@ -590,6 +591,7 @@ class DialogAIChat(QtWidgets.QDialog):
         QtWidgets.QDialog.__init__(self)
         self.ui = Ui_Dialog_ai_chat()
         self.ui.setupUi(self)
+        self._ai_link_tooltip = None
         self._new_chat_popup_menu = None
         self.setup_chat_selector_widget()
         self.setup_ai_permissions_combobox()
@@ -607,11 +609,14 @@ class DialogAIChat(QtWidgets.QDialog):
         self.ui.pushButton_delete.clicked.connect(self.delete_chat)
         self.chat_list_model = QStandardItemModel(self)
         self.ui.treeView_chat_list.setModel(self.chat_list_model)
-        self.ui.treeView_chat_list.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
+        self.ui.treeView_chat_list.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
         self.ui.treeView_chat_list.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
         self.shortcut_delete_chat = QShortcut(QKeySequence("Delete"), self.ui.treeView_chat_list)
         self.shortcut_delete_chat.setContext(QtCore.Qt.ShortcutContext.WidgetShortcut)
         self.shortcut_delete_chat.activated.connect(self.delete_chat)
+        self.shortcut_select_all_chats = QShortcut(QKeySequence("Ctrl+A"), self.ui.treeView_chat_list)
+        self.shortcut_select_all_chats.setContext(QtCore.Qt.ShortcutContext.WidgetShortcut)
+        self.shortcut_select_all_chats.activated.connect(self.select_all_chats)
         # Enable editing of items on double click and when pressing F2
         self.ui.treeView_chat_list.setEditTriggers(
             QtWidgets.QAbstractItemView.EditTrigger.DoubleClicked |
@@ -648,6 +653,7 @@ class DialogAIChat(QtWidgets.QDialog):
         self.agent_prompts_catalog = AiAgentPromptsCatalog(self.app)
         self.ai_mcp_server = AiMcpServer(self.app)
         self.ai_prompt = None
+        self._multi_chat_selection_active = False
         self._setup_prompt_completion()
         self.init_styles()
         self.ai_busy_timer = QtCore.QTimer(self)
@@ -1537,8 +1543,21 @@ class DialogAIChat(QtWidgets.QDialog):
             self.ai_info_style = f'"{doc_font}"'
             self.ai_status_style = f'"{doc_font} color: {self.ai_status_color};"'
         self.ui.plainTextEdit_question.setStyleSheet(self.ai_user_style[1:-1])
-        default_bg_color = self.ui.plainTextEdit_question.palette().color(self.ui.plainTextEdit_question.viewport().backgroundRole())
+        default_bg_color = self.ui.plainTextEdit_question.palette().color(
+            self.ui.plainTextEdit_question.viewport().backgroundRole()
+        )
         self._update_prompt_reference_styles(default_bg_color)
+        output_palette = self.ui.ai_output.palette()
+        for role in (QPalette.ColorRole.Base, QPalette.ColorRole.Window):
+            output_palette.setColor(role, default_bg_color)
+        for widget in (
+                self.ui.ai_output,
+                self.ui.scrollArea_ai_output,
+                self.ui.scrollArea_ai_output.viewport(),
+                self.ui.scrollArea_ai_output_contents,
+        ):
+            widget.setAutoFillBackground(True)
+            widget.setPalette(output_palette)
         self.ui.ai_output.setAutoFillBackground(True)
         self.ui.ai_output.setStyleSheet(f"""
             QLabel#ai_output {{
@@ -1550,16 +1569,30 @@ class DialogAIChat(QtWidgets.QDialog):
                 border: none;
             }}
         """)
-        self.ui.scrollArea_ai_output.setStyleSheet(f'background-color: {default_bg_color.name()};')
+        output_background_style = f"background-color: {default_bg_color.name()};"
+        self.ui.scrollArea_ai_output.setStyleSheet(f"QScrollArea#scrollArea_ai_output {{ {output_background_style} }}")
+        self.ui.scrollArea_ai_output.viewport().setStyleSheet(output_background_style)
+        self.ui.scrollArea_ai_output_contents.setStyleSheet(output_background_style)
         default_panel_color = self.ui.widget_chat.palette().color(self.ui.widget_chat.backgroundRole())
-        self.ui.comboBox_ai_chats.setStyleSheet(f"background-color: {default_panel_color.name()};")
+        combo_background_color = default_panel_color.name()
+        combo_text_color = self.ui.widget_chat.palette().color(QPalette.ColorRole.WindowText).name()
+        if self.app.settings['stylesheet'] not in ('dark', 'rainbow', 'native'):
+            combo_background_color = "#fafafa"
+            combo_text_color = "#000000"
+        combo_style = f"""
+            QComboBox {{
+                background-color: {combo_background_color};
+                color: {combo_text_color};
+            }}
+            QComboBox QAbstractItemView {{
+                background-color: {combo_background_color};
+                color: {combo_text_color};
+            }}
+        """
+        self.ui.comboBox_ai_chats.setStyleSheet(combo_style)
         tree_font = QtGui.QFont(self.app.settings["font"], self.app.settings["treefontsize"], QtGui.QFont.Weight.Normal)
         self.ui.comboBox_ai_chats.view().setFont(tree_font)
-        self.ui.comboBox_ai_permissions.setStyleSheet(f"""
-            QComboBox {{
-                background-color: {default_panel_color.name()};
-            }}
-        """)
+        self.ui.comboBox_ai_permissions.setStyleSheet(combo_style)
         self.update_chat_window()
 
     def refresh_placeholder_if_visible(self) -> None:
@@ -1646,6 +1679,7 @@ class DialogAIChat(QtWidgets.QDialog):
             self.app = app
             self.ai_mcp_server = AiMcpServer(self.app)
             self.load_ai_permissions()
+        self._close_chat_history_connection()
         # init chat history
         self.chat_history_folder = self.app.project_path + '/ai_data'
         if not os.path.exists(self.chat_history_folder):
@@ -1685,12 +1719,72 @@ class DialogAIChat(QtWidgets.QDialog):
         self.current_chat_idx = -1
         self.fill_chat_list()
         self._update_undo_button_state()
-    
+
+    def _close_chat_history_connection(self) -> None:
+        """Close the project-bound chat history connection, if any."""
+
+        if self.chat_history_conn is None:
+            return
+        try:
+            self.chat_history_conn.close()
+        except Exception as e_:
+            logger.warning(e_)
+        finally:
+            self.chat_history_conn = None
+
+    def reset_for_project_close(self) -> None:
+        """Clear project-bound AI chat state after a project is closed."""
+
+        self._dismiss_prompt_completion(accept=False)
+        self._cancel_pending_stream_render()
+        self.ai_stream_render_pending = False
+        if self._chat_window_refresh_timer.isActive():
+            self._chat_window_refresh_timer.stop()
+        self._chat_window_refresh_pending = False
+        self._close_chat_history_connection()
+        self.chat_history_folder = ""
+        self.chat_history_path = ""
+        self.current_chat_idx = -1
+        self.current_streaming_chat_idx = -1
+        self.current_streaming_run_id = ''
+        self.chat_list = []
+        self.chat_msg_list = []
+        self.ai_semantic_search_chunks = []
+        self.curr_codings = None
+        self.ai_search_code_name = None
+        self.ai_search_code_memo = None
+        self.ai_search_file_ids = []
+        self.ai_search_code_ids = []
+        self.ai_text_doc_id = None
+        self.ai_text_doc_name = ''
+        self.ai_text_text = ''
+        self.ai_text_start_pos = -1
+        self._chat_ai_profile_snapshots.clear()
+        self._multi_chat_selection_active = False
+
+        selection_model = self.ui.treeView_chat_list.selectionModel()
+        blockers = [QtCore.QSignalBlocker(self.ui.comboBox_ai_chats)]
+        if selection_model is not None:
+            blockers.append(QtCore.QSignalBlocker(selection_model))
+        try:
+            self.chat_list_model.clear()
+            self.ui.treeView_chat_list.setCurrentIndex(QtCore.QModelIndex())
+            self.ui.comboBox_ai_chats.setCurrentIndex(-1)
+        finally:
+            del blockers
+
+        self.ui.plainTextEdit_question.clear()
+        self.ui.progressBar_ai.setRange(0, 100)
+        self.ui.progressBar_ai.setValue(0)
+        self.ui.pushButton_delete.setEnabled(False)
+        self.ui.pushButton_undo.setEnabled(False)
+        self.update_chat_window(scroll_to_bottom=False)
+        self._hide_transient_chat_overlays()
+
     def close(self):
         self.ai_output_splitter_save_timer.stop()
         self.persist_ai_output_splitter_setting()
-        if self.chat_history_conn is not None:
-            self.chat_history_conn.close()
+        self.reset_for_project_close()
             
     def help(self):
         """ Open help in browser. """
@@ -1834,6 +1928,17 @@ class DialogAIChat(QtWidgets.QDialog):
     def set_sidebar_mode(self, enabled):
         """Switch dialog internals between main view and sidebar view."""
 
+        selected_rows = self._selected_chat_rows()
+        self.ui.treeView_chat_list.setSelectionMode(
+            QtWidgets.QAbstractItemView.SelectionMode.SingleSelection
+            if enabled else QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection
+        )
+        if enabled:
+            target_row = self.current_chat_idx
+            if len(selected_rows) > 0:
+                target_row = selected_rows[0]
+            self._multi_chat_selection_active = False
+            self._set_chat_list_current_row(target_row)
         if enabled:
             self.ui.gridLayout.setContentsMargins(0, 0, 0, 0)
             self._move_chat_widget_to_sidebar()
@@ -2003,6 +2108,12 @@ class DialogAIChat(QtWidgets.QDialog):
         logger.warning(msg)
         Message(self.app, _('AI Agent'), msg, icon='warning').exec()
 
+    def _use_ai_agent_tab_menu_links_as_actions(self) -> bool:
+        """Return True when teaching popups should be replaced by direct actions."""
+
+        menubar = getattr(getattr(self.main_window, 'ui', None), 'menubar', None)
+        return platform.system() == "Darwin" and menubar is not None and menubar.isNativeMenuBar()
+
     def _dispatch_ai_agent_tab_link(self, link: str) -> bool:
         """Handle AI-tab-local qualcoder://ai_agent_tab/... links."""
 
@@ -2015,6 +2126,8 @@ class DialogAIChat(QtWidgets.QDialog):
         link_path = [segment for segment in url.path().split('/') if segment]
         try:
             if len(link_path) == 1 and link_path[0] == 'new':
+                if self._use_ai_agent_tab_menu_links_as_actions():
+                    raise ValueError(_('This menu is shown from the New button. Please use the New button at the bottom left.'))
                 self._popup_new_chat_menu()
                 return True
             if len(link_path) == 1 and link_path[0] == 'permissions':
@@ -2022,6 +2135,10 @@ class DialogAIChat(QtWidgets.QDialog):
                 self.ui.comboBox_ai_permissions.setFocus(Qt.FocusReason.OtherFocusReason)
                 return True
             if len(link_path) == 2 and link_path[0] == 'new':
+                if self._use_ai_agent_tab_menu_links_as_actions():
+                    if not self._trigger_new_chat_menu_target(link_path[1]):
+                        raise ValueError(_('Unknown AI Agent New-menu target: ') + link_path[1])
+                    return True
                 self._popup_new_chat_menu(link_path[1])
                 return True
             raise ValueError(_('Unsupported AI Agent tab link target.'))
@@ -2612,7 +2729,7 @@ class DialogAIChat(QtWidgets.QDialog):
                     sections.append(prompt_text)
 
         project_memo = extract_ai_memo(self.app.get_project_memo())
-        if self.app.settings.get('ai_send_project_memo', 'True') == 'True' and len(project_memo) > 0:
+        if len(project_memo) > 0:
             for prompt in self.agent_prompts_catalog.resolve_prompt_references(project_memo):
                 prompt_key = str(prompt.name if prompt.name is not None else "").strip().casefold()
                 if prompt_key == "" or prompt_key in included_prompt_keys:
@@ -4586,7 +4703,7 @@ class DialogAIChat(QtWidgets.QDialog):
             self.new_chat(_('Code analysis') + f' "{code_name}"', 'code_analysis', summary, prompt_label)
             # warn if project memo empty 
             project_memo = extract_ai_memo(self.app.get_project_memo())
-            if self.app.settings.get('ai_send_project_memo', 'True') == 'True' and len(project_memo) == 0:
+            if len(project_memo) == 0:
                 msg = _('Note that it is highly recommended to use the project memo (Menu "Project > Project Memo") \
 to include a short description of your project\'s research topics, questions, objectives, and the empirical \
 data collected. This information will accompany every prompt sent to the AI, resulting in much more targeted results.')
@@ -4654,7 +4771,7 @@ data collected. This information will accompany every prompt sent to the AI, res
             self.new_chat(_('Topic exploration') + f' "{topic_name}"', 'topic_exploration', summary, prompt_label)
             # warn if project memo empty 
             project_memo = extract_ai_memo(self.app.get_project_memo())
-            if self.app.settings.get('ai_send_project_memo', 'True') == 'True' and len(project_memo) == 0:
+            if len(project_memo) == 0:
                 msg = _('Note that it is highly recommended to use the project memo (Menu "Project > Project Memo") \
 to include a short description of your project\'s research topics, questions, objectives, and the empirical \
 data collected. This information will accompany every prompt sent to the AI, resulting in much more targeted results.')
@@ -4909,6 +5026,45 @@ data collected. This information will accompany every prompt sent to the AI, res
                 "PROMPT_NAME": prompt_name,
             },
         )
+
+    def _resolve_text_analysis_prompt_payload(self, prompt_payload: Any) -> Optional[AgentPromptRecord]:
+        """Resolve one text-analysis prompt from a menu payload or prompt record."""
+
+        prompt_name = ""
+        prompt_scope = ""
+
+        if isinstance(prompt_payload, AgentPromptRecord):
+            prompt_name = str(prompt_payload.name if prompt_payload.name is not None else "").strip()
+            prompt_scope = str(prompt_payload.scope if prompt_payload.scope is not None else "").strip()
+        elif isinstance(prompt_payload, dict):
+            prompt_name = str(prompt_payload.get("name", "") if prompt_payload.get("name", "") is not None else "").strip()
+            prompt_scope = str(prompt_payload.get("scope", "") if prompt_payload.get("scope", "") is not None else "").strip()
+        elif isinstance(prompt_payload, (tuple, list)) and len(prompt_payload) > 0:
+            prompt_name = str(prompt_payload[0] if prompt_payload[0] is not None else "").strip()
+            if len(prompt_payload) > 1:
+                prompt_scope = str(prompt_payload[1] if prompt_payload[1] is not None else "").strip()
+        elif isinstance(prompt_payload, str):
+            prompt_name = str(prompt_payload).strip()
+        else:
+            prompt_name = str(getattr(prompt_payload, 'name', '') if prompt_payload is not None else '').strip()
+            prompt_scope = str(getattr(prompt_payload, 'scope', '') if prompt_payload is not None else '').strip()
+
+        if prompt_name == "":
+            return None
+        if prompt_scope != "":
+            return self.agent_prompts_catalog.find_prompt_variant(
+                prompt_name,
+                prompt_scope,
+                prompt_type="text_analysis",
+                apply_init=False,
+            )
+
+        prompt_record = self.agent_prompts_catalog.get_prompt(prompt_name)
+        if prompt_record is None:
+            return None
+        if self.agent_prompts_catalog.prompt_type_from_name(prompt_record.name) != "text_analysis":
+            return None
+        return prompt_record
 
     def _mcp_text_analysis_worker(self, messages: List[Any], chat_idx: int,
                                   bootstrap_spec: Dict[str, Any], signals=None) -> Dict[str, Any]:
@@ -5295,14 +5451,7 @@ data collected. This information will accompany every prompt sent to the AI, res
             msg = _('The AI is disabled. Go to "AI > Setup Wizard" first.')
             Message(self.app, _('AI not enabled'), msg, "warning").exec()
             return
-        prompt_name = str(getattr(prompt, 'name', '') if prompt is not None else '').strip()
-        prompt_scope = str(getattr(prompt, 'scope', 'system') if prompt is not None else 'system').strip()
-        prompt_record = self.agent_prompts_catalog.find_prompt_variant(
-            prompt_name,
-            prompt_scope,
-            prompt_type="text_analysis",
-            apply_init=False,
-        )
+        prompt_record = self._resolve_text_analysis_prompt_payload(prompt)
         if prompt_record is None:
             msg = _('The selected text analysis prompt could not be loaded.')
             Message(self.app, _('AI prompts'), msg, "warning").exec()
@@ -5357,27 +5506,36 @@ data collected. This information will accompany every prompt sent to the AI, res
         """Deletes the currently selected chat, connected to the button
            'pushButton_delete'
         """
-        if self.current_chat_idx <= -1:
+        selected_rows = self._selected_chat_rows()
+        if len(selected_rows) == 0:
             return
-        chat_id = int(self.chat_list[self.current_chat_idx][0])
-        chat_name = self._display_chat_name(
-            self.chat_list[self.current_chat_idx][1],
-            self.chat_list[self.current_chat_idx][2],
-        )
-        msg = _('Do you really want to delete ') + '"' + chat_name + '"?'
-        ui = DialogConfirmDelete(self.app, msg, _('Delete Chat'))
+        selected_chat_ids = [int(self.chat_list[row][0]) for row in selected_rows]
+        if len(selected_rows) == 1:
+            chat_row = selected_rows[0]
+            chat_name = self._display_chat_name(
+                self.chat_list[chat_row][1],
+                self.chat_list[chat_row][2],
+            )
+            msg = _('Do you really want to delete ') + '"' + chat_name + '"?'
+            title = _('Delete Chat')
+        else:
+            msg = _('Do you really want to delete {count} selected chats?').format(count=len(selected_rows))
+            title = _('Delete Chats')
+        ui = DialogConfirmDelete(self.app, msg, title)
         ok = ui.exec()
         if not ok:
             return
         cursor = self.chat_history_conn.cursor()
         try:
-            cursor.execute('DELETE from chat_messages WHERE chat_id = ?', (chat_id,))
-            cursor.execute('DELETE from chats WHERE id = ?', (chat_id,))
+            cursor.executemany('DELETE from chat_messages WHERE chat_id = ?', [(chat_id,) for chat_id in selected_chat_ids])
+            cursor.executemany('DELETE from chats WHERE id = ?', [(chat_id,) for chat_id in selected_chat_ids])
             self.chat_history_conn.commit()
         except Exception as e_:
             print(e_)
             self.chat_history_conn.rollback()
             raise
+        self.current_chat_idx = selected_rows[0]
+        self._multi_chat_selection_active = False
         self.fill_chat_list()
 
     def find_chat_idx(self, chat_id) -> int | None:
@@ -5517,6 +5675,19 @@ data collected. This information will accompany every prompt sent to the AI, res
 
     def update_chat_window(self, scroll_to_bottom=True):
         """load current chat into self.ai_output"""
+        if getattr(self, '_multi_chat_selection_active', False):
+            self.ui.ai_output.setAlignment(
+                QtCore.Qt.AlignmentFlag.AlignTop
+                | QtCore.Qt.AlignmentFlag.AlignLeading
+                | QtCore.Qt.AlignmentFlag.AlignLeft
+            )
+            self.ui.ai_output.setText('')
+            self.ui.plainTextEdit_question.setEnabled(False)
+            self.ui.pushButton_question.setEnabled(False)
+            self.ui.scrollArea_ai_output.verticalScrollBar().setValue(0)
+            if hasattr(self, "_prompt_reference_highlighter"):
+                self._prompt_reference_highlighter.rehighlight()
+            return
         if self.current_chat_idx > -1:
             self.is_updating_chat_window = True
             try:
@@ -5800,24 +5971,67 @@ data collected. This information will accompany every prompt sent to the AI, res
             return index.row()
         return -1
 
+    def _selected_chat_rows(self) -> list[int]:
+        """Return sorted selected chat rows from the left chat list."""
+
+        selection_model = self.ui.treeView_chat_list.selectionModel()
+        if selection_model is None:
+            return []
+        rows = {
+            index.row()
+            for index in selection_model.selectedRows()
+            if index.isValid() and 0 <= index.row() < self.chat_list_model.rowCount()
+        }
+        return sorted(rows)
+
+    def select_all_chats(self) -> None:
+        """Select all chats in the full tab chat list."""
+
+        if self.ui.treeView_chat_list.selectionMode() != QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection:
+            return
+        if self.chat_list_model.rowCount() == 0:
+            return
+        self.ui.treeView_chat_list.selectAll()
+
     def _set_chat_list_current_row(self, row):
+        selection_model = self.ui.treeView_chat_list.selectionModel()
         if row is None or row < 0 or row >= self.chat_list_model.rowCount():
             with QtCore.QSignalBlocker(self.ui.comboBox_ai_chats):
                 self.ui.comboBox_ai_chats.setCurrentIndex(-1)
+            if selection_model is not None:
+                selection_model.clearSelection()
+                selection_model.setCurrentIndex(
+                    QtCore.QModelIndex(),
+                    QtCore.QItemSelectionModel.SelectionFlag.NoUpdate
+                )
             self.ui.treeView_chat_list.setCurrentIndex(QtCore.QModelIndex())
             return
         with QtCore.QSignalBlocker(self.ui.comboBox_ai_chats):
             self.ui.comboBox_ai_chats.setCurrentIndex(row)
         index = self.chat_list_model.index(row, 0)
-        self.ui.treeView_chat_list.setCurrentIndex(index)
+        if selection_model is not None:
+            selection_model.setCurrentIndex(
+                index,
+                QtCore.QItemSelectionModel.SelectionFlag.ClearAndSelect
+                | QtCore.QItemSelectionModel.SelectionFlag.Rows
+            )
+        else:
+            self.ui.treeView_chat_list.setCurrentIndex(index)
 
     def chat_list_selection_changed(self, selected=None, deselected=None, force_update=False):
         self._dismiss_prompt_completion(accept=False)
-        current_row = self._chat_list_current_row()
+        previous_multi_selection = self._multi_chat_selection_active
+        selected_rows = self._selected_chat_rows()
+        current_row = selected_rows[0] if len(selected_rows) == 1 else -1
         with QtCore.QSignalBlocker(self.ui.comboBox_ai_chats):
             self.ui.comboBox_ai_chats.setCurrentIndex(current_row)
-        self.ui.pushButton_delete.setEnabled(current_row > -1)
-        if (not force_update) and (self.current_chat_idx == current_row):
+        self.ui.pushButton_delete.setEnabled(len(selected_rows) > 0)
+        self._multi_chat_selection_active = len(selected_rows) > 1
+        if self._multi_chat_selection_active:
+            self.chat_msg_list.clear()
+            self.update_chat_window(scroll_to_bottom=False)
+            return
+        if (not force_update) and (self.current_chat_idx == current_row) and not previous_multi_selection:
             return
         if self._cancel_chat_scope(self.current_chat_idx, ask=True):
             # AI generation is either finished or canceled, we can change to another chat
@@ -5850,20 +6064,31 @@ data collected. This information will accompany every prompt sent to the AI, res
 
     def open_context_menu(self, position):
         index = self.ui.treeView_chat_list.indexAt(position)
-        if index.isValid():
-            self.ui.treeView_chat_list.setCurrentIndex(index)
+        if index.isValid() and index.row() not in self._selected_chat_rows():
+            self._set_chat_list_current_row(index.row())
         context_menu = QtWidgets.QMenu(self)
+        selected_rows = self._selected_chat_rows()
         if self.chat_list_model.rowCount() > 0:
-            if self.current_chat_idx > -1:
-                edit_action = QAction("Edit Title", self)
-                delete_action = QAction("Delete Chat", self)
-                export_action = QAction("Export Chat", self)
+            select_all_action = QAction(_('Select all'), self)
+            select_all_action.setShortcut(QKeySequence("Ctrl+A"))
+            select_all_action.triggered.connect(self.select_all_chats)
+            context_menu.addAction(select_all_action)
+            if len(selected_rows) == 1 and self.current_chat_idx > -1:
+                edit_action = QAction(_('Edit Title'), self)
+                delete_action = QAction(_('Delete Chat'), self)
+                export_action = QAction(_('Export Chat'), self)
+                context_menu.addSeparator()
                 context_menu.addAction(edit_action)
                 context_menu.addAction(delete_action)
                 context_menu.addAction(export_action)
                 edit_action.triggered.connect(self.edit_title)
                 delete_action.triggered.connect(self.delete_chat)
                 export_action.triggered.connect(self.export_chat)
+            elif len(selected_rows) > 1:
+                delete_action = QAction(_('Delete Chats'), self)
+                context_menu.addSeparator()
+                context_menu.addAction(delete_action)
+                delete_action.triggered.connect(self.delete_chat)
 
             # The search function will be implemented later:
             # search_action = QAction("Search all Chats", self)
@@ -7395,7 +7620,7 @@ data collected. This information will accompany every prompt sent to the AI, res
             model_kind=model_kind,
             run_context=run_context,
         )
-        raw = strip_think_blocks(str(llm_response.content)).strip()
+        raw = strip_think_blocks(llm_content_to_text(getattr(llm_response, 'content', ''))).strip()
         raw = self._extract_first_json_object(raw)
         if raw == "":
             return {}
@@ -7664,7 +7889,7 @@ data collected. This information will accompany every prompt sent to the AI, res
                 fallback_without_response_format=False,
                 model_kind='large',
             )
-            return strip_think_blocks(str(repaired.content if repaired is not None else '')).strip()
+            return strip_think_blocks(llm_content_to_text(getattr(repaired, 'content', ''))).strip()
         except Exception as err:
             logger.warning("Final answer repair failed: %s", err)
             return ''
@@ -7950,6 +8175,50 @@ data collected. This information will accompany every prompt sent to the AI, res
         rows = cursor.fetchall()
         return [str(row[0]) for row in rows if isinstance(row, tuple) and len(row) > 0 and row[0] is not None]
 
+    @staticmethod
+    def _build_ref_candidates_for_excerpt(source_id: int, source_name: str, start: int,
+                                          excerpt: Any, context_before: Any = "",
+                                          context_after: Any = "") -> List[Dict[str, Any]]:
+        """Build resolver candidates for one excerpt plus optional surrounding context."""
+
+        excerpt_text = str(excerpt if excerpt is not None else "")
+        if source_id <= 0 or start < 0 or excerpt_text.strip() == "":
+            return []
+
+        before_text = str(context_before if context_before is not None else "")
+        after_text = str(context_after if context_after is not None else "")
+        before_start = start - len(before_text)
+        after_start = start + len(excerpt_text)
+
+        candidates: List[Dict[str, Any]] = []
+        seen: set[tuple[int, int, str]] = set()
+
+        def append_candidate(candidate_start: int, candidate_text: str) -> None:
+            text_value = str(candidate_text if candidate_text is not None else "")
+            if candidate_start < 0 or text_value.strip() == "":
+                return
+            key = (source_id, candidate_start, text_value)
+            if key in seen:
+                return
+            seen.add(key)
+            candidates.append(
+                {
+                    "source_id": source_id,
+                    "source_name": source_name,
+                    "start": candidate_start,
+                    "length": len(text_value),
+                    "text": text_value,
+                }
+            )
+
+        # Prefer the primary retrieved excerpt. Extra context is only fallback evidence.
+        append_candidate(start, excerpt_text)
+        append_candidate(before_start, before_text)
+        append_candidate(after_start, after_text)
+        if before_text != "" or after_text != "":
+            append_candidate(before_start, before_text + excerpt_text + after_text)
+        return candidates
+
     def _extract_ref_candidates_from_tool_result(self, tool_result_raw: str) -> List[Dict[str, Any]]:
         """Extract evidence spans from one persisted MCP tool_result message."""
 
@@ -8011,14 +8280,15 @@ data collected. This information will accompany every prompt sent to the AI, res
                     source_name = str(seg.get("source_name", "")).strip()
                     if source_name == "":
                         source_name = self.get_filename(source_id)
-                    candidates.append(
-                        {
-                            "source_id": source_id,
-                            "source_name": source_name,
-                            "start": start,
-                            "length": len(segment_quote),
-                            "text": segment_quote,
-                        }
+                    candidates.extend(
+                        self._build_ref_candidates_for_excerpt(
+                            source_id,
+                            source_name,
+                            start,
+                            segment_quote,
+                            seg.get("context_before", ""),
+                            seg.get("context_after", ""),
+                        )
                     )
                 continue
 
@@ -8031,14 +8301,13 @@ data collected. This information will accompany every prompt sent to the AI, res
                 source_name = str(payload.get("name", "")).strip()
                 if source_name == "":
                     source_name = self.get_filename(source_id)
-                candidates.append(
-                    {
-                        "source_id": source_id,
-                        "source_name": source_name,
-                        "start": start,
-                        "length": len(excerpt),
-                        "text": excerpt,
-                    }
+                candidates.extend(
+                    self._build_ref_candidates_for_excerpt(
+                        source_id,
+                        source_name,
+                        start,
+                        excerpt,
+                    )
                 )
                 continue
 
@@ -8057,14 +8326,15 @@ data collected. This information will accompany every prompt sent to the AI, res
                     source_name = str(hit.get("source_name", "")).strip()
                     if source_name == "":
                         source_name = self.get_filename(source_id)
-                    candidates.append(
-                        {
-                            "source_id": source_id,
-                            "source_name": source_name,
-                            "start": start,
-                            "length": len(excerpt),
-                            "text": excerpt,
-                        }
+                    candidates.extend(
+                        self._build_ref_candidates_for_excerpt(
+                            source_id,
+                            source_name,
+                            start,
+                            excerpt,
+                            hit.get("context_before", ""),
+                            hit.get("context_after", ""),
+                        )
                     )
                 continue
 
@@ -8083,14 +8353,15 @@ data collected. This information will accompany every prompt sent to the AI, res
                     source_name = str(hit.get("source_name", "")).strip()
                     if source_name == "":
                         source_name = self.get_filename(source_id)
-                    candidates.append(
-                        {
-                            "source_id": source_id,
-                            "source_name": source_name,
-                            "start": start,
-                            "length": len(excerpt),
-                            "text": excerpt,
-                        }
+                    candidates.extend(
+                        self._build_ref_candidates_for_excerpt(
+                            source_id,
+                            source_name,
+                            start,
+                            excerpt,
+                            hit.get("context_before", ""),
+                            hit.get("context_after", ""),
+                        )
                     )
                 continue
 
@@ -8109,14 +8380,15 @@ data collected. This information will accompany every prompt sent to the AI, res
                     source_name = str(hit.get("source_name", "")).strip()
                     if source_name == "":
                         source_name = self.get_filename(source_id)
-                    candidates.append(
-                        {
-                            "source_id": source_id,
-                            "source_name": source_name,
-                            "start": start,
-                            "length": len(excerpt),
-                            "text": excerpt,
-                        }
+                    candidates.extend(
+                        self._build_ref_candidates_for_excerpt(
+                            source_id,
+                            source_name,
+                            start,
+                            excerpt,
+                            hit.get("context_before", ""),
+                            hit.get("context_after", ""),
+                        )
                     )
         return candidates
 
@@ -9166,6 +9438,129 @@ data collected. This information will accompany every prompt sent to the AI, res
                     return True  # Event handled
         # For all other cases, return super's eventFilter result
         return super().eventFilter(source, event)
+
+    def _ai_link_tooltip_colors(self) -> Tuple[QtGui.QColor, QtGui.QColor, QtGui.QColor]:
+        """Return readable colors matching the current Qt tooltip style where possible."""
+
+        application = QtWidgets.QApplication.instance()
+        if application is not None:
+            stylesheet = application.styleSheet()
+            tooltip_rules = re.findall(r"QToolTip\s*\{([^}]*)\}", stylesheet, flags=re.IGNORECASE | re.DOTALL)
+            if tooltip_rules:
+                properties = {}
+                for declaration in tooltip_rules[-1].split(";"):
+                    if ":" not in declaration:
+                        continue
+                    name, value = declaration.split(":", 1)
+                    properties[name.strip().lower()] = value.strip()
+
+                def color_from_value(value: str) -> Optional[QtGui.QColor]:
+                    tokens = re.findall(r"#[0-9a-fA-F]{3,8}|rgba?\([^)]+\)|[A-Za-z]+", value)
+                    for token in reversed(tokens):
+                        color = QtGui.QColor(token)
+                        if color.isValid():
+                            return color
+                    return None
+
+                background = color_from_value(properties.get("background-color", properties.get("background", "")))
+                foreground = color_from_value(properties.get("color", ""))
+                border = color_from_value(properties.get("border-color", properties.get("border", "")))
+                if background is not None and foreground is not None:
+                    if border is None:
+                        border = background.darker(135) if background.lightness() >= 128 else background.lighter(135)
+                    return background, foreground, border
+
+        tooltip_palette = QtWidgets.QToolTip.palette()
+        base_role = getattr(QtGui.QPalette.ColorRole, "ToolTipBase", QtGui.QPalette.ColorRole.Base)
+        text_role = getattr(QtGui.QPalette.ColorRole, "ToolTipText", QtGui.QPalette.ColorRole.Text)
+        background = tooltip_palette.color(base_role)
+        foreground = tooltip_palette.color(text_role)
+        if not background.isValid():
+            background = QtGui.QColor("#d9d9d9")
+        if not foreground.isValid():
+            foreground = QtGui.QColor("#000000")
+
+        border = background.darker(135) if background.lightness() >= 128 else background.lighter(135)
+        return background, foreground, border
+
+    def _ai_link_tooltip_position(self, tooltip_size: QtCore.QSize) -> QtCore.QPoint:
+        """Position the AI link tooltip near the cursor while keeping it on screen."""
+
+        cursor_pos = QCursor.pos()
+        screen = QtGui.QGuiApplication.screenAt(cursor_pos)
+        if screen is None:
+            screen = QtGui.QGuiApplication.primaryScreen()
+        if screen is None:
+            return cursor_pos + QtCore.QPoint(12, 18)
+
+        margin = 8
+        available = screen.availableGeometry()
+        preferred = cursor_pos + QtCore.QPoint(12, 18)
+        if preferred.y() + tooltip_size.height() + margin > available.y() + available.height():
+            preferred.setY(cursor_pos.y() - tooltip_size.height() - 18)
+
+        min_x = available.x() + margin
+        min_y = available.y() + margin
+        max_x = available.x() + available.width() - tooltip_size.width() - margin
+        max_y = available.y() + available.height() - tooltip_size.height() - margin
+        return QtCore.QPoint(
+            min(max(preferred.x(), min_x), max(min_x, max_x)),
+            min(max(preferred.y(), min_y), max(min_y, max_y)),
+        )
+
+    def _show_ai_link_tooltip(self, text: str) -> None:
+        """Show a styled tooltip for links in the AI chat output."""
+
+        if self._ai_link_tooltip is None:
+            tooltip = QtWidgets.QFrame(None, Qt.WindowType.ToolTip | Qt.WindowType.FramelessWindowHint)
+            tooltip.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+            layout = QtWidgets.QVBoxLayout(tooltip)
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.setSpacing(0)
+            label = QtWidgets.QLabel(tooltip)
+            label.setObjectName("ai_link_tooltip_label")
+            label.setTextFormat(Qt.TextFormat.PlainText)
+            label.setWordWrap(True)
+            layout.addWidget(label)
+            self._ai_link_tooltip = tooltip
+
+        label = self._ai_link_tooltip.findChild(QtWidgets.QLabel, "ai_link_tooltip_label")
+        if label is None:
+            return
+        doc_font_size = self.app.settings["docfontsize"]
+        tooltip_font_family = self.app.settings["font"].replace("\\", "\\\\").replace('"', '\\"')
+        label.setFont(QtGui.QFont(self.app.settings["font"], doc_font_size))
+        background, foreground, border = self._ai_link_tooltip_colors()
+        self._ai_link_tooltip.setStyleSheet(
+            "QFrame {"
+            f"background-color: {background.name()};"
+            f"border: 1px solid {border.name()};"
+            "}"
+            "QLabel {"
+            f"background-color: {background.name()};"
+            f"color: {foreground.name()};"
+            f'font-family: "{tooltip_font_family}";'
+            f"font-size: {doc_font_size}pt;"
+            "border: none;"
+            "padding: 6px;"
+            "}"
+        )
+        screen = QtGui.QGuiApplication.screenAt(QCursor.pos()) or QtGui.QGuiApplication.primaryScreen()
+        if screen is not None:
+            label.setMaximumWidth(max(240, min(560, screen.availableGeometry().width() - 32)))
+        else:
+            label.setMaximumWidth(560)
+        label.setText(str(text if text is not None else ""))
+        self._ai_link_tooltip.adjustSize()
+        tooltip_pos = self._ai_link_tooltip_position(self._ai_link_tooltip.size())
+        self._ai_link_tooltip.move(tooltip_pos)
+        self._ai_link_tooltip.show()
+
+    def _hide_ai_link_tooltip(self) -> None:
+        """Hide the styled AI link tooltip."""
+
+        if self._ai_link_tooltip is not None:
+            self._ai_link_tooltip.hide()
     
     def on_linkHovered(self, link: str):
 
@@ -9183,7 +9578,7 @@ data collected. This information will accompany every prompt sent to the AI, res
                 else:
                     prompt = self._resolve_prompt_reference_name(prompt_name)
                 if prompt is not None:
-                    QtWidgets.QToolTip.showText(QCursor.pos(), self._prompt_reference_tooltip(prompt), self.ui.ai_output)
+                    self._show_ai_link_tooltip(self._prompt_reference_tooltip(prompt))
             elif link.startswith('coding:'):
                 try:
                     coding_id = link[len('coding:'):]
@@ -9201,7 +9596,7 @@ data collected. This information will accompany every prompt sent to the AI, res
                     tooltip_txt += f'"{coding[2]}"'  # seltext
                 else:
                     tooltip_txt = _('Invalid source reference.')
-                QtWidgets.QToolTip.showText(QCursor.pos(), tooltip_txt, self.ui.ai_output)
+                self._show_ai_link_tooltip(tooltip_txt)
             elif link.startswith('chunk:'):
                 try:
                     chunk_id = link[len('chunk:'):]
@@ -9222,7 +9617,7 @@ data collected. This information will accompany every prompt sent to the AI, res
                     logger.debug(f'Link: "{link}" - Error: {e}')
                     source = None  # TODO source not used
                     tooltip_txt = _('Invalid source reference.')
-                QtWidgets.QToolTip.showText(QCursor.pos(), tooltip_txt, self.ui.ai_output)
+                self._show_ai_link_tooltip(tooltip_txt)
             elif link.startswith('quote:'):
                 # tooltip_txt = _('Open source document')
                 tooltip_txt = ''
@@ -9235,14 +9630,15 @@ data collected. This information will accompany every prompt sent to the AI, res
                     tooltip_txt = ''
                 if tooltip_txt == '':
                     tooltip_txt = _('Error retrieving source text')
-                QtWidgets.QToolTip.showText(QCursor.pos(), tooltip_txt, self.ui.ai_output)
+                self._show_ai_link_tooltip(tooltip_txt)
             elif link.startswith('action:topic_chat_analyze_more'):
                 tooltip_txt = _('This expands the data basis for the analysis. However, '
                                 'be careful not to overdo it, as this can also dilute '
                                 'the focus of the analysis.')
-                QtWidgets.QToolTip.showText(QCursor.pos(), tooltip_txt, self.ui.ai_output)
+                self._show_ai_link_tooltip(tooltip_txt)
         else:
             QtWidgets.QToolTip.hideText()
+            self._hide_ai_link_tooltip()
 
     def _open_text_reference(self, doc_id: int, start: int, end: int):
         """Show AI chat in sidebar mode and open the selected text span."""

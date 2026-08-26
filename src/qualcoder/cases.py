@@ -14,9 +14,10 @@ See the GNU General Public License for more details.
 You should have received a copy of the GNU Lesser General Public License along with QualCoder.
 If not, see <https://www.gnu.org/licenses/>.
 
-Author: Colin Curtain (ccbogel)
+Authors: Colin Curtain C, Kai Dröge, Justin Missaghieh--Poncet, Lorenzo Salomón
 https://github.com/ccbogel/QualCoder
 https://qualcoder.wordpress.com/
+https://qualcoder-org.github.io
 https://qualcoder.org/
 """
 
@@ -25,9 +26,9 @@ import datetime
 import logging
 import openpyxl
 from openpyxl import load_workbook
-import os
+from pathlib import Path
 import qtawesome as qta
-from urllib.parse import urlparse
+import sqlite3
 import webbrowser
 
 from PyQt6 import QtCore, QtGui, QtWidgets
@@ -44,7 +45,8 @@ from .memo import DialogMemo
 from .view_av import DialogViewAV
 from .view_image import DialogViewImage
 
-path = os.path.abspath(os.path.dirname(__file__))
+path = Path(__file__).resolve().parent
+
 logger = logging.getLogger(__name__)
 
 
@@ -114,6 +116,7 @@ class DialogCases(QtWidgets.QDialog):
         self.selected_file = None
         self.clipboard_text = ""  # Used to copy text into another cell
 
+        self.overwrite_attributes_on_import = False
         self.load_cases_data()
         self.fill_table()
         # Initial resize of table columns
@@ -181,7 +184,7 @@ class DialogCases(QtWidgets.QDialog):
         return False
 
     def _on_project_data_changed(self, tables, source):
-        """Refresh the dialog when relevant project tables change elsewhere."""
+        """ Refresh the dialog when relevant project tables change elsewhere."""
 
         if source is self or not isinstance(tables, list):
             return
@@ -225,8 +228,7 @@ class DialogCases(QtWidgets.QDialog):
 
     def insert_nonexisting_attribute_placeholders(self):
         """ Check attribute placeholder is present in attribute table.
-        An error in earlier qualcoder versions did not fill these placeholders.
-        Fix if not present.
+        Create placeholder if not present.
         Cases are a list of dictionaries.
         Attributes are a list of tuples(name,value,id)
         """
@@ -235,6 +237,7 @@ class DialogCases(QtWidgets.QDialog):
         cur = self.app.conn.cursor()
         cur.execute("select name from attribute_type where caseOrFile='case'")
         attribute_names = cur.fetchall()
+        inserted = False
         for c in self.cases:
             for att_name in attribute_names:
                 cur.execute("select value from attribute where id=? and name=? and attr_type='case'",
@@ -244,6 +247,9 @@ class DialogCases(QtWidgets.QDialog):
                     cur.execute("insert into attribute (value,id,name,attr_type, date,owner) values(?,?,?,'case',?,?)",
                                 ("", c['caseid'], att_name[0], now_date, self.app.settings['codername']))
                     self.app.conn.commit()
+                    inserted = True
+        if inserted:
+            self._emit_project_table_changes(['attribute'])
     def help(self):
         """ Open help for transcribe section in browser. """
         self.app.help_wiki("3.3.-Cases")
@@ -267,8 +273,8 @@ class DialogCases(QtWidgets.QDialog):
 
         shortname = self.app.project_name.split(".qda")[0]
         filename = shortname + "_case_attributes.xlsx"
-        e = ExportDirectoryPathDialog(self.app, filename)
-        filepath = e.filepath
+        export_dialog = ExportDirectoryPathDialog(self.app, filename)
+        filepath = export_dialog.filepath
         if filepath is None:
             return
         cols = self.ui.tableWidget.columnCount()
@@ -290,25 +296,11 @@ class DialogCases(QtWidgets.QDialog):
                     pass
                 cell.value = data
         wb.save(filepath)
-        '''with open(filepath, mode='w') as f: # OLD csv save
-            writer = csv.writer(f, delimiter=',', quotechar='"', quoting=csv.QUOTE_MINIMAL)
-            writer.writerow(header)
-            for r in range(0, rows):
-                data = []
-                for c in range(0, cols):
-                    # Table cell may be a None type
-                    cell = ""
-                    try:
-                        cell = self.ui.tableWidget.item(r, c).text()
-                    except AttributeError:
-                        pass
-                    data.append(cell)
-                writer.writerow(data)'''
         msg = _("Case attributes file exported to: ") + filepath
         Message(self.app, _('File export'), msg).exec()
         self.parent_text_edit.append(msg)
 
-    def load_cases_data(self, order_by="asc"):
+    def load_cases_data(self, order_by:str="asc"):
         """ Load case (to maximum) and attribute details from database. Display in tableWidget.
         Cases are a list of dictionaries.
         Attributes are a list of tuples(name,value,id)
@@ -383,12 +375,22 @@ class DialogCases(QtWidgets.QDialog):
             self.attribute_labels_ordered.append(att_name[0])
         # Add list if attribute values to cases, order matches header columns
         sql = "select ifnull(value, '') from attribute where attr_type='case' and attribute.name=? and id=?"
-        for a in self.attribute_labels_ordered:
+        for attribute_name in self.attribute_labels_ordered:
             for i, c in enumerate(self.cases):
-                cur.execute(sql, [a, c['caseid']])
+                cur.execute(sql, [attribute_name, c['caseid']])
                 res = cur.fetchone()
                 if res:
                     c['attributes'].append(res[0])
+                else:
+                    c['attributes'].append("")
+                    # Missing a stored attribute, need to store something
+                    now_date = str(datetime.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S"))
+                    cur.execute("insert into attribute (name,attr_type,value,id,date,owner) values(?,?,?,?,?,?)",
+                                [attribute_name, "case", "", c['caseid'],  now_date, self.app.settings['codername']])
+                    self.app.conn.commit()
+        # No event here: this runs on every refresh and sort, including refreshes
+        # triggered by the bus itself. The user actions that write attributes emit.
+
         self.fill_table()
 
     def update_label(self):
@@ -433,24 +435,29 @@ class DialogCases(QtWidgets.QDialog):
         self.app.delete_backup = False
 
     def import_cases_and_attributes(self):
-        """ Get user chosen file as xlxs or csv for importation """
+        """ Get user chosen file as xlsx or csv for importation """
 
-        if self.cases:
-            logger.warning(_("Cases have already been created."))
-        filename, ok = QtWidgets.QFileDialog.getOpenFileName(None,
+        self.overwrite_attributes_on_import = False
+        filepath, ok = QtWidgets.QFileDialog.getOpenFileName(None,
                                                              _('Select cases file'),
                                                              self.app.settings['directory'],
                                                              "(*.csv *.CSV *.xlsx *.XLSX)",
                                                              options=QtWidgets.QFileDialog.Option.DontUseNativeDialog
                                                              )
-        if filename == "":
+        if filepath == "":
             return
-        if filename[-4:].lower() == ".csv":
-            self.import_csv(filename)
-        if filename[-5:].lower() == ".xlsx":
-            self.import_xlsx(filename)
+        if self.cases:
+            msg = _("Do you want imported data to override existing attributes?")
+            ui = DialogConfirmDelete(self.app, msg, _("Cases exist"))
+            ok = ui.exec()
+            if ok:
+                self.overwrite_attributes_on_import = True
+        if filepath[-4:].lower() == ".csv":
+            self.import_csv(filepath)
+        if filepath[-5:].lower() == ".xlsx":
+            self.import_xlsx(filepath)
 
-    def import_xlsx(self, filepath):
+    def import_xlsx(self, filepath:str):
         """ Import from a xlsx file with the cases and any attributes.
         The file must have a header row which details the attribute names.
         The first column must have the case ids.
@@ -477,88 +484,13 @@ class DialogCases(QtWidgets.QDialog):
         data = data[1:]
         # Insert cases
         cur = self.app.conn.cursor()
+        sql_insert_case = "insert into cases (name,memo,owner,date) values(?,?,?,?)"
+        sql_insert_attr_type = "insert into attribute_type (name,date,owner,memo, valueType, caseOrFile) values(?,?,?,?,?,?)"
         for v in data:
             item = {'name': v[0], 'memo': "", 'owner': self.app.settings['codername'],
                     'date': now_date}
             try:
-                sql = "insert into cases (name,memo,owner,date) values(?,?,?,?)"
-                cur.execute(sql, (item['name'], item['memo'], item['owner'], item['date']))
-                self.app.conn.commit()
-                cur.execute("select last_insert_rowid()")
-                item['caseid'] = cur.fetchone()[0]
-                self.cases.append(item)
-            except Exception as e:
-                logger.error("item:" + str(item) + ", " + str(e))
-        # Determine attribute type
-        attribute_value_type = ["character"] * len(fields)
-        for col, att_name in enumerate(fields):
-            numeric = True
-            for val in data:
-                try:
-                    float(val[col])
-                except ValueError:
-                    numeric = False
-            if numeric:
-                attribute_value_type[col] = "numeric"
-        # Insert attribute types
-        for col, att_name in enumerate(fields):
-            if col > 0:
-                try:
-                    sql = "insert into attribute_type (name,date,owner,memo, valueType, caseOrFile) values(?,?,?,?,?,?)"
-                    cur.execute(sql, (att_name, now_date, self.app.settings['codername'], "",
-                                      attribute_value_type[col], 'case'))
-                    self.app.conn.commit()
-                except Exception as e:
-                    logger.error(_("attribute:") + f"{att_name}, {e}")
-        # Insert attributes
-        sql = "select name, caseid from cases"
-        cur.execute(sql)
-        name_and_ids = cur.fetchall()
-        for n_i in name_and_ids:
-            for v in data:
-                if n_i[0] == v[0]:
-                    for col in range(1, len(v)):
-                        sql = "insert into attribute (name, value, id, attr_type, date, owner) values (?,?,?,?,?,?)"
-                        cur.execute(sql, (fields[col], v[col], n_i[1], 'case',
-                                          now_date, self.app.settings['codername']))
-        self.app.conn.commit()
-        self._emit_project_table_changes(["cases", "attribute_type", "attribute"])
-        self.load_cases_data()
-        self.fill_table()
-        msg = _("Cases and attributes imported from: ") + filepath
-        self.app.delete_backup = False
-        self.parent_text_edit.append(msg)
-        logger.info(msg)
-
-    def import_csv(self, filepath):
-        """ Import from a csv file with the cases and any attributes.
-        The csv file must have a header row which details the attribute names.
-        The csv file must be comma delimited. The first column must have the case ids.
-        The attribute types are calculated from the data.
-        """
-
-        values = []
-        with open(filepath, 'r', newline='') as f:
-            reader = csv.reader(f, delimiter=',', quoting=csv.QUOTE_MINIMAL)
-            try:
-                for row in reader:
-                    values.append(row)
-            except csv.Error as e:
-                logger.warning(('file %s, line %d: %s' % (filepath, reader.line_num, e)))
-        if len(values) <= 1:
-            logger.info(_("Cannot import from csv, only one row in file"))
-            return
-        now_date = str(datetime.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S"))
-        fields = values[0]
-        data = values[1:]
-        # Insert cases
-        cur = self.app.conn.cursor()
-        for v in data:
-            item = {'name': v[0], 'memo': "", 'owner': self.app.settings['codername'],
-                    'date': now_date}
-            try:
-                sql = "insert into cases (name,memo,owner,date) values(?,?,?,?)"
-                cur.execute(sql, (item['name'], item['memo'], item['owner'], item['date']))
+                cur.execute(sql_insert_case, (item['name'], item['memo'], item['owner'], item['date']))
                 self.app.conn.commit()
                 cur.execute("select last_insert_rowid()")
                 item['caseid'] = cur.fetchone()[0]
@@ -580,9 +512,7 @@ class DialogCases(QtWidgets.QDialog):
         for col, att_name in enumerate(fields):
             if col > 0:
                 try:
-                    sql = "insert into attribute_type (name,date,owner,memo, \
-                    valueType, caseOrFile) values(?,?,?,?,?,?)"
-                    cur.execute(sql, (att_name, now_date, self.app.settings['codername'], "",
+                    cur.execute(sql_insert_attr_type, (att_name, now_date, self.app.settings['codername'], "",
                                       attribute_value_type[col], 'case'))
                     self.app.conn.commit()
                 except Exception as e:
@@ -591,13 +521,103 @@ class DialogCases(QtWidgets.QDialog):
         sql = "select name, caseid from cases"
         cur.execute(sql)
         name_and_ids = cur.fetchall()
+        insert_sql = "insert into attribute (name, value, id, attr_type, date, owner) values (?,?,?,?,?,?)"
+        update_sql = "update attribute set value=?, owner=?, date=? where attr_type=? and name=? and id=? "
         for n_i in name_and_ids:
             for v in data:
                 if n_i[0] == v[0]:
                     for col in range(1, len(v)):
-                        sql = "insert into attribute (name, value, id, attr_type, date, owner) values (?,?,?,?,?,?)"
-                        cur.execute(sql, (fields[col], v[col], n_i[1], 'case',
+                        try:
+                            cur.execute(insert_sql, (fields[col], v[col], n_i[1], 'case',
                                           now_date, self.app.settings['codername']))
+                        except sqlite3.IntegrityError:
+                            if self.overwrite_attributes_on_import:
+                                cur.execute(update_sql, (v[col], self.app.settings['codername'], now_date,
+                                                         'case', fields[col], n_i[1]))
+        self.app.conn.commit()
+        self._emit_project_table_changes(["cases", "attribute_type", "attribute"])
+        self.load_cases_data()
+        self.fill_table()
+        msg = _("Cases and attributes imported from: ") + filepath
+        self.app.delete_backup = False
+        self.parent_text_edit.append(msg)
+        logger.info(msg)
+
+    def import_csv(self, filepath:str):
+        """ Import from a csv file with the cases and any attributes.
+        The csv file must have a header row which details the attribute names.
+        The csv file must be comma delimited. The first column must have the case ids.
+        The attribute types are calculated from the data.
+        Args:
+            filepath : String
+        """
+
+        values = []
+        with open(filepath, 'r', newline='') as f:
+            reader = csv.reader(f, delimiter=',', quoting=csv.QUOTE_MINIMAL)
+            try:
+                for row in reader:
+                    values.append(row)
+            except csv.Error as e:
+                logger.warning(('file %s, line %d: %s' % (filepath, reader.line_num, e)))
+        if len(values) <= 1:
+            logger.info(_("Cannot import from csv, only one row in file"))
+            return
+        now_date = str(datetime.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S"))
+        fields = values[0]
+        data = values[1:]
+
+        # Insert cases
+        cur = self.app.conn.cursor()
+        sql_insert_case = "insert into cases (name,memo,owner,date) values(?,?,?,?)"
+        sql_insert_attr_type = "insert into attribute_type (name,date,owner,memo, valueType, caseOrFile) values(?,?,?,?,?,?)"
+        for v in data:
+            item = {'name': v[0], 'memo': "", 'owner': self.app.settings['codername'], 'date': now_date}
+            try:
+                cur.execute(sql_insert_case, (item['name'], item['memo'], item['owner'], item['date']))
+                self.app.conn.commit()
+                cur.execute("select last_insert_rowid()")
+                item['caseid'] = cur.fetchone()[0]
+                self.cases.append(item)
+            except Exception as e:
+                logger.error(f"item: {item}, {e}")
+        # Determine attribute type
+        attribute_value_type = ["character"] * len(fields)
+        for col, att_name in enumerate(fields):
+            numeric = True
+            for val in data:
+                try:
+                    float(val[col])
+                except ValueError:
+                    numeric = False
+            if numeric:
+                attribute_value_type[col] = "numeric"
+        # Insert attribute types
+        for col, att_name in enumerate(fields):
+            if col > 0:
+                try:
+                    cur.execute(sql_insert_attr_type, (att_name, now_date, self.app.settings['codername'], "",
+                                      attribute_value_type[col], 'case'))
+                    self.app.conn.commit()
+                except Exception as e:
+                    logger.error(_("attribute:") + f"{att_name}, {e}")
+        # Insert attributes
+        sql = "select name, caseid from cases"
+        cur.execute(sql)
+        name_and_ids = cur.fetchall()
+        sql_insert_value = "insert into attribute (name, value, id, attr_type, date, owner) values (?,?,?,?,?,?)"
+        sql_update_value = "update attribute set value=?, owner=?, date=? where attr_type=? and name=? and id=? "
+        for n_i in name_and_ids:
+            for v in data:
+                if n_i[0] == v[0]:
+                    for col in range(1, len(v)):
+                        try:
+                            cur.execute(sql_insert_value, (fields[col], v[col], n_i[1], 'case', now_date,
+                                                     self.app.settings['codername']))
+                        except sqlite3.IntegrityError:
+                            if self.overwrite_attributes_on_import:
+                                cur.execute(sql_update_value, (v[col], self.app.settings['codername'], now_date,
+                                                         'case', fields[col], n_i[1]))
         self.app.conn.commit()
         self._emit_project_table_changes(["cases", "attribute_type", "attribute"])
         self.load_cases_data()
@@ -618,7 +638,7 @@ class DialogCases(QtWidgets.QDialog):
         case_name = ui.get_new_name()
         if case_name is None:
             return
-        # update case list and database
+        # Update case list and database
         item = {'name': case_name, 'memo': "", 'owner': self.app.settings['codername'],
                 'date': datetime.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S"), 'files': [],
                 'attributes': []}
@@ -641,6 +661,7 @@ class DialogCases(QtWidgets.QDialog):
         self.fill_table()
         self.parent_text_edit.append(_("Case added: ") + item['name'])
         self.app.delete_backup = False
+        self._emit_project_table_changes(['cases', 'attribute'])
 
     def delete_case(self):
         """ When delete button pressed, case is deleted from model and database. """
@@ -674,70 +695,73 @@ class DialogCases(QtWidgets.QDialog):
         self.load_cases_data()
         self.app.delete_backup = False
         self.fill_table()
+        self._emit_project_table_changes(['cases', 'case_text', 'attribute'])
 
     def cell_modified(self):
         """ If the case name has been changed in the table widget update the database.
          Cells that can be changed directly are the case name, and attributes. """
 
-        x = self.ui.tableWidget.currentRow()
-        y = self.ui.tableWidget.currentColumn()
-        if y == self.NAME_COLUMN:  # update case name
-            new_text = str(self.ui.tableWidget.item(x, y).text()).strip()
-            # check that no other case name has this text and this is not empty
+        row = self.ui.tableWidget.currentRow()
+        col = self.ui.tableWidget.currentColumn()
+        value = str(self.ui.tableWidget.item(row, col).text()).strip()
+        changed_tables = []
+        if col == self.NAME_COLUMN:  # update case name
+            # Check that no other case name has this text and this is not empty
             update = True
-            if new_text == "":
+            if value == "":
                 update = False
             for c in self.cases:
-                if c['name'] == new_text:
+                if c['name'] == value:
                     update = False
             if update:
                 cur = self.app.conn.cursor()
-                cur.execute("update cases set name=? where caseid=?", (new_text, self.cases[x]['caseid']))
+                cur.execute("update cases set name=? where caseid=?", (value, self.cases[row]['caseid']))
                 self.app.conn.commit()
-                self.cases[x]['name'] = new_text
+                self.cases[row]['name'] = value
+                changed_tables.append("cases")
             else:  # put the original text in the cell
-                self.ui.tableWidget.item(x, y).setText(self.cases[x]['name'])
-        if y > 2:  # update attribute value
+                self.ui.tableWidget.item(row, col).setText(self.cases[row]['name'])
+        if col >= self.ATTRIBUTE_START_COLUMN:  # Update attribute value
             now_date = str(datetime.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S"))
-            value = str(self.ui.tableWidget.item(x, y).text()).strip()
-            attribute_name = self.header_labels[y]
+            attribute_name = self.header_labels[col]
             cur = self.app.conn.cursor()
             # Check numeric for numeric attributes, clear "" if cannot be cast
             cur.execute("select valuetype from attribute_type where caseOrFile='case' and name=?", [attribute_name])
             result = cur.fetchone()
             if result is None:
                 return
-            if result[0] == "numeric":
+            if result[0] == "numeric" and value != "":
                 try:
                     float(value)
                 except ValueError:
-                    self.ui.tableWidget.item(x, y).setText("")
+                    self.ui.tableWidget.item(row, col).setText("")
                     value = ""
                     msg = _("This attribute is numeric")
                     Message(self.app, _("Warning"), msg, "warning").exec()
             # Check attribute row is present before updating
             cur.execute("select value from attribute where id=? and name=? and attr_type='case'",
-                        [self.cases[x]['caseid'], attribute_name])
+                        [self.cases[row]['caseid'], attribute_name])
             res = cur.fetchone()
             if res is None:
                 cur.execute("insert into attribute (value,id,name,attr_type, date,owner) values(?,?,?,'case',?,?)",
-                            (value, self.cases[x]['caseid'], attribute_name, now_date, self.app.settings['codername']))
+                            (value, self.cases[row]['caseid'], attribute_name, now_date, self.app.settings['codername']))
                 self.app.conn.commit()
             cur.execute("update attribute set value=?, date=?, owner=? where id=? and name=? and attr_type='case'",
-                        (value, now_date, self.app.settings['codername'], self.cases[x]['caseid'], attribute_name))
+                        (value, now_date, self.app.settings['codername'], self.cases[row]['caseid'], attribute_name))
             self.app.conn.commit()
-            self._emit_project_table_changes(["attribute"])
+            changed_tables.append("attribute")
+        self._emit_project_table_changes(changed_tables)
 
         # Update self.cases[attributes]
-        # Add list of attribute values to files, order matches header columns
+        # Add list of attribute values to cases, order matches header columns
         sql = "select ifnull(value, '') from attribute where attr_type='case' and attribute.name=? and id=?"
-        self.cases[x]['attributes'] = []
+        self.cases[row]['attributes'] = []
         cur = self.app.conn.cursor()
         for att_name in self.attribute_labels_ordered:
-            cur.execute(sql, [att_name, self.cases[x]['caseid']])
+            cur.execute(sql, [att_name, self.cases[row]['caseid']])
             res = cur.fetchone()
             if res:
-                self.cases[x]['attributes'].append(res[0])
+                self.cases[row]['attributes'].append(res[0])
 
         self.app.delete_backup = False
 
@@ -771,13 +795,17 @@ class DialogCases(QtWidgets.QDialog):
                                        'pos1': row[3], 'owner': row[4], 'date': row[5], 'memo': row[6]})
 
         if y == self.MEMO_COLUMN:
+            previous_memo = self.cases[x]['memo']
             ui = DialogMemo(self.app, _("Memo for case ") + self.cases[x]['name'],
-                            self.cases[x]['memo'])
+                            self.cases[x]['memo'], entity_type="case", entity_id=self.cases[x]['caseid'])
             ui.exec()
             self.cases[x]['memo'] = ui.memo
             cur = self.app.conn.cursor()
             cur.execute('update cases set memo=? where caseid=?', (self.cases[x]['memo'], self.cases[x]['caseid']))
             self.app.conn.commit()
+            if self.cases[x]['memo'] != previous_memo:
+                # Opening a memo to read it must not wake up the other dialogs
+                self._emit_project_table_changes(['cases'])
             if self.cases[x]['memo'] == "" or self.cases[x]['memo'] is None:
                 self.ui.tableWidget.setItem(x, self.MEMO_COLUMN, QtWidgets.QTableWidgetItem())
             else:
@@ -857,9 +885,11 @@ class DialogCases(QtWidgets.QDialog):
             item_text = self.ui.tableWidget.item(row, col).text()
         except AttributeError:  # NoneType error
             pass
+        # Check and get all selected indexes
+        selected_indexes = self.ui.tableWidget.selectionModel().selectedIndexes()
 
         menu = QtWidgets.QMenu()
-        menu.setStyleSheet("QMenu {font-size:" + str(self.app.settings['fontsize']) + "pt} ")
+        menu.setStyleSheet(f"QMenu {{font-size:{self.app.settings['fontsize']}pt}} ")
         action_asc = None
         action_desc = None
         action_view_case = None
@@ -871,13 +901,20 @@ class DialogCases(QtWidgets.QDialog):
         action_equals_value = menu.addAction(_("Show this value"))
         action_order_by_value_asc = None
         action_order_by_value_desc = None
+        action_multiple_cells_value = None
         if col >= self.ATTRIBUTE_START_COLUMN:
             action_order_by_value_asc = menu.addAction(_("Order ascending"))
             action_order_by_value_desc = menu.addAction(_("Order descending"))
+            if len(selected_indexes) > 1:
+                action_multiple_cells_value = menu.addAction(_("Set value of selected cells"))
         action_show_all = menu.addAction(_("Show all rows Ctrl A"))
         action_url = None
-        url_test = urlparse(item_text)
-        if all([url_test.scheme, url_test.netloc]):
+        # Regex HTTP HTTPS protocol
+        regex_http = QtCore.QRegularExpression(
+            r"^https?:\/\/(?:www\.)?[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,63}\b(?:[-a-zA-Z0-9()@:%_\+.~#?&\/=]*)$")
+        # Regex Protocol optional
+        regex_no_protocol = QtCore.QRegularExpression(r"^www\.[a-zA-Z0-9()]{1,63}\b(?:[-a-zA-Z0-9()@:%_\+.~#?&\/=]*)$")
+        if bool(regex_no_protocol.match(item_text)) or bool(regex_http.match(item_text)):
             action_url = menu.addAction(_("Open URL"))
         action = menu.exec(self.ui.tableWidget.mapToGlobal(position))
         if action is None:
@@ -921,6 +958,50 @@ class DialogCases(QtWidgets.QDialog):
                 self.ui.tableWidget.setRowHidden(r, False)
         if action == action_url:
             webbrowser.open(item_text)
+        if action == action_multiple_cells_value:
+            self.multiple_cells_value()
+
+    def multiple_cells_value(self):
+        """ Assign a value to all selected attribute cells. """
+
+        value, ok = QtWidgets.QInputDialog.getText(self, _("Selected cells"), _("Set value:"),
+                                                        QtWidgets.QLineEdit.EchoMode.Normal)
+        if not ok: return
+        msg = ""
+        value = value.strip()
+        selected_indexes = self.ui.tableWidget.selectionModel().selectedIndexes()
+        for i in selected_indexes:
+            col, row =  i.column(), i.row()
+            # Check if cell is an editable attribute
+            if col >= self.ATTRIBUTE_START_COLUMN:
+                try:
+                    prev_value = str(self.ui.tableWidget.item(col, row).text()).strip()
+                except AttributeError:
+                    prev_value = ""
+                attribute_name = self.header_labels[col]
+                cur = self.app.conn.cursor()
+                # Check numeric for numeric attributes, clear "" if it cannot be cast
+                cur.execute("select valuetype from attribute_type where caseOrFile='case' and name=?",
+                            (attribute_name,))
+                result = cur.fetchone()
+                if result is None:
+                    return
+                if result[0] == "numeric" and value != "":
+                    try:
+                        float(value)
+                    except ValueError:
+                        value = prev_value
+                        msg = _("Value must be numeric")
+                cur.execute("update attribute set value=? where id=? and name=? and attr_type='case'",
+                            (value, self.cases[row]['caseid'], attribute_name))
+                item = QtWidgets.QTableWidgetItem(value)
+                self.ui.tableWidget.blockSignals(True)  # Otherwise, cell_modified() is called
+                self.ui.tableWidget.setItem(row,col, item)
+                self.ui.tableWidget.blockSignals(False)
+            self.app.conn.commit()
+        self._emit_project_table_changes(["attribute"])
+        if msg != "":
+            Message(self.app, _("Value error"), msg).exec()
 
     def fill_table(self):
         """ Fill the table widget with case details. """
@@ -965,9 +1046,10 @@ class DialogCases(QtWidgets.QDialog):
             self.ui.tableWidget.horizontalHeaderItem(self.ATTRIBUTE_START_COLUMN + i).setToolTip(_("Right click header row to hide columns") + f"\n{tt}")
         self.ui.tableWidget.blockSignals(False)
 
-    def get_tooltip_values(self, attribute_name):
+    def get_tooltip_values(self, attribute_name:str):
         """ Get values to display in tooltips for the value list column.
-        param: attribute_name : String """
+        Args:
+            attribute_name : String """
 
         tt = ""
         cur = self.app.conn.cursor()
@@ -1095,11 +1177,11 @@ class DialogCases(QtWidgets.QDialog):
     def link_clicked(self, position):
         """ View image or audio/video media in dialog.
         For A/V, added try block in case VLC bindings do not work.
-        Also check existence of media, as particularly, linked files may have bad links. """
+        Also check existence of media, linked files may have bad links. """
 
         cursor = self.ui.textBrowser.cursorForPosition(position)
         menu = QtWidgets.QMenu()
-        menu.setStyleSheet("QMenu {font-size:" + str(self.app.settings['fontsize']) + "pt} ")
+        menu.setStyleSheet(f"QMenu {{font-size:{self.app.settings['fontsize']}pt}} ")
         action_link = None
         for item in self.display_text_links:
             if item['pos0'] <= cursor.position() <= item['pos1']:
@@ -1113,32 +1195,32 @@ class DialogCases(QtWidgets.QDialog):
                 ui = None
                 if item['mediapath'][:6] == "video:":
                     abs_path = item['mediapath'].split(':')[1]
-                    if not os.path.exists(abs_path):
+                    if not Path(abs_path).exists():
                         return
                     ui = DialogViewAV(self.app, item)
                 if item['mediapath'][:6] == "/video":
                     abs_path = self.app.project_path + item['mediapath']
-                    if not os.path.exists(abs_path):
+                    if not Path(abs_path).exists():
                         return
                     ui = DialogViewAV(self.app, item)
                 if item['mediapath'][:6] == "audio:":
                     abs_path = item['mediapath'].split(':')[1]
-                    if not os.path.exists(abs_path):
+                    if not Path(abs_path).exists():
                         return
                     ui = DialogViewAV(self.app, item)
                 if item['mediapath'][0:6] == "/audio":
                     abs_path = self.app.project_path + item['mediapath']
-                    if not os.path.exists(abs_path):
+                    if not Path(abs_path).exists():
                         return
                     ui = DialogViewAV(self.app, item)
                 if item['mediapath'][0:7] == "images:":
                     abs_path = item['mediapath'].split(':')[1]
-                    if not os.path.exists(abs_path):
+                    if not Path(abs_path).exists():
                         return
                     ui = DialogViewImage(self.app, item)
                 if item['mediapath'][0:7] == "/images":
                     abs_path = self.app.project_path + item['mediapath']
-                    if not os.path.exists(abs_path):
+                    if not Path(abs_path).exists():
                         return
                     ui = DialogViewImage(self.app, item)
                 ui.exec()
@@ -1167,8 +1249,7 @@ class ToolTipEventFilter(QtCore.QObject):
 
     def set_positions(self, media_data):
         """ Code_text contains the positions for the tooltip to be displayed.
-
-        param:
+        Args:
             media_data: List of dictionaries of the text contains: pos0, pos1
         """
 

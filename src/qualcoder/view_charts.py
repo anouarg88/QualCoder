@@ -14,7 +14,7 @@ See the GNU General Public License for more details.
 You should have received a copy of the GNU Lesser General Public License along with QualCoder.
 If not, see <https://www.gnu.org/licenses/>.
 
-Author: Colin Curtain (ccbogel)
+Authors: Colin Curtain C, Kai Dröge, Justin Missaghieh--Poncet, Lorenzo Salomón
 https://github.com/ccbogel/QualCoder
 https://qualcoder.wordpress.com/
 https://qualcoder.org/
@@ -23,15 +23,15 @@ https://qualcoder.org/
 from collections import Counter
 from copy import copy, deepcopy
 import logging
-import os
+from pathlib import Path
 import tempfile  # Create a temporary file
 import pandas as pd
 import plotly.express as px
 import qtawesome as qta  # see: https://pictogrammers.com/library/mdi/
-
 from PyQt6 import QtCore, QtGui, QtWidgets
 from PyQt6.QtWidgets import QDialog
 from PyQt6.QtGui import QIcon
+import shutil
 
 from .GUI.ui_dialog_charts import Ui_DialogCharts
 from .helpers import ExportDirectoryPathDialog, Message
@@ -39,7 +39,6 @@ from .report_attributes import DialogSelectAttributeParameters
 from .simple_wordcloud import Wordcloud
 from . import stopwords
 
-path = os.path.abspath(os.path.dirname(__file__))
 logger = logging.getLogger(__name__)
 
 
@@ -185,8 +184,9 @@ class ViewCharts(QDialog):
         self.ui.comboBox_char_attributes.currentIndexChanged.connect(self.character_attribute_charts)
         self.ui.comboBox_num_attributes.currentIndexChanged.connect(self.numeric_attribute_charts)
         # Heatmaps
-        heatmap_combobox_list = ["", "File", "Case"]
-        self.ui.comboBox_heatmap.addItems(heatmap_combobox_list)
+        # Canonical keys in userData, labels translatable
+        for key, label in [("", ""), ("File", _("File")), ("Case", _("Case"))]:
+            self.ui.comboBox_heatmap.addItem(label, key)
         self.ui.comboBox_heatmap.currentIndexChanged.connect(self.make_heatmap)
         # Word cloud default stopwords based on default language
         index = self.ui.comboBox_stopwords.findText(self.app.settings['language'],
@@ -315,7 +315,7 @@ class ViewCharts(QDialog):
             try:
                 words_string = getattr(stopwords, lang_code, None)
                 if words_string:
-                    temp_path = os.path.join(tempfile.gettempdir(), f"qc_stopwords_{lang_code}.txt")
+                    temp_path = Path(tempfile.gettempdir()) / f"qc_stopwords_{lang_code}.txt"
                     with open(temp_path, 'w', encoding='utf-8') as f:
                         f.write("\n".join(words_string.split()))
                     return temp_path
@@ -323,14 +323,15 @@ class ViewCharts(QDialog):
                 pass
                 
             # OPCIÓN B: Buscar en la carpeta Examples como plan de respaldo
-            examples_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "Examples")
-            example_file = os.path.join(examples_dir, f"stopwords_{lang_code}.txt")
-            if os.path.exists(example_file):
+            #examples_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "Examples")
+            examples_dir = Path(__file__).resolve().parent.parent / "Examples"
+            example_file = Path(examples_dir) / f"stopwords_{lang_code}.txt"
+            if Path(example_file).exists():
                 return example_file
 
         # 3. FALLBACK: Prevenir crashes creando un archivo temporal vacío si no hay nada seleccionado
-        fallback_file = os.path.join(tempfile.gettempdir(), "qc_vacio_seguridad.txt")
-        if not os.path.exists(fallback_file):
+        fallback_file = Path(tempfile.gettempdir()) / "qc_vacio_seguridad.txt"  # 
+        if not Path(fallback_file).exisats():
             try:
                 with open(fallback_file, 'w', encoding='utf-8') as f:
                     f.write("") 
@@ -414,7 +415,7 @@ class ViewCharts(QDialog):
          This overrides existing stops words in the simple stopwords,
          and overrides stops words file in .qualcoder configuration folder."""
 
-        default_import_directory = os.path.expanduser("~")
+        default_import_directory = str(Path('~').expanduser())
         response = QtWidgets.QFileDialog.getOpenFileName(None, _('Select stopwords file'),
                                                          default_import_directory,
                                                          "Text Files (*.txt)",
@@ -515,7 +516,7 @@ class ViewCharts(QDialog):
                 if code['catid'] == cat['catid']:
                     selected_codes.append(code)
         # Include descendant sub-codes (supercid) of the selected codes, cascading, so a
-        # category selection also charts the sub-codes nested under its codes. <- L
+        # category selection also charts the sub-codes nested under its codes.
         selected_cids = {c['cid'] for c in selected_codes}
         changed = True
         while changed:
@@ -564,7 +565,6 @@ class ViewCharts(QDialog):
         """ Show word cloud.
          Can be by file and/or by category. """
 
-        title = _('Word cloud')
         owner, subtitle = self.owner_and_subtitle_helper()
         self.get_selected_categories_and_codes()
         cur = self.app.conn.cursor()
@@ -577,9 +577,11 @@ class ViewCharts(QDialog):
             if file_ids != "":
                 sql = "select seltext from code_text where cid=? and owner like ? and fid" + file_ids
             cur.execute(sql, [c['cid'], owner])
-            res_text = cur.fetchone()
-            if res_text:
-                values.append(res_text[0])
+            # fetchall: include every coded segment, not only the first one per code
+            res_text = cur.fetchall()
+            for row in res_text:
+                if row[0]:
+                    values.append(row[0])
 
         # Create image
         text = " ".join(values)
@@ -602,32 +604,39 @@ class ViewCharts(QDialog):
             self.ui.lineEdit_max_words.setText("200")
         reverse_colors = self.ui.checkBox_reverse_range.isChecked()
         ngrams = int(self.ui.comboBox_ngrams.currentText())
-        stopwords_path = self.get_selected_stopwords_path()
+        stopwords_path = str(self.get_selected_stopwords_path())  # Must be string object for wordcloud
+
+        # Ventana de confirmación de guardado. Save confirmation window. 
+        try:
+            # For wordcloud filepaths must be String
+            tmp_path = Path(self.app.confighome) / "wordcloud.png"
+            Wordcloud(self.app, text, width=width, height=height, max_words=max_words, background_color=background,
+                      text_color=foreground, reverse_colors=reverse_colors, ngrams=ngrams,
+                      stopwords_filepath2=stopwords_path, save_filepath=str(tmp_path))
+        except Exception as e:
+            logger.error(f"Error generating Wordcloud: {str(e)}")
+            Message(self.app, _("Error"), _("Error loading stopwords or generating wordcloud: ") + str(e)).exec()
+            return
+
+        # Export the wordcloud
         export_dir = QtWidgets.QFileDialog.getExistingDirectory(
             None, _('Select folder to save Wordcloud'),
-            self.last_wordcloud_dir,
-            options=QtWidgets.QFileDialog.Option.ShowDirsOnly
-        )
+            self.last_wordcloud_dir, options=QtWidgets.QFileDialog.Option.ShowDirsOnly)
         if not export_dir:
             return
         self.last_wordcloud_dir = export_dir
         base_name = "QualCoder_Wordcloud"
         extension = ".png"
-        filepath = os.path.join(export_dir, base_name + extension)
+        file_path = Path(export_dir) / f"{base_name}{extension}"
         counter = 0
-        
-        while os.path.exists(filepath):
-            filepath = os.path.join(export_dir, f"{base_name}_{counter}{extension}")
+        while Path(file_path).exists():
+            file_path = Path(export_dir) / f"{base_name}_{counter}{extension}"
             counter += 1
-        # Ventana de confirmación de guardado. Save confirmation window
         try:
-            Wordcloud(self.app, text, width=width, height=height, max_words=max_words, background_color=background,
-                      text_color=foreground, reverse_colors=reverse_colors, ngrams=ngrams,
-                      stopwords_filepath2=stopwords_path, save_filepath=filepath)
-            Message(self.app, _("Success"), _("Wordcloud saved successfully to:\n") + filepath).exec()
-        except Exception as e:
-            logger.error(f"Error generating Wordcloud: {str(e)}")
-            Message(self.app, _("Error"), _("Error loading stopwords or generating wordcloud: ") + str(e)).exec()
+            shutil.move(tmp_path, file_path)
+            Message(self.app, _("Image saved"), _("Wordcloud saved successfully to:\n") + str(file_path)).exec()
+        except Exception as err:
+            logger.error(err)
 
     def codes_of_category_helper(self, category_name):
         """ Get child categories and codes of this category node.
@@ -723,30 +732,30 @@ class ViewCharts(QDialog):
         cases = []
         counts = []
         for c in self.codes:
-            sql = "select cases.name from cases join case_text on cases.caseid = case_text.caseid " \
+            sql = "select cases.name from cases join (select distinct caseid, fid from case_text) case_text on cases.caseid = case_text.caseid " \
                   "join code_text on code_text.fid=case_text.fid" \
                   " where cid=? and code_text.owner like ? order by cases.name asc"
             if file_ids != "":
-                sql = "select cases.name from cases join case_text on cases.caseid = case_text.caseid " \
+                sql = "select cases.name from cases join (select distinct caseid, fid from case_text) case_text on cases.caseid = case_text.caseid " \
                       "join code_text on code_text.fid=case_text.fid where" \
                       " cid=? and code_text.owner like ? and code_text.fid" + file_ids + " order by cases.name asc"
             cur.execute(sql, [c['cid'], owner])
             res_text = cur.fetchall()
-            sql = "select cases.name from cases join case_text on cases.caseid = case_text.caseid " \
+            sql = "select cases.name from cases join (select distinct caseid, fid from case_text) case_text on cases.caseid = case_text.caseid " \
                   " join code_image on code_image.id=case_text.fid where \
              cid=? and code_image.owner like ? order by cases.name asc"
             if file_ids != "":
-                sql = "select cases.name from cases join case_text on cases.caseid = case_text.caseid " \
+                sql = "select cases.name from cases join (select distinct caseid, fid from case_text) case_text on cases.caseid = case_text.caseid " \
                       "join code_image on code_image.id=case_text.fid where " \
                       "cid=? and code_image.owner like ? and code_image.id" + file_ids + " order by cases.name asc"
             cur.execute(sql, [c['cid'], owner])
             res_image = cur.fetchall()
-            sql = "select cases.name from cases join case_text on cases.caseid = case_text.caseid " \
+            sql = "select cases.name from cases join (select distinct caseid, fid from case_text) case_text on cases.caseid = case_text.caseid " \
             " join code_av on case_text.fid=code_av.id where \
             cid=? and code_av.owner like ? order by cases.name asc"
             if file_ids != "":
-                sql = "select cases.name from cases join case_text on cases.caseid = case_text.caseid " \
-                "join code_av code_av.id=case_text.fid where " \
+                sql = "select cases.name from cases join (select distinct caseid, fid from case_text) case_text on cases.caseid = case_text.caseid " \
+                "join code_av on code_av.id=case_text.fid where " \
                 "cid=? and code_av.owner like ? and code_av.id" + file_ids + " order by cases.name asc"
             cur.execute(sql, [c['cid'], owner])
             res_av = cur.fetchall()
@@ -805,30 +814,30 @@ class ViewCharts(QDialog):
         cases = []
         counts = []
         for c in self.codes:
-            sql = "select cases.name from cases join case_text on cases.caseid = case_text.caseid " \
+            sql = "select cases.name from cases join (select distinct caseid, fid from case_text) case_text on cases.caseid = case_text.caseid " \
                   "join code_text on code_text.fid=case_text.fid" \
                   " where cid=? and code_text.owner like ? order by cases.name asc"
             if file_ids != "":
-                sql = "select cases.name from cases join case_text on cases.caseid = case_text.caseid " \
+                sql = "select cases.name from cases join (select distinct caseid, fid from case_text) case_text on cases.caseid = case_text.caseid " \
                       "join code_text on code_text.fid=case_text.fid where" \
                       " cid=? and code_text.owner like ? and code_text.fid" + file_ids + " order by cases.name asc"
             cur.execute(sql, [c['cid'], owner])
             res_text = cur.fetchall()
-            sql = "select cases.name from cases join case_text on cases.caseid = case_text.caseid " \
+            sql = "select cases.name from cases join (select distinct caseid, fid from case_text) case_text on cases.caseid = case_text.caseid " \
                   " join code_image on code_image.id=case_text.fid where \
              cid=? and code_image.owner like ? order by cases.name asc"
             if file_ids != "":
-                sql = "select cases.name from cases join case_text on cases.caseid = case_text.caseid " \
+                sql = "select cases.name from cases join (select distinct caseid, fid from case_text) case_text on cases.caseid = case_text.caseid " \
                       "join code_image on code_image.id=case_text.fid where " \
                       "cid=? and code_image.owner like ? and code_image.id" + file_ids + " order by cases.name asc"
             cur.execute(sql, [c['cid'], owner])
             res_image = cur.fetchall()
-            sql = "select cases.name from cases join case_text on cases.caseid = case_text.caseid " \
+            sql = "select cases.name from cases join (select distinct caseid, fid from case_text) case_text on cases.caseid = case_text.caseid " \
             " join code_av on case_text.fid=code_av.id where \
             cid=? and code_av.owner like ? order by cases.name asc"
             if file_ids != "":
-                sql = "select cases.name from cases join case_text on cases.caseid = case_text.caseid " \
-                "join code_av code_av.id=case_text.fid where " \
+                sql = "select cases.name from cases join (select distinct caseid, fid from case_text) case_text on cases.caseid = case_text.caseid " \
+                "join code_av on code_av.id=case_text.fid where " \
                 "cid=? and code_av.owner like ? and code_av.id" + file_ids + " order by cases.name asc"
             cur.execute(sql, [c['cid'], owner])
             res_av = cur.fetchall()
@@ -1082,9 +1091,9 @@ class ViewCharts(QDialog):
         labels = []
         case_file_name, file_ids = self.get_file_ids()
         for c in self.codes:
-            sql = "select sum(pos1 - pos0) from code_text where cid=? and owner like ?"
+            sql = "select ifnull(sum(pos1 - pos0), 0) from code_text where cid=? and owner like ?"
             if file_ids != "":
-                sql = "select sum(pos1 - pos0) from code_text where cid=? and owner like ? and fid" + file_ids
+                sql = "select ifnull(sum(pos1 - pos0), 0) from code_text where cid=? and owner like ? and fid" + file_ids
             cur.execute(sql, [c['cid'], owner])
             res = cur.fetchone()
             labels.append(c['name'])
@@ -1111,9 +1120,9 @@ class ViewCharts(QDialog):
         labels = []
         case_file_name, file_ids = self.get_file_ids()
         for c in self.codes:
-            sql = "select sum(cast(width as int) * cast(height as int)) from code_image where cid=? and owner like ?"
+            sql = "select ifnull(sum(cast(width as int) * cast(height as int)), 0) from code_image where cid=? and owner like ?"
             if file_ids != "":
-                sql = "select sum(cast(width as int) * cast(height as int)) from code_image where cid=? and owner like ? and id" + file_ids
+                sql = "select ifnull(sum(cast(width as int) * cast(height as int)), 0) from code_image where cid=? and owner like ? and id" + file_ids
             cur.execute(sql, [c['cid'], owner])
             res = cur.fetchone()
             labels.append(c['name'])
@@ -1140,9 +1149,9 @@ class ViewCharts(QDialog):
         labels = []
         case_file_name, file_ids = self.get_file_ids()
         for c in self.codes:
-            sql = "select sum(pos1 - pos0) from code_av where cid=? and owner like ?"
+            sql = "select ifnull(sum(pos1 - pos0), 0) from code_av where cid=? and owner like ?"
             if file_ids != "":
-                sql = "select sum(pos1 - pos0) from code_av where cid=? and owner like ? and id" + file_ids
+                sql = "select ifnull(sum(pos1 - pos0), 0) from code_av where cid=? and owner like ? and id" + file_ids
             cur.execute(sql, [c['cid'], owner])
             res = cur.fetchone()
             labels.append(c['name'])
@@ -1228,9 +1237,9 @@ class ViewCharts(QDialog):
         labels = []
         case_file_name, file_ids = self.get_file_ids()
         for c in self.codes:
-            sql = "select sum(pos1 - pos0) from code_text where cid=? and owner like ?"
+            sql = "select ifnull(sum(pos1 - pos0), 0) from code_text where cid=? and owner like ?"
             if file_ids != "":
-                sql = "select sum(pos1 - pos0) from code_text where cid=? and owner like ? and fid" + file_ids
+                sql = "select ifnull(sum(pos1 - pos0), 0) from code_text where cid=? and owner like ? and fid" + file_ids
             cur.execute(sql, [c['cid'], owner])
             res = cur.fetchone()
             labels.append(c['name'])
@@ -1257,9 +1266,9 @@ class ViewCharts(QDialog):
         values = []
         labels = []
         for c in self.codes:
-            sql = "select sum(cast(width as int) * cast(height as int)) from code_image where cid=? and owner like ?"
+            sql = "select ifnull(sum(cast(width as int) * cast(height as int)), 0) from code_image where cid=? and owner like ?"
             if file_ids != "":
-                sql = "select sum(cast(width as int) * cast(height as int)) from code_image where cid=? and owner like ? and id" + file_ids
+                sql = "select ifnull(sum(cast(width as int) * cast(height as int)), 0) from code_image where cid=? and owner like ? and id" + file_ids
             cur.execute(sql, [c['cid'], owner])
             res = cur.fetchone()
             labels.append(c['name'])
@@ -1286,9 +1295,9 @@ class ViewCharts(QDialog):
         labels = []
         cur = self.app.conn.cursor()
         for c in self.codes:
-            sql = "select sum(pos1 - pos0) from code_av where cid=? and owner like ?"
+            sql = "select ifnull(sum(pos1 - pos0), 0) from code_av where cid=? and owner like ?"
             if file_ids != "":
-                sql = "select sum(pos1 - pos0) from code_av where cid=? and owner like ? and id" + file_ids
+                sql = "select ifnull(sum(pos1 - pos0), 0) from code_av where cid=? and owner like ? and id" + file_ids
             cur.execute(sql, [c['cid'], owner])
             res = cur.fetchone()
             labels.append(c['name'])
@@ -1348,7 +1357,7 @@ class ViewCharts(QDialog):
 
     @staticmethod
     def _contrast_text(hex_colour):
-        """ Black or white label for readability over a given sector colour. <- L """
+        """ Black or white label for readability over a given sector colour. """
         h = (hex_colour or '').lstrip('#')
         if len(h) != 6:
             return '#000000'
@@ -1362,7 +1371,7 @@ class ViewCharts(QDialog):
     def _apply_code_colours(self, fig, colours_map):
         """ Colour each sunburst/treemap sector with its code colour (neutral grey for
         categories) and set a black or white label per sector for readable contrast.
-        Sectors are matched by name read from the trace, so the order stays correct. <- L """
+        Sectors are matched by name read from the trace, so the order stays correct. """
         try:
             labels = list(fig.data[0].labels)
         except (IndexError, AttributeError, TypeError):
@@ -1371,7 +1380,7 @@ class ViewCharts(QDialog):
         fig.update_traces(insidetextfont_color=text_colours)
 
     def _rollup_subcodes_into_parent_codes(self):
-        """ Hierarchy charts: nest sub-codes under their parent code. <- L
+        """ Hierarchy charts: nest sub-codes under their parent code.
         Sub-codes have a null catid, so the category roll-up leaves them parentless and they
         float at the root. Here each sub-code count is rolled up the code hierarchy (deepest
         first) so a parent code total includes its descendants, and each sub-code parentname
@@ -1433,7 +1442,7 @@ class ViewCharts(QDialog):
             for coded_item in coded_data:
                 if coded_item[0] == code_['cid']:
                     code_['count'] += 1
-        self._rollup_subcodes_into_parent_codes()  # sub-codes nest under their parent code <- L
+        self._rollup_subcodes_into_parent_codes()  # sub-codes nest under their parent code
         # Add the code count directly to each parent category, add parentname to each code
         for category in self.categories:
             for code_ in self.codes:
@@ -1444,7 +1453,7 @@ class ViewCharts(QDialog):
         # Until only top categories remain
         sub_categories = copy(self.categories)
         counter = 0
-        while len(sub_categories) > 0 or counter < 5000:
+        while len(sub_categories) > 0 and counter < 5000:
             # Identify parent categories
             parent_list = []
             for super_cat in sub_categories:
@@ -1468,7 +1477,7 @@ class ViewCharts(QDialog):
         items = []
         values = []
         parents = []
-        colors_map = {}  # sector colour: the code's own colour, neutral grey for categories <- L
+        colors_map = {}  # sector colour: the code's own colour, neutral grey for categories
         for sb_combined in combined:
             items.append(sb_combined['name'])
             values.append(sb_combined['count'])
@@ -1486,14 +1495,14 @@ class ViewCharts(QDialog):
             fig = px.sunburst(df[mask], names='item', parents='parent', values='value', branchvalues='total',
                               color='item', color_discrete_map=colors_map,
                               title=title + subtitle)
-            self._apply_code_colours(fig, colors_map)  # sectors match code colours, labels stay readable <- L
+            self._apply_code_colours(fig, colors_map)  # sectors match code colours, labels stay readable
             fig.show()
             self.helper_export_html(fig)
         if chart == "treemap":
             fig = px.treemap(df[mask], names='item', parents='parent', values='value', branchvalues='total',
                              color='item', color_discrete_map=colors_map,
                              title=title + subtitle)
-            self._apply_code_colours(fig, colors_map)  # sectors match code colours, labels stay readable <- L
+            self._apply_code_colours(fig, colors_map)  # sectors match code colours, labels stay readable
             fig.show()
             self.helper_export_html(fig)
 
@@ -1510,7 +1519,7 @@ class ViewCharts(QDialog):
         cur = self.app.conn.cursor()
         sql = "select cid, pos1-pos0 from code_text where owner like ?"
         if file_ids != "":
-            sql = "select cid, pos1-pos0 from code_text where owner like ?and fid" + file_ids
+            sql = "select cid, pos1-pos0 from code_text where owner like ? and fid" + file_ids
         cur.execute(sql, [owner])
         result = cur.fetchall()
         for row in result:
@@ -1520,7 +1529,7 @@ class ViewCharts(QDialog):
             for coded_item in coded_data:
                 if coded_item[0] == code_['cid']:
                     code_['count'] += coded_item[1]
-        self._rollup_subcodes_into_parent_codes()  # sub-codes nest under their parent code <- L
+        self._rollup_subcodes_into_parent_codes()  # sub-codes nest under their parent code
         # Add the code count directly to each parent category, add parentname to each code
         for category in self.categories:
             for code_ in self.codes:
@@ -1531,7 +1540,7 @@ class ViewCharts(QDialog):
         # Until only top categories remain
         sub_categories = copy(self.categories)
         counter = 0
-        while len(sub_categories) > 0 or counter < 5000:
+        while len(sub_categories) > 0 and counter < 5000:
             # Identify parent categories
             parent_list = []
             for super_cat in sub_categories:
@@ -1618,7 +1627,7 @@ class ViewCharts(QDialog):
         # Until only top categories remain
         sub_categories = copy(self.categories)
         counter = 0
-        while len(sub_categories) > 0 or counter < 5000:
+        while len(sub_categories) > 0 and counter < 5000:
             # Identify parent categories
             parent_list = []
             for super_cat in sub_categories:
@@ -1705,7 +1714,7 @@ class ViewCharts(QDialog):
         # Until only top categories remain
         sub_categories = copy(self.categories)
         counter = 0
-        while len(sub_categories) > 0 or counter < 5000:
+        while len(sub_categories) > 0 and counter < 5000:
             # Identify parent categories
             parent_list = []
             for super_cat in sub_categories:
@@ -1892,10 +1901,10 @@ class ViewCharts(QDialog):
             codes = codes[:40]
             Message(self.app, _("Too many codes"), _("Too many codes for display. Restricted to 40")).exec()
         # Filters
-        heatmap_type = self.ui.comboBox_heatmap.currentText()
-        if heatmap_type == "":
+        heatmap_type = self.ui.comboBox_heatmap.currentData()  # canonical key, translation-safe
+        if heatmap_type in (None, ""):
             return
-        title = heatmap_type + " " + _("Heatmap")
+        title = self.ui.comboBox_heatmap.currentText() + " " + _("Heatmap")
         self.get_selected_categories_and_codes()
         y_labels = []
         for c in codes:
@@ -1947,7 +1956,7 @@ class ViewCharts(QDialog):
                 for code_ in codes:
                     code_counts = []
                     for c in cases:
-                        cur.execute("SELECT fid FROM case_text where caseid=?", [c[0]])
+                        cur.execute("SELECT distinct fid FROM case_text where caseid=?", [c[0]])
                         fids = cur.fetchall()
                         case_counts = 0
                         for fid in fids:
@@ -1956,7 +1965,7 @@ class ViewCharts(QDialog):
                     data.append(code_counts)
             else:
                 attr_msg, file_ids_txt = self.get_file_ids()
-                print(self.attribute_case_ids_and_names)
+                # print(self.attribute_case_ids_and_names)
                 for c in self.attribute_case_ids_and_names:
                     x_labels.append(c[1])
                 # Calculate the frequency of each code in each file
@@ -1964,7 +1973,7 @@ class ViewCharts(QDialog):
                 for code_ in codes:
                     code_counts = []
                     for c in self.attribute_case_ids_and_names:
-                        cur.execute("SELECT fid FROM case_text where caseid=?", [c[0]])
+                        cur.execute("SELECT distinct fid FROM case_text where caseid=?", [c[0]])
                         fids = cur.fetchall()
                         case_counts = 0
                         for fid in fids:

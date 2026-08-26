@@ -14,19 +14,19 @@ See the GNU General Public License for more details.
 You should have received a copy of the GNU Lesser General Public License along with QualCoder.
 If not, see <https://www.gnu.org/licenses/>.
 
-Author: Colin Curtain (ccbogel)
+Authors: Colin Curtain C, Kai Dröge, Justin Missaghieh--Poncet, Lorenzo Salomón
 https://github.com/ccbogel/QualCoder
 https://qualcoder.wordpress.com/
+https://qualcoder-org.github.io
 https://qualcoder.org/
 """
 
 import logging
-import os
-import sqlite3
+from pathlib import Path
 
 import qtawesome as qta  # see: https://pictogrammers.com/library/mdi/
 
-from PyQt6 import QtGui, QtWidgets, QtCore
+from PyQt6 import QtWidgets, QtCore
 
 from .code_text import DialogCodeText  # for isinstance()
 from .confirm_delete import DialogConfirmDelete
@@ -36,7 +36,6 @@ from .merge_projects import MergeProjects
 from .select_items import DialogSelectItems
 from .text_file_replacement import ReplaceTextFile
 
-path = os.path.abspath(os.path.dirname(__file__))
 logger = logging.getLogger(__name__)
 
 
@@ -46,18 +45,6 @@ class DialogSpecialFunctions(QtWidgets.QDialog):
     Updating a text file while trying to keep existing codings.
     """
 
-    app = None
-    parent_text_edit = None
-    tab_coding = None  # Tab widget coding tab for updates
-
-    # For Replacing a text file with another and keeping codings
-    file_to_replace = None
-    file_replacement = None
-
-    # For merging projects
-    merge_project_path = ""
-    projects_merged = False  # Used in main to clear gui tabs
-
     def __init__(self, app, parent_text_edit, tab_coding, parent=None):
 
         super(DialogSpecialFunctions, self).__init__(parent)
@@ -66,12 +53,18 @@ class DialogSpecialFunctions(QtWidgets.QDialog):
         self.ui.setupUi(self)
         self.app = app
         self.parent_text_edit = parent_text_edit
-        self.tab_coding = tab_coding
+        self.tab_coding = tab_coding  # Tab widget coding tab for updates
+        self.coder_names = []
+        # For Replacing a text file with another and keeping codings
+        self.file_to_replace = None
+        self.file_replacement = None
+        # For merging projects
+        self.projects_merged = False  # Used in main to clear gui tabs
+        self.merge_project_path = ""
+
         self.setWindowFlags(self.windowFlags() & ~QtCore.Qt.WindowType.WindowContextHelpButtonHint)
         font = f'font: {app.settings["fontsize"]}pt "{app.settings["font"]}";'
         self.setStyleSheet(font)
-        self.merge_project_path = ""
-        self.coder_names = []
         self.ui.pushButton_select_text_file.setIcon(qta.icon('mdi6.file-search', options=[{'scale_factor': 1.4}]))
         self.ui.pushButton_select_text_file.setFocus()
         self.ui.pushButton_select_replacement_text_file.setIcon(
@@ -93,8 +86,14 @@ class DialogSpecialFunctions(QtWidgets.QDialog):
         # Text positions, is here in case it is needed, but hidden for users as dangerous, Key Tilde to activate
         self.ui.groupBox_text_positions.hide()
 
+    def _emit_project_table_changes(self, tables):
+        """Notify other open dialogs about changed project tables."""
+
+        if getattr(self.app, "project_events", None) is not None:
+            self.app.project_events.emit_table_changes(tables, source=self)
+
     def keyPressEvent(self, event):
-        """ Tilde ~ to show the exitst start and end text positions in coded text. """
+        """ Tilde ~ to show the existing start and end text positions in coded text. """
 
         key = event.key()
         if key == QtCore.Qt.Key.Key_AsciiTilde:
@@ -108,7 +107,7 @@ class DialogSpecialFunctions(QtWidgets.QDialog):
         self.merge_project_path = ""
         default_directory = self.app.settings['directory']
         if default_directory == "":
-            default_directory = os.path.expanduser('~')
+            default_directory = Path('~').expanduser()
         self.merge_project_path = QtWidgets.QFileDialog.getExistingDirectory(self,
                                                                              _('Open project directory'),
                                                                              default_directory)
@@ -132,7 +131,12 @@ class DialogSpecialFunctions(QtWidgets.QDialog):
 
         mp = MergeProjects(self.app, self.merge_project_path)
         self.parent_text_edit.append(mp.summary_msg)
-        self.projects_merged = mp.projects_merged
+        # Sticky: a later cancelled merge must not undo the refresh owed to an earlier one
+        if mp.projects_merged:
+            self.projects_merged = True
+        else:
+            # Cancelled or failed, so allow another attempt
+            self.ui.pushButton_merge.setEnabled(True)
 
     # Functions to update a text file but attempt to keep original codings
     def select_original_text_file(self):
@@ -222,6 +226,7 @@ class DialogSpecialFunctions(QtWidgets.QDialog):
                 pass
             cur.execute(update_sql, [new_pos0, seltext, r[2], r[3], r[0], r[1], r[4]])
             self.app.conn.commit()
+        self._emit_project_table_changes(['code_text'])
         self.parent_text_edit.append(
             _("All text codings by ") + self.app.settings['codername'] + _(" resized by ") + str(delta) + _(
                 " characters."))
@@ -268,6 +273,7 @@ class DialogSpecialFunctions(QtWidgets.QDialog):
                 pass
             cur.execute(update_sql, [new_pos1, seltext, r[2], r[3], r[0], r[1], r[4]])
             self.app.conn.commit()
+        self._emit_project_table_changes(['code_text'])
         self.parent_text_edit.append(
             _("All text codings by ") + self.app.settings['codername'] + _(" resized by ") + str(delta) + _(
                 " characters."))

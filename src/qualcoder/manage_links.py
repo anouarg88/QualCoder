@@ -14,15 +14,16 @@ See the GNU General Public License for more details.
 You should have received a copy of the GNU Lesser General Public License along with QualCoder.
 If not, see <https://www.gnu.org/licenses/>.
 
-Author: Colin Curtain (ccbogel)
+Authors: Colin Curtain C, Kai Dröge, Justin Missaghieh--Poncet, Lorenzo Salomón
 https://github.com/ccbogel/QualCoder
 https://qualcoder.wordpress.com/
+https://qualcoder-org.github.io
 https://qualcoder.org/
-
 """
 
 import logging
 import os
+from pathlib import Path
 import time
 
 from PyQt6 import QtCore, QtWidgets, QtGui
@@ -34,17 +35,12 @@ from .helpers import Message
 from .code_av import DialogCodeAV  # for isinstance()
 from .view_image import DialogCodeImage  # DialogCodeImage for isinstance()
 
-path = os.path.abspath(os.path.dirname(__file__))
 logger = logging.getLogger(__name__)
 
 
 class DialogManageLinks(QtWidgets.QDialog):
     """ Fix bad file links. Can browse to correct location to set a new file path.
     """
-
-    parent_textEdit = None
-    tab_coding = None  # Tab widget coding tab for updates
-    links = []
 
     def __init__(self, app, parent_text_edit, tab_coding):
 
@@ -71,10 +67,16 @@ class DialogManageLinks(QtWidgets.QDialog):
         self.links = self.app.check_bad_file_links()
         for link in self.links:
             link['filepaths'] = []
-        self.home = os.path.expanduser('~')
+        self.home = Path('~').expanduser()
         self.fill_table()
         self.ui.pushButton_search_folders.pressed.connect(self.find_filepaths)
         self.ui.pushButton_bulk.pressed.connect(self.bulk_path_rename)
+
+    def _emit_project_table_changes(self, tables):
+        """Notify other open dialogs about changed project tables."""
+
+        if getattr(self.app, "project_events", None) is not None:
+            self.app.project_events.emit_table_changes(tables, source=self)
 
     def bulk_path_rename(self):
         """ Update all the linked by changing the path.
@@ -123,6 +125,7 @@ class DialogManageLinks(QtWidgets.QDialog):
                 self.app.conn.commit()
             if instances > 1:
                 multiples += 1
+        self._emit_project_table_changes(['source'])
         if multiples > 0:
             Message(self.app, _("Multiple occurrences"), _("Multiples of text in path. Some links not updated.") + f"\n{old_text}").exec()
         self.links = self.app.check_bad_file_links()
@@ -132,20 +135,20 @@ class DialogManageLinks(QtWidgets.QDialog):
 
     def find_filepaths(self):
         """ Get file paths of this file name. """
-        pd = QtWidgets.QProgressDialog(labelText=self.home[-30:], minimum=0, maximum=0, parent=self)
+        pd = QtWidgets.QProgressDialog(labelText=str(self.home[-30:]), minimum=0, maximum=0, parent=self)
         pd.setWindowModality(QtCore.Qt.WindowModality.WindowModal)
         pd.setWindowTitle(_('Search folders'))
         pd.show()
         last_msg_update = time.time()
         for link in self.links:
             paths = []
-            for root, dirs, files in os.walk(self.home):
+            for root, dirs, files in Path(self.home).walk:
                 QtWidgets.QApplication.processEvents() # necessary to update the progress dialog
                 if time.time() - last_msg_update > 0.1:  
                     pd.setLabelText(f'...{root[-30:]}')
                     last_msg_update = time.time()
                 if link['name'] in files:
-                    paths.append(os.path.join(root, link['name']))
+                    paths.append(str(Path(root) / link['name']))  # keep as string for now
                 if pd.wasCanceled() or len(paths) > 2:
                     break
             link['filepaths'] = paths
@@ -191,9 +194,13 @@ class DialogManageLinks(QtWidgets.QDialog):
             return
         self.update_database(file_path, row)
 
-    def update_database(self, new_file_path, row):
+    def update_database(self, new_file_path: str, row:int):
         """ Update database and links list.
-         Called by: file_dialog_selection, cell_selected. """
+         Called by: file_dialog_selection, cell_selected.
+         Args:
+             new_file_path: String
+             row : Integer
+        """
 
         new_file_name = new_file_path.split('/')[-1]
         # Use split ':',1 as can have ':' as a part of the file path
@@ -202,6 +209,7 @@ class DialogManageLinks(QtWidgets.QDialog):
         sql = "update source set mediapath=? where id=?"
         cur.execute(sql, [self.links[row]['mediapath'], self.links[row]['id']])
         self.app.conn.commit()
+        self._emit_project_table_changes(['source'])
         self.fill_table()
         # Update file in file list in any opened coding dialog
         contents = self.tab_coding.layout()
@@ -257,7 +265,7 @@ class DialogManageLinks(QtWidgets.QDialog):
             self.ui.tableWidget.setItem(row, 1, name_item)
             path_item = QtWidgets.QTableWidgetItem(type_and_path[1])
             path_item.setFlags(name_item.flags() ^ QtCore.Qt.ItemFlag.ItemIsEditable)
-            if not os.path.exists(type_and_path[1]):
+            if not Path(type_and_path[1]).exists():
                 path_item.setForeground(QtGui.QBrush(QtGui.QColor("Red")))
             self.ui.tableWidget.setItem(row, 2, path_item)
             if 'filepaths' in item:

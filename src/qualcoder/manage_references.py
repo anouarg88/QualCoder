@@ -14,16 +14,19 @@ See the GNU General Public License for more details.
 You should have received a copy of the GNU Lesser General Public License along with QualCoder.
 If not, see <https://www.gnu.org/licenses/>.
 
-Author: Colin Curtain (ccbogel)
+Authors: Colin Curtain C, Kai Dröge, Justin Missaghieh--Poncet, Lorenzo Salomón
 https://github.com/ccbogel/QualCoder
 https://qualcoder.wordpress.com/
+https://qualcoder-org.github.io
 https://qualcoder.org/
 """
 
+import datetime
 import os
 from rispy import TAG_KEY_MAPPING
 import logging
 from operator import itemgetter
+from shutil import copyfile
 import qtawesome as qta
 import re
 
@@ -33,7 +36,10 @@ from .GUI.ui_reference_editor import Ui_DialogReferenceEditor
 from .GUI.ui_manage_references import Ui_Dialog_manage_references
 from .confirm_delete import DialogConfirmDelete
 from .information import DialogInformation
-from .helpers import Message
+from .helpers import Message, extract_epub_fulltext
+from .pdf_preview import DialogPdfPreview
+from .manage_references_import import ATTACHMENT_EXTENSIONS, existing_reference_signatures, \
+    reference_signature
 from .ris import Ris, RisImport
 from .view_av import DialogViewAV
 from .view_image import DialogViewImage
@@ -65,15 +71,14 @@ class DialogReferenceManager(QtWidgets.QDialog):
     Remove file from a case. View file.
     """
 
-    app = None
-    parent_text_edit = None
-    files = []
-    refs = []
-
     def __init__(self, app_, parent_text_edit):
 
         self.app = app_
         self.parent_text_edit = parent_text_edit
+        # Per import session tri-state: code the highlights of attached PDFs.
+        self.pdf_import_code_highlights = None
+        # Attachments imported in the current batch, to update the AI memory once.
+        self.attachments_imported = 0
         self.files = []
         self.av_dialog_open = None
         self.refs = []
@@ -124,6 +129,12 @@ class DialogReferenceManager(QtWidgets.QDialog):
         self.ui.splitter.setSizes([500, 200])
         self.table_files_rows_hidden = False
         self.table_refs_rows_hidden = False
+
+    def _emit_project_table_changes(self, tables):
+        """Notify other open dialogs about changed project tables."""
+
+        if getattr(self.app, "project_events", None) is not None:
+            self.app.project_events.emit_table_changes(tables, source=self)
 
     def get_data(self):
         """ Get data for files and references. """
@@ -285,17 +296,32 @@ class DialogReferenceManager(QtWidgets.QDialog):
             if len(self.files[row]['mediapath']) > 5 and self.files[row]['mediapath'][:6] in ("/audio", "audio:"):
                 self.view_av(row)
                 return
+        # PDF attachments open in the page viewer (as in Manage files), without the
+        # txt copy button: converted copies are created from Manage files.
+        mediapath_ = self.files[row]['mediapath']
+        if mediapath_ is not None and mediapath_.lower().endswith(".pdf") and \
+                (mediapath_[0:6] == '/docs/' or mediapath_[0:5] == 'docs:'):
+            if mediapath_[0:6] == '/docs/':
+                pdf_filepath = os.path.join(self.app.project_path, "documents", mediapath_[6:])
+            else:
+                pdf_filepath = mediapath_[5:]
+            if not os.path.exists(pdf_filepath):
+                self.parent_text_edit.append(_("Bad link or non-existent file ") + str(pdf_filepath))
+                return
+            preview = DialogPdfPreview(self.app, pdf_filepath, self.files[row]['name'], self,
+                                       show_convert_txt=False)
+            preview.exec()
+            return
         ui = DialogInformation(self.app, self.files[row]['name'], self.files[row]['fulltext'])
         ui.ui.textEdit.setReadOnly(True)
         ui.exec()
 
-    def view_av(self, row):
+    def view_av(self, row:int):
         """ View an audio or video file. Edit the memo. Edit the transcript file.
         Added try block in case VLC bindings do not work.
         Uses a non-modal dialog.
-
-        param:
-            x  :  row number Integer
+        Args:
+            row  :  row number Integer
         """
 
         if not vlc:
@@ -324,11 +350,10 @@ class DialogReferenceManager(QtWidgets.QDialog):
             self.av_dialog_open = None
             return
 
-    def view_image(self, row):
+    def view_image(self, row:int):
         """ View an image file and edit the image memo.
-
-        param:
-            x  :  row number Integer
+        Args:
+            row  :  row number Integer
         """
 
         # Check image exists
@@ -373,8 +398,11 @@ class DialogReferenceManager(QtWidgets.QDialog):
             # print(best_match)
             ris_id = best_match[0]
             fid = file_['id']
-            self.link_reference_to_files(ris_id, fid)
+            # Silenced per call: one event covers the whole auto-link run
+            self.link_reference_to_files(ris_id, fid, notify=False)
             files_linked_count += 1
+        if files_linked_count > 0:
+            self._emit_project_table_changes(['source', 'attribute'])
         msg = _("Matches: ") + f"          {files_linked_count} / {len(files_unlinked)}          "
         Message(self.app, _("Files linked to references"), msg).exec()
 
@@ -533,12 +561,12 @@ class DialogReferenceManager(QtWidgets.QDialog):
             self.fill_table_refs()
             return
         if action == action_type_ascending:
-            sorted_list = sorted(self.refs, key=lambda x: x['TY'])
+            sorted_list = sorted(self.refs, key=lambda x: x.get('TY', ''))
             self.refs = sorted_list
             self.fill_table_refs()
             return
         if action == action_type_descending:
-            sorted_list = sorted(self.refs, key=lambda x: x['TY'], reverse=True)
+            sorted_list = sorted(self.refs, key=lambda x: x.get('TY', ''), reverse=True)
             self.refs = sorted_list
             self.fill_table_refs()
             return
@@ -656,10 +684,260 @@ class DialogReferenceManager(QtWidgets.QDialog):
             self.delete_reference()
 
     def import_references(self):
-        """ Import RIS formatted references from .ris or .txt files or PubMed nbib files """
+        """
+        Asks for the source (file or Zotero) and launches the matching importer. File imports
+        RIS formatted references from .ris, .txt or PubMed .nbib files. Reference selection,
+        duplicate detection (reference and file) and attachment linking happen in the preview
+        dialog.
+        """
 
-        RisImport(self.app, self.parent_text_edit)
+        msg_box = QtWidgets.QMessageBox(self)
+        msg_box.setStyleSheet(f'font: {self.app.settings["fontsize"]}pt "{self.app.settings["font"]}";')
+        msg_box.setWindowTitle(_("Import references"))
+        msg_box.setText(_("Import references from:"))
+        msg_box.setIcon(QtWidgets.QMessageBox.Icon.Question)
+        button_file = msg_box.addButton(_("File"), QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+        button_file.setToolTip(_("RIS, TXT or PubMed NBIB file"))
+        button_zotero = msg_box.addButton(_("Zotero"), QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+        button_zotero.setToolTip(_("Local Zotero install (experimental)"))
+        msg_box.addButton(_("Cancel"), QtWidgets.QMessageBox.ButtonRole.RejectRole)
+        msg_box.setDefaultButton(button_file)
+        msg_box.exec()
+        clicked = msg_box.clickedButton()
+        if clicked == button_file:
+            self.import_from_file()
+        elif clicked == button_zotero:
+            self.import_from_zotero()
+
+    def _update_ai_vectorstore(self):
+        """
+        A single pass over the AI memory when the batch is done, instead of one per attachment.
+        update_vectorstore() reindexes everything missing in the project in one worker, so it
+        covers every imported attachment and queues one job instead of one per file.
+        """
+
+        if not self.attachments_imported:
+            return
+        if self.app.settings.get('ai_enable') != 'True':
+            return
+        try:
+            self.app.ai.sources_vectorstore.update_vectorstore()
+        except Exception as err:
+            logger.warning(f"Attachment vectorstore update failed: {err}")
+
+    def import_from_file(self):
+        """
+        Imports RIS references from a .ris, .txt or .nbib file.
+        """
+
+        self.pdf_import_code_highlights = None  # Asked once.
+        self.attachments_imported = 0
+        RisImport(self.app, self.parent_text_edit, self)  # self: For dialog and db.
+        self._update_ai_vectorstore()
         self.get_data()
+
+    def import_from_zotero(self):
+        """
+        Launches the experimental import from the local Zotero install (local API).
+        """
+
+        self.pdf_import_code_highlights = None  # Asked once.
+        self.attachments_imported = 0
+        from .manage_references_import_zotero import ZoteroImport
+        ZoteroImport(self.app, self.parent_text_edit, self).run()
+        self._update_ai_vectorstore()
+
+    def _reference_signature(self, tag_value_pairs):
+        """
+        Normalized signature of a reference; delegates to the shared import module.
+        """
+
+        return reference_signature(tag_value_pairs)
+
+    def _existing_reference_signatures(self):
+        """
+        Set of signatures of the references already in the project.
+        """
+
+        return existing_reference_signatures(self.app.conn)
+
+    def _clean_attachment_value(self, value):
+        """
+        Cleans the raw attachment value as written in the .ris. Exporters differ: quotes,
+        trailing spaces or carriage returns, ; separated description suffixes, file:// and
+        internal-pdf:// schemes, and percent escapes in paths. Without this the attachment was
+        dropped silently.
+        Args:
+            value: raw tag value, String
+        Returns:
+            String path (possibly relative), or "" when there is nothing usable
+        """
+
+        if not value:
+            return ""
+        raw = str(value).strip().strip('"').strip("'").strip()
+        # Description suffix written by some exporters: path;description:Full Text PDF
+        if ";" in raw:
+            head, _sep, tail = raw.partition(";")
+            if head.strip():
+                lower_tail = tail.lower()
+                if "description" in lower_tail or "://" not in tail:
+                    raw = head.strip()
+        # Schemes: file:// (local path) and internal-pdf:// (EndNote and friends)
+        if raw.lower().startswith("file:"):
+            from urllib.parse import urlparse, unquote
+            raw = unquote(urlparse(raw).path)
+            # On Windows file:///C:/x gives /C:/x, strip the leading slash
+            if os.name == "nt" and re.match(r"^/[A-Za-z]:", raw):
+                raw = raw[1:]
+        elif raw.lower().startswith("internal-pdf:"):
+            raw = re.sub(r"^internal-pdf:/*\d*/?", "", raw, flags=re.IGNORECASE)
+        if "%" in raw:  # URL escapes in plain paths.
+            from urllib.parse import unquote
+            unquoted = unquote(raw)
+            if unquoted != raw:
+                raw = unquoted
+        return raw.strip()
+
+    def _resolve_attachment_path(self, value, ris_dir=""):
+        """
+        Resolves an attachment path: file:// URL, absolute path, or relative tried against the
+        .ris folder (most common in Zotero exports, e.g. files/N/file.pdf) and the project
+        folder; as a last resort, the file name anywhere under the .ris folder. Returns the
+        path if it exists and is a supported type, else None.
+        """
+
+        raw = self._clean_attachment_value(value)
+        if not raw:
+            return None
+        norm = raw.replace("\\", "/")  # separadores normalizados para basename. Normalised separators.
+        basename = os.path.basename(norm)
+        candidates = [raw]  # tal cual: absoluta, o relativa al cwd. As-is: absolute, or cwd-relative.
+        if ris_dir:
+            candidates.append(os.path.join(ris_dir, raw))       # relativa al .ris. Relative to .ris.
+            candidates.append(os.path.join(ris_dir, norm))      # con separadores normalizados.
+            candidates.append(os.path.join(ris_dir, basename))  # At its root.
+        for base in (self.app.project_path, os.path.dirname(self.app.project_path)):
+            if base:
+                candidates.append(os.path.join(base, raw))
+        for c in candidates:
+            if c and c.lower().endswith(ATTACHMENT_EXTENSIONS) and os.path.isfile(c):
+                return c
+        # Last resort: look the name up anywhere under the .ris folder
+        if ris_dir and basename.lower().endswith(ATTACHMENT_EXTENSIONS):
+            for root, _dirs, files in os.walk(ris_dir):
+                for name in files:
+                    if name.lower() == basename.lower():
+                        return os.path.join(root, name)
+        logger.debug(f"Attachment not found on disk: {value!r} (cleaned: {raw!r})")
+        return None
+
+    def _import_attachment_file(self, file_path, progress=None, notify:bool=True):
+        """
+        Imports an attachment (PDF or EPUB) into the project: copy to documents/,
+        extract its text and create the source row with attribute placeholders. Returns the
+        file id (fid) or None. Mirrors manage_files.load_file_text (PyMuPDF with
+        join_lines=True for PDF, so coding positions map onto the PDF viewer, ebooklib for
+        EPUB). progress: optional QProgressDialog.
+        """
+
+        filename = os.path.basename(file_path)
+        ext = os.path.splitext(filename)[1].lower()
+        cur = self.app.conn.cursor()
+        # Name collision: different references may carry attachments with the same file name
+        # (e.g. shared libraries). Reuse if unlinked; if already linked to another reference,
+        # make the name unique, so we break neither source.name UNIQUE nor the existing link.
+        cur.execute("select id, risid from source where name=? collate nocase", [filename])
+        existing = cur.fetchone()
+        if existing is not None:
+            if existing[1] is None:  # reusarlo. Present and unlinked: reuse it.
+                return existing[0]
+            base_, keep_ext = os.path.splitext(filename)  # nombre en uso: hacerlo unico. Name taken: make unique.
+            n = 2
+            while True:
+                filename = f"{base_} ({n}){keep_ext}"
+                cur.execute("select 1 from source where name=? collate nocase", [filename])
+                if cur.fetchone() is None:
+                    break
+                n += 1
+        # Extract text per type.
+        text_ = ""
+        try:
+            if ext == ".pdf":
+                from .pdf_utils import extract_pdf_fulltext
+
+                def _pdf_progress(page_no, total_pages):  # avance por paginas. Per-page progress.
+                    if progress is not None:
+                        progress.setLabelText(f"{filename} p:{page_no}/{total_pages}")
+                        QtCore.QCoreApplication.processEvents()
+
+                # join_lines=True: Same extraction as manage_files, otherwise coding positions do
+                # not map onto the pages.
+                text_ = extract_pdf_fulltext(file_path, progress_callback=_pdf_progress, join_lines=True) or ""
+            elif ext == ".epub":
+                # Extraction shared with manage_files: same text through either route
+                text_ = extract_epub_fulltext(file_path)
+            else:
+                logger.warning(f"Unsupported attachment type, not imported: {file_path}")
+                return None
+        except Exception as err:
+            logger.warning(f"Attachment text extraction failed: {file_path} : {err}")
+            return None
+        try:
+            copyfile(file_path, self.app.project_path + f"/documents/{filename}")
+        except Exception as err:
+            logger.warning(f"Attachment copy failed: {file_path} : {err}")
+            return None
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        cur.execute("insert into source(name,fulltext,mediapath,memo,owner,date) values(?,?,?,?,?,?)",
+                    (filename, text_, "/docs/" + filename, "", self.app.settings['codername'], now))
+        self.app.conn.commit()
+        cur.execute("select last_insert_rowid()")
+        fid = cur.fetchone()[0]
+        # File attribute placeholders.
+        cur.execute('select name from attribute_type where caseOrFile ="file"')
+        for a in cur.fetchall():
+            cur.execute("insert into attribute (name, attr_type, value, id, date, owner) "
+                        "values(?,'file','',?,?,?)", [a[0], fid, now, self.app.settings['codername']])
+        self.app.conn.commit()
+        # The AI memory is not touched per file: import_document queues a worker that rebuilds the
+        # whole FAISS index, and a batch would queue one rebuild per attachment. Counted here only;
+        # _update_ai_vectorstore does the single pass when the batch ends.
+        self.attachments_imported += 1
+        if notify:
+            self._emit_project_table_changes(['source', 'attribute'])
+        self.parent_text_edit.append(filename + _(" imported"))
+        if ext == ".pdf":
+            self._import_pdf_annotations(fid, file_path, text_, progress)
+        return fid
+
+    def _import_pdf_annotations(self, fid, file_path, fulltext, progress=None):
+        """
+        Annotations and markups of an attached PDF, as in Manage files: text
+        annotations to the file memo; highlights and underlines coded under the
+        PDF Highlights / PDF Underlines categories if the user agrees (asked once
+        per session). Shared pdf_utils helpers: same result through either route.
+        """
+
+        from .pdf_utils import extract_pdf_highlights, pdf_annotations_to_file_memo, \
+            code_pdf_highlights, pdf_markups_question_text
+        pdf_annotations_to_file_memo(self.app, self.parent_text_edit, fid, file_path)
+        try:
+            highlights = extract_pdf_highlights(file_path)
+        except Exception as err:
+            logger.warning(f"Markup detection: {file_path} {err}")
+            return
+        if not highlights:
+            return
+        if self.pdf_import_code_highlights is None:
+            reply = QtWidgets.QMessageBox.question(
+                self, _("PDF highlights"), pdf_markups_question_text(highlights),
+                QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+                QtWidgets.QMessageBox.StandardButton.Yes)
+            self.pdf_import_code_highlights = reply == QtWidgets.QMessageBox.StandardButton.Yes
+        if self.pdf_import_code_highlights:
+            code_pdf_highlights(self.app, self.parent_text_edit, fid, file_path, fulltext,
+                                highlights, progress, self)
 
     def keyPressEvent(self, event):
         """ Used to activate buttons.
@@ -690,24 +968,25 @@ class DialogReferenceManager(QtWidgets.QDialog):
 
         if type(event) == QtGui.QKeyEvent:
             key = event.key()
-            # mod = event.modifiers()
-            if key == QtCore.Qt.Key.Key_L and (
+            mod = event.modifiers()
+            # Plain keys only: Ctrl+L / Ctrl+U must not link or unlink.
+            if key == QtCore.Qt.Key.Key_L and mod == QtCore.Qt.KeyboardModifier.NoModifier and (
                     self.ui.tableWidget_refs.hasFocus() or self.ui.tableWidget_files.hasFocus()):
                 self.link_reference_to_files()
                 return True
-            if key == QtCore.Qt.Key.Key_U and (
+            if key == QtCore.Qt.Key.Key_U and mod == QtCore.Qt.KeyboardModifier.NoModifier and (
                     self.ui.tableWidget_refs.hasFocus() or self.ui.tableWidget_files.hasFocus()):
                 self.unlink_files()
                 return True
         return False
 
-    def unlink_files(self, fid=None):
+    def unlink_files(self, fid:int|None=None, notify:bool=True):
         """ Remove linked reference from selected files.
         Called by:
             pushButton_unlink: Uses selected rows in files table. Does not use parameters.
             Method: edit_reference. Uses parameter.
-
-        :param: fid Integer source table id, or None
+        Args:
+            fid Integer source table id, or None
         """
 
         # Get selected file id from parameter or selected table_files rows
@@ -734,17 +1013,19 @@ class DialogReferenceManager(QtWidgets.QDialog):
             for attribute in attributes:
                 cur.execute(sql, [fid, attribute])
                 self.app.conn.commit()
+        if notify:
+            self._emit_project_table_changes(['source', 'attribute'])
         self.get_data()
 
-    def link_reference_to_files(self, ris_id=None, fid=None):
+    def link_reference_to_files(self, ris_id:int|None=None, fid:int|None=None, notify:bool=True):
         """ Link the selected files to the selected reference.
 
         Called by:
             pushButton_link: Uses selected rows in references and files tables. Does not use parameters.
             Method: auto_link_files_to_references. Uses parameters.
-
-        :param: ris_id Integer reference id , or None
-        :param: fid Integer source table id, or None
+        Args:
+            ris_id Integer reference id , or None
+            fid Integer source table id, or None
         """
 
         # Get reference id from first selected row, or via parameter ris_id
@@ -759,6 +1040,10 @@ class DialogReferenceManager(QtWidgets.QDialog):
             if r['risid'] == ris_id:
                 ref = r
                 break
+        if ref is None:
+            # risid without a loaded reference (desync): avoid TypeError below.
+            logger.warning(f"link_reference_to_files: risid {ris_id} not found in refs")
+            return
         # Get selected file id from parameter or selected table_files rows
         fid_list = []
         if fid:
@@ -808,6 +1093,8 @@ class DialogReferenceManager(QtWidgets.QDialog):
             for attribute in attr_values:
                 cur.execute(sql, [attr_values[attribute], fid, attribute])
                 self.app.conn.commit()
+        if notify:
+            self._emit_project_table_changes(['source', 'attribute'])
         self.get_data()
 
     def edit_reference(self):
@@ -822,6 +1109,8 @@ class DialogReferenceManager(QtWidgets.QDialog):
         for r in self.refs:
             if r['risid'] == ris_id:
                 ref_data = r
+        if ref_data is None:  # Same guard.
+            return
         short_dict = {}
         for k in ref_data:
             if len(k) == 2:
@@ -859,11 +1148,19 @@ class DialogReferenceManager(QtWidgets.QDialog):
                             [ui_re.tableWidget.item(row, 1).text(), ris_id, key])
                 self.app.conn.commit()
                 ref_edited = True
-        # Update Reference attributes
+        # Update Reference attributes. unlink_files and link_reference_to_files emit
+        # per call, so they are silenced here and one event covers the whole edit.
+        relinked = False
         for file_ in self.files:
             if file_['risid'] == ris_id:
-                self.unlink_files(file_['id'])
-                self.link_reference_to_files(ris_id, file_['id'])
+                self.unlink_files(file_['id'], notify=False)
+                self.link_reference_to_files(ris_id, file_['id'], notify=False)
+                relinked = True
+        if ref_edited or relinked:
+            tables = ['ris'] if ref_edited else []
+            if relinked:
+                tables += ['source', 'attribute']
+            self._emit_project_table_changes(tables)
         if ref_edited:
             self.parent_text_edit.append(_("Reference edited."))
         self.get_data()
@@ -900,6 +1197,7 @@ class DialogReferenceManager(QtWidgets.QDialog):
             for attribute in attributes:
                 cur.execute(sql, [source[0], attribute])
                 self.app.conn.commit()
+        self._emit_project_table_changes(['ris', 'source', 'attribute'])
         self.get_data()
         self.fill_table_refs()
         self.fill_table_files()

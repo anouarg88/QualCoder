@@ -14,9 +14,10 @@ See the GNU General Public License for more details.
 You should have received a copy of the GNU Lesser General Public License along with QualCoder.
 If not, see <https://www.gnu.org/licenses/>.
 
-Author: Colin Curtain (ccbogel)
+Authors: Colin Curtain C, Kai Dröge, Justin Missaghieh--Poncet, Lorenzo Salomón
 https://github.com/ccbogel/QualCoder
 https://qualcoder.wordpress.com/
+https://qualcoder-org.github.io
 https://qualcoder.org/
 
 
@@ -35,21 +36,20 @@ Import plain text codes - import from codebook file
 Markdown highlighter
 Number bar - display line numbers alongside text content
 Code resize handles for text coding
-
 """
 
 import csv
 import datetime
-import fitz
+import pymupdf
 from io import BytesIO
 import logging
-import os
+from pathlib import Path
 from PIL import Image, ImageOps, ImageFilter
 import platform
 from random import randint
 import sqlite3
 
-from PyQt6 import QtCore, QtGui, QtWidgets, sip  # <- L sip: detect deleted C++ objects in deferred callbacks
+from PyQt6 import QtCore, QtGui, QtWidgets, sip  # sip: detect deleted C++ objects in deferred callbacks
 
 from .color_selector import TextColor, colors
 from .GUI.ui_dialog_code_context_image import Ui_Dialog_code_context_image
@@ -57,13 +57,13 @@ from .GUI.ui_dialog_start_and_end_marks import Ui_Dialog_StartAndEndMarks
 
 # If VLC not installed, it will not crash
 vlc = None
+from .media_player_qt import MediaInstance as QtMediaInstance, make_vlc_instance
 try:
     import vlc
 except Exception as e:
     print(e)
 
 
-path = os.path.abspath(os.path.dirname(__file__))
 logger = logging.getLogger(__name__)
 
 
@@ -73,18 +73,18 @@ def get_default_user_directory():
     documents_dir = QtCore.QStandardPaths.writableLocation(
         QtCore.QStandardPaths.StandardLocation.DocumentsLocation
     )
-    if documents_dir and os.path.isdir(documents_dir):
+    if documents_dir and Path(documents_dir).is_dir():
         return documents_dir
 
     home_dir = QtCore.QDir.homePath()
-    if home_dir and os.path.isdir(home_dir):
+    if home_dir and Path(home_dir).is_dir():
         return home_dir
 
-    expanded_home = os.path.expanduser("~")
-    if expanded_home and os.path.isdir(expanded_home):
+    expanded_home = str(Path('~').expanduser())
+    if expanded_home and Path(expanded_home).is_dir():
         return expanded_home
 
-    return os.getcwd()
+    return Path.cwd()
 
 
 def msecs_to_mins_and_secs(msecs):
@@ -143,6 +143,29 @@ def file_typer(mediapath):
     if mediapath[-3:] in ('mkv', 'mov', 'mp4', 'm4v', 'wmv') or mediapath[-4:] == 'webm':
         return "video"
     return "text"
+
+
+def doc_end_position(text_edit):
+    """
+    End position of a text edit document, in Qt character units.
+    Qt counts UTF-16 units, so len(toPlainText()) is one short per non-BMP
+    character (emoji) and cursor positions drift left.
+    param:
+        text_edit: QTextEdit or QPlainTextEdit
+    """
+
+    return text_edit.document().characterCount() - 1
+
+
+def doc_position_from_index(plain_text, index):
+    """
+    Convert a Python string index into a Qt document position.
+    param:
+        plain_text: String the index refers to, from toPlainText()
+        index: Integer, Python index into plain_text
+    """
+
+    return index + sum(1 for char in plain_text[:index] if ord(char) > 0xFFFF)
 
 
 def init_persistent_tree_header(tree_widget, app, settings_key):
@@ -356,6 +379,49 @@ def restore_persistent_tree_widths(tree_widget, minimum_widths=None, default_wid
         tree_widget._qc_restoring_tree_widths = False
 
 
+def extract_epub_fulltext(filepath):
+    """
+    Fulltext of an EPUB, in reading (spine) order and without the navigation document.
+    Shared by manage_files and the reference attachment import, so an EPUB entered through
+    either route produces the same text.
+    Args:
+        filepath: path of the .epub file, String
+    Returns:
+        String fulltext
+    """
+
+    import ebooklib
+    from ebooklib import epub
+    from .html_parser import html_to_text
+
+    book = epub.read_epub(filepath)
+    documents = [d for d in book.get_items_of_type(ebooklib.ITEM_DOCUMENT)
+                 if not isinstance(d, epub.EpubNav)]
+    by_id = {}
+    for d in documents:
+        by_id[d.get_id()] = d
+    ordered = []
+    for entry in (book.spine or []):
+        idref = entry[0] if isinstance(entry, (tuple, list)) else entry
+        item = by_id.get(idref)
+        if item is not None and item not in ordered:
+            ordered.append(item)
+    for d in documents:  # anything outside the spine goes last
+        if d not in ordered:
+            ordered.append(d)
+    text_ = ""
+    for d in ordered:
+        try:
+            # Paragraph spacing for visual format, as in manage_files.
+            text_ += html_to_text(d.get_body_content().decode("utf-8")) + "\n\n"
+        except TypeError as err:
+            logger.debug(f"ebooklib get_body_content error: {err}")
+    text_ = text_.replace("\r\n", "\n").replace("\r", "\n")
+    if text_ and text_[0] == "\ufeff":
+        text_ = text_[1:]
+    return text_
+
+
 class Message(QtWidgets.QMessageBox):
     """ This is called a lot , but is styled to font size """
 
@@ -395,7 +461,7 @@ class ExportDirectoryPathDialog:
                 app.last_export_directory = directory
             self.filepath = directory + "/" + filename_only + "." + extension
             counter = 0
-            while os.path.exists(self.filepath):
+            while Path(self.filepath).exists():
                 self.filepath = directory + f"/{filename_only}_{counter}.{extension}"
                 counter += 1
         else:
@@ -482,6 +548,12 @@ class DialogCodeInText(QtWidgets.QDialog):
             tt = _("Resize coding\nAlt+Left Arrow, Alt+Right Arrow\nShift+LeftArrow, Shift+Right Arrow")
             self.te.setToolTip(tt)
 
+    def _emit_project_table_changes(self, tables):
+        """Notify other open dialogs about changed project tables."""
+
+        if getattr(self.app, "project_events", None) is not None:
+            self.app.project_events.emit_table_changes(tables, source=self)
+
     def draw_initial_coded_text(self):
         """ Can be called multiple times via keystrokes, so  initally set formatting to none. """
 
@@ -558,6 +630,13 @@ class DialogCodeInText(QtWidgets.QDialog):
                 return True
         return False
 
+    def emit_code_text_change(self):
+        """
+        Notify the event bus that this coding was resized.
+        """
+
+        self._emit_project_table_changes(['code_text'])
+
     def extend_left(self):
         """ Shift left arrow. """
 
@@ -571,6 +650,7 @@ class DialogCodeInText(QtWidgets.QDialog):
         sql = "update code_text set pos0=?, seltext=? where ctid=?"
         cur.execute(sql, (self.data['pos0'], seltext, self.data['ctid']))
         self.app.conn.commit()
+        self.emit_code_text_change()
         self.draw_initial_coded_text()
 
     def extend_right(self):
@@ -587,6 +667,7 @@ class DialogCodeInText(QtWidgets.QDialog):
         cur.execute(sql,
                     (self.data['pos1'], seltext, self.data['ctid']))
         self.app.conn.commit()
+        self.emit_code_text_change()
         self.draw_initial_coded_text()
 
     def shrink_to_left(self):
@@ -602,6 +683,7 @@ class DialogCodeInText(QtWidgets.QDialog):
         sql = "update code_text set pos1=?, seltext=? where ctid=?"
         cur.execute(sql, (self.data['pos1'], seltext, self.data['ctid']))
         self.app.conn.commit()
+        self.emit_code_text_change()
         self.draw_initial_coded_text()
 
     def shrink_to_right(self):
@@ -617,6 +699,7 @@ class DialogCodeInText(QtWidgets.QDialog):
         sql = "update code_text set pos0=?, seltext=? where ctid=?"
         cur.execute(sql, (self.data['pos0'], seltext, self.data['ctid']))
         self.app.conn.commit()
+        self.emit_code_text_change()
         self.draw_initial_coded_text()
 
 
@@ -649,11 +732,17 @@ class DialogCodeInAV(QtWidgets.QDialog):
         self.gridLayout = QtWidgets.QGridLayout(self)
         self.frame = QtWidgets.QFrame(self)
         self.gridLayout.addWidget(self.frame, 0, 0, 0, 0)
-        if not vlc:
-            return
-        # Create a vlc instance with an empty vlc media player
-        # https://stackoverflow.com/questions/55339786/how-to-turn-off-vlcpulse-audio-from-python-program
-        self.instance = vlc.Instance()
+        self.mediaplayer = None
+        try:
+            if self.app.settings.get('av_player', 'vlc') == 'qt' or vlc is None:
+                # python-vlc missing or Qt chosen: use the Qt Multimedia backend <- L
+                self.instance = QtMediaInstance()
+            else:
+                self.instance = make_vlc_instance(vlc)
+                if self.instance is None:
+                    raise NameError("libvlc not available")
+        except (NameError, AttributeError):
+            self.instance = QtMediaInstance()
         self.mediaplayer = self.instance.media_player_new()
         self.mediaplayer.video_set_mouse_input(False)
         self.mediaplayer.video_set_key_input(False)
@@ -680,7 +769,9 @@ class DialogCodeInAV(QtWidgets.QDialog):
         # video would be displayed in it's own window). This is platform
         # specific, so we must give the ID of the QFrame (or similar object) to
         # vlc. Different platforms have different functions for this
-        if platform.system() == "Linux":  # for Linux using the X Server
+        if hasattr(self.mediaplayer, 'set_video_host'):
+            self.mediaplayer.set_video_host(self.frame)  # Qt backend embeds itself <- L
+        elif platform.system() == "Linux":  # for Linux using the X Server
             # self.mediaplayer.set_xwindow(int(self.ui.frame.winId()))
             self.mediaplayer.set_xwindow(int(self.frame.winId()))
         elif platform.system() == "Windows":  # for Windows
@@ -689,7 +780,8 @@ class DialogCodeInAV(QtWidgets.QDialog):
             self.mediaplayer.set_nsobject(int(self.winId()))
 
         # The vlc MediaPlayer needs a float value between 0 and 1 for AV position,
-        pos = self.data['pos0'] / self.mediaplayer.get_media().get_duration()
+        duration = self.mediaplayer.get_media().get_duration()
+        pos = self.data['pos0'] / duration if duration > 0 else 0
         self.mediaplayer.play()  # Need to start play first
         self.mediaplayer.set_position(pos)
         self.timer = QtCore.QTimer(self)
@@ -699,6 +791,8 @@ class DialogCodeInAV(QtWidgets.QDialog):
     def update_ui(self):
         """ Checks for end of playing segment. """
 
+        if self.mediaplayer is None:
+            return
         msecs = self.mediaplayer.get_time()
         msg = msecs_to_mins_and_secs(msecs)
         try:
@@ -710,7 +804,11 @@ class DialogCodeInAV(QtWidgets.QDialog):
             self.mediaplayer.stop()
 
     def closeEvent(self, event):
-        self.mediaplayer.stop()
+        # Guard: a build without a media backend leaves mediaplayer unset <- L
+        if getattr(self, 'mediaplayer', None) is not None:
+            self.mediaplayer.stop()
+            if type(self.mediaplayer).__module__.endswith('media_player_qt'):
+                self.mediaplayer.release()  # free handle for later delete
 
 
 class DialogCodeInImage(QtWidgets.QDialog):
@@ -747,18 +845,29 @@ class DialogCodeInImage(QtWidgets.QDialog):
         if not self.data['mediapath'].lower().endswith(".pdf"):
             image = QtGui.QImage(abs_path)
         else:  # A pdf, must create the image
+            source_path = ""
             if self.data['mediapath'][:6] == "/docs/":
                 source_path = f"{self.app.project_path}/documents/{self.data['mediapath'][6:]}"
             if self.data['mediapath'][:5] == "docs:":
                 source_path = self.data['mediapath'][5:]
-            fitz_pdf = fitz.open(source_path)  # Use pymupdf to get page images
-            for page in fitz_pdf:
-                if page.number == self.data['pdf_page']:
-                    # Only need the current page image of interest
-                    pixmap = page.get_pixmap()
-                    pixmap.save(os.path.join(self.app.confighome, f"tmp_pdf_page.png"))
-            source_path = os.path.join(self.app.confighome, f"tmp_pdf_page.png")
-            image = QtGui.QImage(source_path)
+            # In-memory render of only the needed page, document always closed
+            # (the old tmp_pdf_page.png pattern leaked the handle and went stale).
+            image = QtGui.QImage()
+            try:
+                pymu_pdf = pymupdf.open(source_path)
+                try:
+                    # .get(): some callers build the dict by hand; a missing or NULL
+                    # pdf_page falls back to page 0 instead of raising KeyError.
+                    pdf_page_ = self.data.get('pdf_page') if self.data.get('pdf_page') is not None else 0
+                    if 0 <= pdf_page_ < len(pymu_pdf):
+                        page = pymu_pdf.load_page(pdf_page_)
+                        pix = page.get_pixmap(alpha=False, annots=False)  # PDF highlights/notes not painted
+                        image = QtGui.QImage(pix.samples, pix.width, pix.height, pix.stride,
+                                             QtGui.QImage.Format.Format_RGB888).copy()
+                finally:
+                    pymu_pdf.close()
+            except Exception as err:
+                logger.warning(f"Pdf page image: {source_path} {err}")
 
         if image.isNull():
             Message(self.app, _('Image error'), _("Cannot open: ") + abs_path, "warning").exec()
@@ -1018,7 +1127,6 @@ class ImportPlainTextCodes:
             return
         filepath = filepath[0]  # List to string of file path
         self.text_edit.append("\n" + _("Importing codes from: ") + filepath)
-        self.text_edit.append(_("Refresh codes trees via menu options for coding, reports"))
         with open(filepath, 'r', encoding='UTF-8-sig') as file_:
             rows = []
             if filepath[-4:].lower() == ".csv":
@@ -1031,6 +1139,7 @@ class ImportPlainTextCodes:
                     if row:
                         rows.append(row)
         cur = self.app.conn.cursor()
+        imported_tables = set()  # only tables that really got a row
         # Insert categories
         for row in rows:
             categories = row[0].split(">>")
@@ -1049,6 +1158,7 @@ class ImportPlainTextCodes:
                                 (category.strip(), "", self.app.settings['codername'],
                                  datetime.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S"), supercatid))
                     self.app.conn.commit()
+                    imported_tables.add('code_cat')
                     self.text_edit.append(_("Imported category: ") + category)
                 except sqlite3.IntegrityError:
                     pass
@@ -1076,9 +1186,19 @@ class ImportPlainTextCodes:
                 cur.execute("insert into code_name (name,memo,owner,date,catid,color) values(?,?,?,?,?,?)",
                             (code_name, memo, self.app.settings['codername'], date_, catid, color))
                 self.app.conn.commit()
+                imported_tables.add('code_name')
                 self.text_edit.append(_("Imported code: ") + code_name)
             except sqlite3.IntegrityError:
                 self.text_edit.append(_("Duplicate code not imported: ") + code_name)
+        # One event for the whole import, not one per row
+        if imported_tables:
+            self._emit_project_table_changes(sorted(imported_tables))
+    def _emit_project_table_changes(self, tables):
+        """Notify other open dialogs about changed project tables."""
+
+        if getattr(self.app, "project_events", None) is not None:
+            self.app.project_events.emit_table_changes(tables, source=self)
+
 
 
 class MarkdownHighlighter(QtGui.QSyntaxHighlighter):
@@ -1128,6 +1248,17 @@ class MarkdownHighlighter(QtGui.QSyntaxHighlighter):
         bold_format = QtGui.QTextCharFormat()
         bold_format.setFontWeight(QtGui.QFont.Weight.Bold)
         self.highlighting_rules += [(QtCore.QRegularExpression(r"\*\*.*\*\*"), bold_format)]
+        # URLs
+        ul_format = QtGui.QTextCharFormat()
+        ul_format.setUnderlineStyle(QtGui.QTextCharFormat.SingleUnderline)
+        brush = QtGui.QBrush(QtCore.Qt.GlobalColor.darkBlue, QtCore.Qt.BrushStyle.SolidPattern)
+        if self.app.settings['stylesheet'] in ('dark', 'rainbow'):  
+            brush = QtGui.QBrush(QtGui.QColor("#00BFFF"), QtCore.Qt.BrushStyle.SolidPattern)
+        ul_format.setForeground(brush)
+        # HTTP HTTPS protocol
+        self.highlighting_rules += [(QtCore.QRegularExpression(r"https?:\/\/(?:www\.)?[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,63}\b(?:[-a-zA-Z0-9()@:%_\+.~#?&\/=]*)"), ul_format)]
+        # Protocol optional
+        self.highlighting_rules += [(QtCore.QRegularExpression(r"www\.[a-zA-Z0-9()]{1,63}\b(?:[-a-zA-Z0-9()@:%_\+.~#?&\/=]*)"), ul_format)]
 
     def highlightBlock(self, text):
         for pattern, format_ in self.highlighting_rules:
@@ -1178,7 +1309,7 @@ class NumberBar(QtWidgets.QFrame):
         self.text_edit.installEventFilter(self.event_filter)
         self.text_edit.viewport().installEventFilter(self.event_filter)
         if self.is_plain_text:
-            self.text_edit.blockCountChanged.connect(self.adjustWidth)
+            self.text_edit.blockCountChanged.connect(self.adjust_width)
             self.text_edit.updateRequest.connect(self._on_update_request)
 
     def _on_update_request(self, rect, dy):
@@ -1187,11 +1318,11 @@ class NumberBar(QtWidgets.QFrame):
             self.scroll(0, dy)
         else:
             self.update(0, rect.y(), self.width(), rect.height())
-        self.adjustWidth()
+        self.adjust_width()
 
-    def adjustWidth(self):
+    def adjust_width(self):
         """ 
-        Adjust the with of the NumberBar according to the length of the highest number. 
+        Adjust the width of the NumberBar according to the length of the highest number.
         The minimum width is 3 digits.
         Will try to adjust the scrolling position accordingly so that the visible text is 
         not jumping too much.
@@ -1228,14 +1359,22 @@ class NumberBar(QtWidgets.QFrame):
     def showEvent(self, event):
         """Adjusts the width based on the current font size"""
         super().showEvent(event)
-        self.adjustWidth()
+        self.adjust_width()
+
+    def wheelEvent(self, event):
+        """Forward mouse-wheel scrolling to the associated text editor."""
+
+        QtWidgets.QApplication.sendEvent(self.text_edit.viewport(), event)
+        if event.isAccepted():
+            return
+        super().wheelEvent(event)
 
     def update(self, *args):
         """
         Updates the number bar to display the current set of numbers.
         Also, adjusts the width of the number bar if necessary.
         """
-        self.adjustWidth()
+        self.adjust_width()
         QtWidgets.QWidget.update(self, *args)
            
     def paintEvent(self, event):
@@ -1346,7 +1485,6 @@ class CodeResizeHandle(QtWidgets.QWidget):
         painter = QtGui.QPainter(self)
         painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
         w = self.width()
-        h = self.height()
         radius = w / 2.0
         path = QtGui.QPainterPath()
         if self.is_start:
@@ -1499,8 +1637,8 @@ class ToolTipEventFilter(QtCore.QObject):
                             text_ += "<br /><em>" + _("IMPORTANT") + "</em>"
                         text_ += "</p>"
                         multiple += 1
-                    except Exception as e:
-                        msg = "Codes ToolTipEventFilter Exception\n" + str(e) + ". Possible key error: \n"
+                    except Exception as err:
+                        msg = f"Codes ToolTipEventFilter Exception\n{err} Possible key error: \n"
                         msg += str(item)
                         logger.error(msg)
             if multiple > 1:

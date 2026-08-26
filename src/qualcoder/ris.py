@@ -14,21 +14,22 @@ See the GNU General Public License for more details.
 You should have received a copy of the GNU Lesser General Public License along with QualCoder.
 If not, see <https://www.gnu.org/licenses/>.
 
-Author: Colin Curtain (ccbogel)
+Authors: Colin Curtain C, Kai Dröge, Justin Missaghieh--Poncet, Lorenzo Salomón
 https://github.com/ccbogel/QualCoder
 https://qualcoder.wordpress.com/
+https://qualcoder-org.github.io
 https://qualcoder.org/
 """
 
-import collections
 import datetime
 import logging
-import os
-import re
+from pathlib import Path
 import rispy
 from PyQt6 import QtWidgets
 
-path = os.path.abspath(os.path.dirname(__file__))
+from .manage_references_import import ATTACHMENT_TAGS, existing_reference_signatures, \
+    import_progress_dialog, reference_signature
+
 logger = logging.getLogger(__name__)
 
 country_names = [
@@ -67,9 +68,10 @@ class Ris:
     def __init__(self, app):
         self.app = app
 
-    def get_references(self, selected_ris=None):
+    def get_references(self, selected_ris:int|None=None):
         """ As list of dictionaries with risid and summary.
-        ris: Integer risid
+        Args:
+            selected_ris: Integer risid
         """
 
         self.refs = []
@@ -81,7 +83,6 @@ class Ris:
         ris_ids_res = cur.fetchall()
         if not ris_ids_res:  # May be empty if selected_ris is incorrect or no references present
             return
-        # TODO missing title
         for ris_id in ris_ids_res:
             ref = {'risid': ris_id[0]}
             details = str(ris_id[0]) + " "
@@ -119,6 +120,12 @@ class Ris:
                     ref['issue'] = tpl[2]
             if volume and issue:
                 ref['journal_vol_issue'] += f"{volume} ({issue})"
+            # Without these defaults, a reference lacking title or type broke get_data, tooltips
+            # and the manager's sorts (KeyError on ref['TI'] / ref['TY']).
+            if 'TI' not in ref:
+                ref['TI'] = ""
+            if 'TY' not in ref:
+                ref['TY'] = ""
             if 'PY' not in ref:
                 ref['PY'] = ""
             if 'authors' not in ref:
@@ -128,15 +135,16 @@ class Ris:
             ref['vancouver'], ref['apa'] = self.format_vancouver_and_apa(ref)
             self.refs.append(ref)
 
-    def format_vancouver_and_apa(self, ref):
+    def format_vancouver_and_apa(self, ref:dict[str,str]):
         """ Format items in list for display as Vancouver style and APA style.
             Vancouver:
             Title.  authors (or editor)
             journal name, year, date, volume, issue, pages
             publisher (and place) issn, url
-
             APA:
             authors (year). title, journal volume issue (page numbers) URL
+        Args:
+            ref : Dictionary
          """
 
         title = ""
@@ -153,8 +161,6 @@ class Ris:
         issn = None
         url = None
         doi = None
-        vancouver = ""  # Vancouver reference style, approximately
-        apa = ""  # American Psychological Association reference style v 7
 
         # Get the first title based on this order
         for tag in ("TI", "T1", "ST", "TT"):
@@ -254,7 +260,7 @@ class Ris:
         vancouver = vancouver.replace("  ", " ")
         vancouver = vancouver.strip()
 
-        # Wrap up APA style
+        # Wrap up APA style, American Psychological Association reference style v 7
         # authors(year).title, journal volume issue(page numbers) URL
         apa = authors.replace(";", ",")
         if editor:
@@ -281,7 +287,7 @@ class Ris:
         apa = apa.strip()
         return vancouver, apa
 
-    def apa_title(self, title):
+    def apa_title(self, title:str) -> str:
         """ APA 7 Sentence case. And after . : -
          Keep names Titled - not easy to do, but have added country names. """
 
@@ -318,24 +324,34 @@ class RisImport:
     Ref_journal
     """
 
-    app = None
-    parent_text_edit = None
+    def __init__(self, app, parent_text_edit, refs_dialog=None):
+        """ Args:
+            refs_dialog: DialogReferenceManager, used for the preview dialog, duplicate detection
+                and attachment import. Without it, everything is imported without asking.
+        """
 
-    def __init__(self, app, parent_text_edit):
         self.app = app
         self.parent_text_edit = parent_text_edit
+        self.refs_dialog = refs_dialog
+        self.imported_filepath = ""
         response = QtWidgets.QFileDialog.getOpenFileNames(None, _('Select RIS or NBIB references file'),
                                                           self.app.settings['directory'],
-                                                          "(*.ris *.RIS *.nbib *.txt)",
-                                                          options=QtWidgets.QFileDialog.Option.DontUseNativeDialog)
+                                                          "(*.ris *.RIS *.nbib *.txt)")  # native OS dialog
         imports = response[0]
         if imports:
             file_path = imports[0]
+            self.imported_filepath = file_path  # Original path.
             if file_path.endswith(".nbib"):
                 file_path = self.nbib_to_ris(file_path)
             self.create_file_attributes()
             self.create_file_placeholder_attributes()
             self.import_ris_file(file_path)
+
+    def _emit_project_table_changes(self, tables):
+        """Notify other open dialogs about changed project tables."""
+
+        if getattr(self.app, "project_events", None) is not None:
+            self.app.project_events.emit_table_changes(tables, source=self)
 
     def create_file_attributes(self):
         """ Creates the attributes for Ref_Authors, Ref_Title, Ref_Type, Ref_Year, Ref_Journal """
@@ -344,6 +360,7 @@ class RisImport:
         cur = self.app.conn.cursor()
         ref_vars = {'Ref_Authors': 'character', 'Ref_Title': 'character', 'Ref_Type': 'character',
                     'Ref_Year': 'numeric', 'Ref_Journal': 'character'}
+        created = False
         for key in ref_vars:
             cur.execute("select name from attribute_type where name=?", [key])
             res = cur.fetchone()
@@ -351,7 +368,10 @@ class RisImport:
                 cur.execute("insert into attribute_type (name,date,owner,memo,caseOrFile, valuetype) values(?,?,?,?,?,?)",
                         (key, now_date, self.app.settings['codername'], "", 'file', ref_vars[key]))
                 self.app.conn.commit()
+                created = True
         self.app.delete_backup = False
+        if created:
+            self._emit_project_table_changes(['attribute_type'])
 
     def create_file_placeholder_attributes(self):
         """ Creates empty placeholder attributes for each file.
@@ -366,6 +386,7 @@ class RisImport:
         attr_types = cur.fetchall()
         attr_types = ["Ref_Authors", "Ref_Title", "Ref_Type", "Ref_Year", "Ref_Journal"]
         insert_sql = "insert into attribute (name, attr_type, value, id, date, owner) values(?,'file','',?,?,?)"
+        created = False
         for source in sources:
             for att in attr_types:
                 sql = "select value from attribute where id=? and name=?"
@@ -376,99 +397,245 @@ class RisImport:
                                     self.app.settings['codername']]
                     cur.execute(insert_sql, placeholders)
                     self.app.conn.commit()
+                    created = True
+        if created:
+            self._emit_project_table_changes(['attribute'])
 
     def import_ris_file(self, filepath):
-        """ Open file and extract RIS information.
-        List tags: 'A1', 'A2', 'A3', 'A4', 'AU', 'KW', 'N1'  # authors, KW keywords, N1 Notes
-        longtag is the extended wording of a tag
-        tag_keys is the dictionary of 2 char short tag keys (e.g. AU) and the longtag wording
+        """
+        Reads the .ris/.nbib file, builds the candidate reference list
+        (with reference and attachment duplicate status) and opens the preview dialog to choose
+        which to import. Inserts only the chosen ones and links all their PDF/EPUB attachments
+        (if requested). A reference may have several attachments (e.g. PDF and EPUB, or two L1
+        lines); all of them are imported. List tags: 'A1', 'A2', 'A3', 'A4', 'AU', 'KW', 'N1' #
+        authors, KW keywords, N1 Notes longtag is the extended wording of a tag tag_keys is the
+        dictionary of 2 char short tag keys (e.g. AU) and the longtag wording
         """
 
-        # list_tags = rispy.LIST_TYPE_TAGS
-        # print("List tags ", list_tags)
+        # List tags: rispy defaults plus the link tags (attachments), so multiple
+        # attachments per reference are captured as a list instead of rispy keeping only the first
+        # one.
+        default_list_tags = getattr(rispy.RisParser, "DEFAULT_LIST_TAGS",
+                                    ['A1', 'A2', 'A3', 'A4', 'AU', 'KW', 'N1', 'UR'])
+        list_tags = list(default_list_tags) + list(ATTACHMENT_TAGS)
         tag_keys = rispy.TAG_KEY_MAPPING
-        # for tk in tag_keys:
-        #    print(tk, tag_keys[tk])
         longtag_to_tag = dict((v, k) for k, v in tag_keys.items())
         cur = self.app.conn.cursor()
         cur.execute("select max(risid) from ris")
         res = cur.fetchone()
-        new_entries = 0
-        duplicates = 0
         max_risid = 0
-        if res is not None:
+        if res is not None and res[0] is not None:
             max_risid = res[0]
-            if max_risid is None:
-                max_risid = 0
         with open(filepath, 'r', encoding="utf-8", errors="surrogateescape") as ris_file:
-            entries = rispy.load(ris_file)
+            entries = rispy.load(ris_file, list_tags=list_tags)
+
+        # .ris folder, to resolve relative attachment paths.
+        ris_dir = str(Path(self.imported_filepath).parent) if self.imported_filepath \
+            else str(Path(filepath).parent)
+        existing_sigs = self.project_signatures()
+        cur.execute("select lower(name) from source")
+        existing_names = set(r[0] for r in cur.fetchall() if r[0] is not None)
+        seen_sigs = set()
+        seen_attach = set()
+        rows = []
+        candidates = []  # paralelo a rows: Parallel: (triples, [paths]).
+        any_attachment = False
+        unresolved = 0  # Cited but missing.
+
         for entry in entries:
             try:
                 del entry['id']
             except KeyError:
                 pass
-            if self.entry_exists(entry):
-                duplicates += 1
-            else:
-                new_entries += 1
-                max_risid += 1
-                # print(entry.keys())
-                for longtag in entry:
-                    if isinstance(entry[longtag], list):
-                        data = "; ".join(entry[longtag])
+            triples = []  # For the ris table.
+            attach_values = []  # Individual attachment values.
+            for longtag in entry:
+                raw = entry[longtag]
+                tag = longtag_to_tag.get(longtag)
+                if not tag:
+                    continue  # Unknown tag: skip the field.
+                # Collect each attachment separately (do not join). Detection is by link TAG, not
+                # by long name: Zotero writes PDFs in L1 and EPUBs in L4, whose long name is
+                # 'figure'. No extension filter here either: the raw value may carry spaces,
+                # description suffixes or URL escapes.
+                if tag in ATTACHMENT_TAGS:
+                    for v in (raw if isinstance(raw, list) else [raw]):
+                        if isinstance(v, str) and v.strip():
+                            attach_values.append(v)
+                # Join lists for the ris table.
+                value = "; ".join(str(x) for x in raw) if isinstance(raw, list) else raw
+                if not isinstance(value, str):
+                    continue
+                triples.append((tag, longtag, value))
+            if not triples:
+                continue
+            sig = reference_signature([(t, v) for t, _lt, v in triples])
+            ref_dup = bool(sig) and (sig in existing_sigs or sig in seen_sigs)
+            if sig:
+                seen_sigs.add(sig)
+            if not self.refs_dialog and ref_dup:
+                continue  # No dialog: skip.
+            # Resolve all attachments of the reference (PDF and EPUB), without repeating paths.
+            attach_paths = []
+            if self.refs_dialog:
+                for v in attach_values:
+                    p = self.refs_dialog._resolve_attachment_path(v, ris_dir)
+                    if p and p not in attach_paths:
+                        attach_paths.append(p)
+                    elif p is None:
+                        unresolved += 1
+            attach_label = ""
+            attach_dup = False
+            if attach_paths:
+                any_attachment = True
+                names = [Path(p.replace("\\", "/")).name for p in attach_paths]
+                # Label: first name, plus "(+N)" if more
+                attach_label = names[0] if len(names) == 1 else f"{names[0]} (+{len(names) - 1})"
+                for nm in names:
+                    low = nm.lower()
+                    if low in existing_names or low in seen_attach:
+                        attach_dup = True
                     else:
-                        data = entry[longtag]
-                    if not isinstance(data, str):
-                        continue
-                    # print("risid", max_risid, longtag_to_tag[longtag], longtag, data)
-                    sql = "insert into ris (risid,tag,longtag,value) values (?,?,?,?)"
-                    cur.execute(sql, [max_risid, longtag_to_tag[longtag], longtag, data])
-            self.app.conn.commit()
+                        seen_attach.add(low)
+            rows.append({"label": self._entry_label(triples), "ref_duplicate": ref_dup,
+                         "attachment": attach_label, "attachment_duplicate": attach_dup})
+            candidates.append((triples, attach_paths))
 
+        if not rows:
+            self.parent_text_edit.append(_("No references found in: ") + filepath + "\n========")
+            return
+
+        # Preview dialog with checkboxes.
+        from .manage_references_import import DialogImportReferences
+        dialog = DialogImportReferences(self.app, self.refs_dialog, rows,
+                                        allow_attachments=any_attachment, attachments_default=any_attachment)
+        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            dialog.deleteLater()
+            return
+        selected = sorted(dialog.selected_indices())
+        want_attachments = dialog.import_attachments()
+        dialog.deleteLater()  # One per import, not kept.
+        if not selected:
+            return
+        chosen = [candidates[i] for i in selected]
+
+        # Insert the chosen references, one commit.
+        new_entries = 0
+        pairs = []  # (risid, [attachment paths]).
+        for triples, attach_paths in chosen:
+            max_risid += 1
+            for tag, longtag, value in triples:
+                cur.execute("insert into ris (risid,tag,longtag,value) values (?,?,?,?)",
+                            [max_risid, tag, longtag, value])
+            pairs.append((max_risid, attach_paths))
+            new_entries += 1
+        self.app.conn.commit()
         if new_entries > 0:
-            msg = _("Bibliography loaded from: ") + filepath + "\n"
-            msg += _("New Entries: ") + str(new_entries) + "\n"
-            if duplicates > 0:
-                msg += _("Duplicates not inserted: ") + str(duplicates)
-            self.parent_text_edit.append(msg + "\n========")
-        else:
-            msg = _("No new references loaded from: ") + filepath + "\n"
-            if duplicates > 0:
-                msg += _("References already exist")
-            self.parent_text_edit.append(msg + "\n========")
+            self._emit_project_table_changes(['ris'])
+        if self.refs_dialog:
+            self.refs_dialog.get_data()
 
-    def entry_exists(self, entry):
-        """ Check if this entry exists.
-        Criteria for exists: each entry matches for tag and value. Identical number of data points.
-        param: entry - dictionary of longtag and value
-        return: exists - boolean
+        # Link all attachments of each chosen reference if requested; repeated names become
+        # numbered copies.
+        linked = 0
+        failed = 0  # Attachments that could not be read.
+        if want_attachments and self.refs_dialog:
+            to_link = [(risid, paths) for risid, paths in pairs if paths]
+            total = sum(len(paths) for _risid, paths in to_link)
+            if total:
+                first_name = Path(to_link[0][1][0].replace("\\", "/")).name
+                progress = import_progress_dialog(self.refs_dialog, total, first_name)
+                done = 0
+                try:
+                    for risid, paths in to_link:
+                        for path_ in paths:
+                            QtWidgets.QApplication.processEvents()
+                            done += 1
+                            progress.setValue(done)
+                            progress.setLabelText(Path(path_.replace("\\", "/")).name)
+                            fid = self.refs_dialog._import_attachment_file(path_, progress,
+                                                                           notify=False)
+                            if fid is None:
+                                failed += 1
+                                continue
+                            # Silenced per attachment: one event after the batch
+                            self.refs_dialog.link_reference_to_files(risid, fid, notify=False)
+                            linked += 1
+                finally:
+                    # No autoClose: close it, in a finally so a failure midway does not leave the
+                    # bar stuck on screen.
+                    progress.close()
+                    progress.deleteLater()
+            if linked > 0 and getattr(self.app, "project_events", None) is not None:
+                # One event for the whole attachment batch, not one per file
+                self.app.project_events.emit_table_changes(['source', 'attribute'], source=None)
+            self.refs_dialog.get_data()
+
+        msg = _("Bibliography loaded from: ") + filepath + "\n"
+        msg += _("References imported: ") + str(new_entries)
+        if want_attachments:
+            msg += "\n" + _("Attachments linked: ") + str(linked)
+            # What did not make it is reported, instead of vanishing without a trace.
+            if failed:
+                msg += "\n" + _("Attachments not imported: ") + str(failed)
+        if unresolved:
+            msg += "\n" + _("Attachment files not found: ") + str(unresolved)
+        self.parent_text_edit.append(msg + "\n========")
+
+    def project_signatures(self):
+        """
+        Signatures already in the project.
         """
 
-        exists = False
-        #print(entry)
-        res_list = []
-        cur = self.app.conn.cursor()
-        sql = "select risid from ris where longtag=? and value=?"
-        for longtag in entry:
-            if isinstance(entry[longtag], list):
-                data = "; ".join(entry[longtag])
-            else:
-                data = entry[longtag]
-            if not isinstance(data, str):
+        if self.refs_dialog:
+            return self.refs_dialog._existing_reference_signatures()
+        return existing_reference_signatures(self.app.conn)
+
+    def entry_exists(self, entry):
+        """
+        Check if this entry already exists in the project. Signature based detection
+        (title|year|authors), tolerant to accents, punctuation, case, and to the imported
+        reference carrying more or fewer fields than the stored one. The previous version
+        required ALL fields to match and ran one query per field, so a single differing datum
+        (or an added DOI) made it look new. A reference without a title has no signature and
+        counts as new.
+        Args:
+            entry: dictionary of longtag and value, as returned by rispy
+        Returns:
+            Boolean
+        """
+
+        longtag_to_tag = dict((v, k) for k, v in rispy.TAG_KEY_MAPPING.items())
+        pairs = []
+        for longtag, raw in entry.items():
+            tag = longtag_to_tag.get(longtag)
+            if not tag:
                 continue
-            cur.execute(sql, [longtag, data])
-            res = cur.fetchall()
-            #print("res for",longtag,data,res)
-            for r in res:
-                res_list.append(r[0])
-        #print("len entry ", len(entry), "res_list", res_list)
-        # Check number of db matching data points equals the number of data points in entry
-        frequencies = collections.Counter(res_list)
-        freq_dict = dict(frequencies)
-        for k in freq_dict:
-            if freq_dict[k] == len(entry):
-                exists = True
-        return exists
+            value = "; ".join(str(x) for x in raw) if isinstance(raw, list) else raw
+            if isinstance(value, str):
+                pairs.append((tag, value))
+        sig = reference_signature(pairs)
+        if not sig:
+            return False
+        return sig in self.project_signatures()
+
+    def _entry_label(self, triples):
+        """
+        Readable label of a reference (author - title (year)) for the selection dialog.
+        """
+
+        tagvals = {}
+        for tag, _longtag, value in triples:
+            tagvals.setdefault(tag, value)
+        title = tagvals.get('TI') or tagvals.get('T1') or _("(untitled)")
+        authors = tagvals.get('AU') or tagvals.get('A1') or ""
+        year = tagvals.get('PY') or tagvals.get('Y1') or ""
+        label = title
+        if authors:
+            label = authors.split(';')[0].strip() + " - " + label
+        if year:
+            label += f" ({year})"
+        return label
 
     def nbib_to_ris(self, nbib_filepath):
         """ Create a temporary ris file from the PubMed nbib file.
@@ -501,7 +668,7 @@ class RisImport:
         # Add final record tag
         ris_data += "\nER  -\n\n"
 
-        ris_file_path = os.path.join(self.app.confighome, "temp_nbib_to_ris.ris")
+        ris_file_path = Path(self.app.confighome) / "temp_nbib_to_ris.ris"
         with open(ris_file_path, "w", encoding="utf-8") as ris_data_file:
             ris_data_file.write(ris_data)
         return ris_file_path

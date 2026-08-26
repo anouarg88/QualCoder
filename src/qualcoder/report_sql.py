@@ -14,9 +14,10 @@ See the GNU General Public License for more details.
 You should have received a copy of the GNU Lesser General Public License along with QualCoder.
 If not, see <https://www.gnu.org/licenses/>.
 
-Author: Colin Curtain (ccbogel)
+Authors: Colin Curtain C, Kai Dröge, Justin Missaghieh--Poncet, Lorenzo Salomón
 https://github.com/ccbogel/QualCoder
 https://qualcoder.wordpress.com/
+https://qualcoder-org.github.io
 https://qualcoder.org/
 """
 
@@ -28,8 +29,8 @@ import csv
 from datetime import datetime
 import logging
 import openpyxl
-import os
-import qtawesome as qta
+import re
+import qtawesome as qta  # https://pictogrammers.com/library/mdi/
 import sqlite3
 
 from .GUI.ui_dialog_SQL import Ui_Dialog_sql
@@ -37,7 +38,6 @@ from .save_sql_query import DialogSaveSql
 from .helpers import ExportDirectoryPathDialog, Message
 from .highlighter import Highlighter
 
-path = os.path.abspath(os.path.dirname(__file__))
 logger = logging.getLogger(__name__)
 
 
@@ -48,27 +48,21 @@ class DialogSQL(QtWidgets.QDialog):
     Data outputs are as tab (or other) separated files.
     DEFAULT_SQL is listed at end of module for additional complex queries. """
 
-    app = None
-    schema = None
-    parent_textEdit = None
-    sql = ""
-    stored_sqls = []  # a list of dictionaries of user created sql, as {index, sql}
-    default_sqls = []  # a list of dictionaries of default sql, as {index, sql}
-    file_data = []  # for file exports
-    results = None  # SQL results
-    queryTime = ""  # for label tooltip
-    queryFilters = ""  # for label tooltip
-    cell_value = ""
-    row = -1
-    col = -1
-
     def __init__(self, app_, parent_textedit):
 
         QtWidgets.QDialog.__init__(self)
         self.app = app_
         self.parent_textEdit = parent_textedit
-        self.queryTime = ""
-        self.queryFilters = ""
+        self.queryTime = ""  # for label tooltip
+        self.queryFilters = ""  # for label tooltip
+        self.row = -1
+        self.col = -1
+        self.sql = ""
+        self.stored_sqls = []  # a list of dictionaries of user created sql, as {index, sql}
+        self.default_sqls = []  # a list of dictionaries of default sql, as {index, sql}
+        self.file_data = []  # for file exports
+        self.results = None  # SQL results
+        self.cell_value = ""
 
         # Set up the user interface from Designer.
         self.ui = Ui_Dialog_sql()
@@ -91,6 +85,7 @@ class DialogSQL(QtWidgets.QDialog):
         self.ui.tableWidget_results.setTabKeyNavigation(False)
 
         # Add tables and fields to treeWidget
+        self.schema = None
         self.get_schema_update_tree_widget()
         self.ui.treeWidget.itemClicked.connect(self.get_item)
         self.ui.treeWidget.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -121,6 +116,30 @@ class DialogSQL(QtWidgets.QDialog):
             pass
         self.ui.splitter.splitterMoved.connect(self.update_sizes)
         self.ui.splitter_2.splitterMoved.connect(self.update_sizes)
+
+    # Tables a free-form query may write. Used when the target cannot be parsed out.
+    PROJECT_TABLES = ['source', 'code_name', 'code_cat', 'code_text', 'code_image', 'code_av',
+                      'cases', 'case_text', 'attribute', 'attribute_type', 'journal', 'annotation']
+
+    @staticmethod
+    def _tables_written_by(sql):
+        """Name the table a user DELETE or UPDATE targets, for the project change event.
+
+        Falls back to every project table when the target cannot be identified, so a
+        hand-written query never leaves open dialogs showing stale data.
+        """
+
+        match = re.search(r"(?:delete\s+from|update)\s+[\"\'`\[]?([a-zA-Z_][a-zA-Z0-9_]*)",
+                          sql, re.IGNORECASE)
+        if match and match.group(1).lower() in DialogSQL.PROJECT_TABLES:
+            return [match.group(1).lower()]
+        return list(DialogSQL.PROJECT_TABLES)
+
+    def _emit_project_table_changes(self, tables):
+        """Notify other open dialogs about changed project tables."""
+
+        if getattr(self.app, "project_events", None) is not None:
+            self.app.project_events.emit_table_changes(tables, source=self)
 
     def update_sizes(self):
         """ Called by splitter resized """
@@ -290,10 +309,12 @@ class DialogSQL(QtWidgets.QDialog):
                 self.ui.label.setText(str(cur.rowcount) + _(" rows deleted"))
                 self.app.delete_backup = False
                 self.app.conn.commit()
+                self._emit_project_table_changes(self._tables_written_by(self.sql))
             if self.sql[0:6].upper() == "UPDATE":
                 self.ui.label.setText(str(cur.rowcount) + _(" rows updated"))
                 self.app.delete_backup = False
                 self.app.conn.commit()
+                self._emit_project_table_changes(self._tables_written_by(self.sql))
             if selected_text != "":
                 text = self.ui.label.text() + "  " + _("Using selected text")
                 self.ui.label.setText(text)
@@ -408,6 +429,7 @@ class DialogSQL(QtWidgets.QDialog):
                 delete_sql = menu.addAction(_("Delete stored sql"))
         action = menu.exec(self.ui.treeWidget.mapToGlobal(position))
         if action is not None and action == delete_sql:
+            deleted = False
             for i in range(len(self.stored_sqls)):
                 if self.stored_sqls[i]['index'] == index:
                     title = self.ui.treeWidget.currentItem().text(0)
@@ -415,7 +437,10 @@ class DialogSQL(QtWidgets.QDialog):
                     cur.execute("delete from stored_sql where title=?", [title])
                     self.app.conn.commit()
                     del self.stored_sqls[i]
+                    deleted = True
                     break
+            if deleted:
+                self._emit_project_table_changes(['stored_sql'])
             self.get_schema_update_tree_widget()
 
     def keyPressEvent(self, event):
@@ -511,6 +536,7 @@ class DialogSQL(QtWidgets.QDialog):
         try:
             cur.execute(sql, [title, description, grouper, ssql])
             self.app.conn.commit()
+            self._emit_project_table_changes(['stored_sql'])
         except Exception as e:
             Message(self.app, _("Cannot save"), str(e)).exec()
         self.get_schema_update_tree_widget()
