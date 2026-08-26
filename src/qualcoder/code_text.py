@@ -462,7 +462,10 @@ class DialogCodeText(QtWidgets.QWidget):
         self._sync_coding_margin_background()
 
         # apply initial visibility based on persisted preference <- L
-        self.coding_margin.setVisible(self.show_margin_stripes)
+        if getattr(self, '_margin_stack', None) is not None:
+            self._margin_stack.setVisible(self.show_margin_stripes)
+        else:
+            self.coding_margin.setVisible(self.show_margin_stripes)
         self._set_margin_container_visibility(self.show_margin_stripes)
         QtCore.QTimer.singleShot(0, self._apply_coding_margin_width)
         QtCore.QTimer.singleShot(60, self._apply_coding_margin_width)
@@ -659,26 +662,47 @@ class DialogCodeText(QtWidgets.QWidget):
         return text_
 
     # Helpers to relocate the coding margin between left/right <- L
+    def _iter_margins(self):
+        """Yield every CodingMargin instance (plain-text and formatted)."""
+        yield self.coding_margin
+        if getattr(self, '_formatted_coding_margin', None) is not None:
+            yield self._formatted_coding_margin
+
+    def _refresh_coding_margins(self):
+        """Repaint all CodingMargin instances (plain-text and formatted)."""
+        for _m in self._iter_margins():
+            if _m is not None:
+                _m.update()
+
     def _install_coding_margin_in_side(self, side):
-        """ Move the CodingMargin widget into the left or right container. """
+        """ Move the CodingMargin widget into the left or right container.
+
+        Once the formatted tab exists, the margins live inside a shared
+        QStackedWidget (``self._margin_stack``) so both editors can show the
+        code-stripes margin; the stack itself is what gets relocated. """
 
         if side not in ('left', 'right'):
             side = 'left'
 
+        target = getattr(self, '_margin_stack', None)
+        if target is None:
+            target = self.coding_margin
+
         for lay in (self._coding_margin_layout_left, self._coding_margin_layout_right):
             if lay is None:
                 continue
-            idx = lay.indexOf(self.coding_margin)
+            idx = lay.indexOf(target)
             if idx >= 0:
                 lay.takeAt(idx)
 
         if side == 'right':
-            self._coding_margin_layout_right.addWidget(self.coding_margin)
+            self._coding_margin_layout_right.addWidget(target)
         else:
-            self._coding_margin_layout_left.addWidget(self.coding_margin)
+            self._coding_margin_layout_left.addWidget(target)
 
         self.margin_side = side
-        self.coding_margin.side = side
+        for _m in self._iter_margins():
+            _m.side = side
 
     def _sync_coding_margin_background(self):
         """Keep the coding margin area aligned with the text editor background."""
@@ -688,13 +712,26 @@ class DialogCodeText(QtWidgets.QWidget):
         background_hex = background_color.name()
         for widget in (
                 self.ui.widget_code_margin_left,
-                self.ui.widget_code_margin_right,
-                self.coding_margin):
+                self.ui.widget_code_margin_right):
             palette = widget.palette()
             palette.setColor(QtGui.QPalette.ColorRole.Window, background_color)
             palette.setColor(QtGui.QPalette.ColorRole.Base, background_color)
             widget.setPalette(palette)
             widget.setAutoFillBackground(True)
+        for _m in self._iter_margins():
+            if _m is None:
+                continue
+            _m_palette = _m.palette()
+            _m_palette.setColor(QtGui.QPalette.ColorRole.Window, background_color)
+            _m_palette.setColor(QtGui.QPalette.ColorRole.Base, background_color)
+            _m.setPalette(_m_palette)
+            _m.setAutoFillBackground(True)
+        if getattr(self, '_margin_stack', None) is not None:
+            _stack_palette = self._margin_stack.palette()
+            _stack_palette.setColor(QtGui.QPalette.ColorRole.Window, background_color)
+            _stack_palette.setColor(QtGui.QPalette.ColorRole.Base, background_color)
+            self._margin_stack.setPalette(_stack_palette)
+            self._margin_stack.setAutoFillBackground(True)
         self._text_margins_splitter.setStyleSheet(
             "QSplitter::handle {"
             f" background-color: {background_hex};"
@@ -703,7 +740,14 @@ class DialogCodeText(QtWidgets.QWidget):
             " padding: 0px;"
             "}"
         )
-        self.coding_margin.update()
+        # Also paint the margin containers' full area (including the band above
+        # the content offset) with the editor background so no grey theme strip
+        # shows next to the tab bar.
+        for _mc in (self.ui.widget_code_margin_left, self.ui.widget_code_margin_right):
+            _mc.setStyleSheet(
+                f"QWidget {{ background-color: {background_hex}; border: 0px; }}"
+            )
+        self._refresh_coding_margins()
 
     def _get_saved_coding_margin_width(self) -> int:
         """Return the stored coding margin width, or the default width."""
@@ -1093,14 +1137,15 @@ class DialogCodeText(QtWidgets.QWidget):
         except (TypeError, AttributeError):
             pass
 
-        if hasattr(self, 'coding_margin') and self.coding_margin is not None:
+        if getattr(self, '_margin_stack', None) is not None:
+            self._margin_stack.setVisible(self.show_margin_stripes)
+        elif hasattr(self, 'coding_margin') and self.coding_margin is not None:
             self.coding_margin.setVisible(self.show_margin_stripes)
         self._set_margin_container_visibility(self.show_margin_stripes)
         if self.show_margin_stripes:
             self._apply_coding_margin_width()
 
-        if hasattr(self, 'coding_margin') and self.coding_margin is not None:
-            self.coding_margin.update()
+        self._refresh_coding_margins()
 
     def _set_margin_side(self, side):  # <- L
         """ Move the coding margin to the requested side and persist. """
@@ -1120,8 +1165,7 @@ class DialogCodeText(QtWidgets.QWidget):
         if self.show_margin_stripes:
             self._apply_coding_margin_width()
 
-        if hasattr(self, 'coding_margin') and self.coding_margin is not None:
-            self.coding_margin.update()
+        self._refresh_coding_margins()
 
     def _set_highlight_style(self, style):  # <- L
         """ Switch in-text highlight style between 'marker' and 'underline'. """
@@ -2461,12 +2505,50 @@ class DialogCodeText(QtWidgets.QWidget):
         self._text_margins_splitter.setStretchFactor(
             self._text_margins_splitter.indexOf(self._text_tabs), 1)
 
+        # Coding margin for the formatted editor. Both margins (plain-text and
+        # formatted) share one container via a QStackedWidget; the visible page
+        # follows the active tab (see _on_text_tab_changed).
+        self._formatted_coding_margin = CodingMargin(
+            self._formatted_text_edit, self, side=self.margin_side)
+        self._margin_stack = QtWidgets.QStackedWidget()
+        # IMPORTANT: take the plain margin OUT of its layout BEFORE reparenting
+        # it into the stack. QStackedWidget.addWidget() reparents the widget,
+        # which removes it from the old layout; if we tried to find it in the
+        # layout afterwards it is no longer there, and the stack would never be
+        # inserted - leaving a parentless, floating window (and no margin at all).
+        for _lay in (self._coding_margin_layout_left, self._coding_margin_layout_right):
+            if _lay is None:
+                continue
+            _mi = _lay.indexOf(self.coding_margin)
+            if _mi >= 0:
+                _lay.takeAt(_mi)
+                _lay.insertWidget(_mi, self._margin_stack)
+                break
+        self._margin_stack.addWidget(self.coding_margin)             # page 0: plain
+        self._margin_stack.addWidget(self._formatted_coding_margin)  # page 1: formatted
+        self._margin_stack.setCurrentIndex(0)
+        self._margin_stack.setVisible(self.show_margin_stripes)
+        self._sync_coding_margin_background()
+        # Repaint the formatted margin when the formatted editor scrolls
+        self._formatted_text_edit.verticalScrollBar().valueChanged.connect(
+            self._formatted_coding_margin.update)
+
         # Offset the NumberBar and coding margin by the tab bar height
-        # so line numbers align with the plain-text editor inside the tab.
+        # so line numbers AND code stripes align with the text editor inside
+        # the tab (the editor starts BELOW the tab bar; the margin column and
+        # line-number column start at the top of the splitter row, so without
+        # this offset stripes/labels would sit one line too high).
         tb_height = self._text_tabs.tabBar().height()
         layout = self.ui.lineNumbers.layout()
         if layout:
             layout.setContentsMargins(0, tb_height, 0, 0)
+        # Apply the same vertical offset to the margin containers so the
+        # CodingMargin stripes line up with the editor content.
+        for _mc in (self.ui.widget_code_margin_left, self.ui.widget_code_margin_right):
+            _ml = _mc.layout()
+            if _ml is None:
+                _ml = QtWidgets.QVBoxLayout(_mc)
+            _ml.setContentsMargins(0, tb_height, 0, 0)
 
         # Cache formatted-editor selections before tree clicks steal focus
         self._cached_fmt_sel = None
@@ -2560,30 +2642,72 @@ class DialogCodeText(QtWidgets.QWidget):
         if hasattr(self, 'number_bar'):
             self.number_bar._qc_formatted_mode = is_formatted
             self.number_bar.update()
-        # Hide the coding margin in formatted view (meaningless there)
-        if hasattr(self, 'coding_margin') and self.coding_margin is not None:
+        # Show the coding margin matching the active tab. Both the plain-text
+        # and the formatted editor now get the code-stripes margin; the shared
+        # QStackedWidget switches pages with the tab.
+        if getattr(self, '_margin_stack', None) is not None:
+            self._margin_stack.setCurrentIndex(1 if is_formatted else 0)
+            self._margin_stack.setVisible(self.show_margin_stripes)
+        elif hasattr(self, 'coding_margin') and self.coding_margin is not None:
             self.coding_margin.setVisible(
                 not is_formatted and self.show_margin_stripes)
         if self.file_ is None:
             return
-        # Load formatted HTML the first time the formatted tab is shown
-        if is_formatted and self._formatted_text_edit.toPlainText() == "":
+        # Always (re)load the formatted HTML when switching to that tab so it
+        # stays in sync with the current plain-text range (file switches, edit
+        # mode, start/end changes). Cheap enough; setHtml is idempotent.
+        if is_formatted:
             self._load_formatted_text()
         # Re-apply code highlights for the now-visible editor
         self.unlight()
         self.highlight()
 
     def _load_formatted_text(self):
-        """Load ``fulltext_html`` into the formatted editor, or fall back to
-        plain text if no HTML version exists."""
+        """Load the ``[start:end]`` slice of ``fulltext_html`` into the formatted
+        editor so it shows EXACTLY the same text range as the plain-text editor.
+
+        This keeps character positions identical between the two views: the
+        plain editor displays ``fulltext[start:end]`` and the formatted editor
+        displays the same range rendered from the HTML, so codings made in
+        either view map to the same ``fulltext`` offsets (``_cache_formatted_selection``
+        adds ``file_['start']`` on top of the slice-relative cursor position).
+
+        Falls back to plain text when no HTML version exists.
+        """
         if self.file_ is None:
             return
         fid = self.file_['id']
         cur = self.app.conn.cursor()
         cur.execute("SELECT fulltext_html FROM source WHERE id=?", [fid])
         row = cur.fetchone()
+        start = int(self.file_.get('start', 0))
+        # Always show EXACTLY the same character range as the plain-text editor:
+        # the plain editor displays ``self.text`` (== fulltext[start:start+len]).
+        # Deriving the end from the displayed text (instead of a possibly stale
+        # ``file_['end']``) keeps both views perfectly in sync.
+        end = start + len(self.text)
         if row and row[0]:
-            self._formatted_text_edit.setHtml(row[0])
+            full_html = row[0]
+            _doc = QtGui.QTextDocument()
+            _doc.setHtml(full_html)
+            _full_len = len(_doc.toPlainText())
+            _end = min(end, _full_len)
+            _start = min(start, _end)
+            if _start < _end:
+                _cur = QtGui.QTextCursor(_doc)
+                _cur.setPosition(_start)
+                _cur.setPosition(_end, QtGui.QTextCursor.MoveMode.KeepAnchor)
+                _sliced_html = _cur.selection().toHtml()
+            else:
+                _sliced_html = ""
+            self._formatted_text_edit.setHtml(_sliced_html)
+            # VERIFY alignment: the rendered HTML must produce EXACTLY the same
+            # plain text as the plain-text editor. Old imports, edited files or
+            # files whose stored fulltext_html is out of sync with fulltext
+            # would otherwise show shifted text (and shifted codings). In that
+            # case fall back to plain text so positions stay correct.
+            if self._formatted_text_edit.toPlainText() != self.text:
+                self._formatted_text_edit.setPlainText(self.text)
         else:
             self._formatted_text_edit.setPlainText(self.text)
 
@@ -3955,8 +4079,7 @@ class DialogCodeText(QtWidgets.QWidget):
 
         # Request a margin redraw on editor resize so stripes follow text reflow <- L
         if object_ is self.ui.plainTextEdit and event.type() == QtCore.QEvent.Type.Resize:
-            if hasattr(self, 'coding_margin') and self.coding_margin is not None:
-                self.coding_margin.update()
+            self._refresh_coding_margins()
 
         if object_ is self.ui.treeWidget.viewport():
             # If a show selected code was active, then clicking on a code in code tree, shows all codes and all tooltips
@@ -4745,7 +4868,9 @@ class DialogCodeText(QtWidgets.QWidget):
             self._load_formatted_text()
 
         # margin visibility handled via layout container; sync with preference <- L
-        if hasattr(self, 'coding_margin') and self.coding_margin is not None:
+        if getattr(self, '_margin_stack', None) is not None:
+            self._margin_stack.setVisible(self.show_margin_stripes)
+        elif hasattr(self, 'coding_margin') and self.coding_margin is not None:
             self.coding_margin.setVisible(self.show_margin_stripes)
         self._set_margin_container_visibility(self.show_margin_stripes)
 
@@ -4758,8 +4883,7 @@ class DialogCodeText(QtWidgets.QWidget):
         self.ui.checkBox_search_all_files.setEnabled(True)
 
         # ensure the margin is repainted with the new file's codes <- L
-        if hasattr(self, 'coding_margin') and self.coding_margin is not None:
-            self.coding_margin.update()
+        self._refresh_coding_margins()
 
     def detect_text_direction(self):
         for char in self.text:
@@ -4999,8 +5123,7 @@ class DialogCodeText(QtWidgets.QWidget):
 
         if self.file_ is None or self.ui.plainTextEdit.toPlainText() == "":
             # still refresh the side margin so it clears properly <- L
-            if hasattr(self, 'coding_margin') and self.coding_margin is not None:
-                self.coding_margin.update()
+            self._refresh_coding_margins()
             return
         codes = {x['cid']: x for x in self.codes}
 
@@ -5065,8 +5188,7 @@ class DialogCodeText(QtWidgets.QWidget):
         self.apply_underline_to_overlaps()
 
         # refresh the side margin widget after highlights change <- L
-        if hasattr(self, 'coding_margin') and self.coding_margin is not None:
-            self.coding_margin.update()
+        self._refresh_coding_margins()
 
         # Restore formatted editor's scroll position (mergeCharFormat
         # on a QTextEdit can reset the viewport to the top).
@@ -5997,7 +6119,9 @@ class DialogCodeText(QtWidgets.QWidget):
             self.edit_original_case_assignment = res_case
 
         # Hide the coding margin (and its container) during edit mode <- L
-        if hasattr(self, 'coding_margin') and self.coding_margin is not None:
+        if getattr(self, '_margin_stack', None) is not None:
+            self._margin_stack.hide()
+        elif hasattr(self, 'coding_margin') and self.coding_margin is not None:
             self.coding_margin.hide()
         self._set_margin_container_visibility(False)
 
@@ -6058,6 +6182,11 @@ class DialogCodeText(QtWidgets.QWidget):
             self.file_['characters'] = len(self.text)
             cur = self.app.conn.cursor()
             cur.execute("update source set fulltext=? where id=?", (self.text, self.file_['id']))
+            # Keep fulltext_html in sync: after editing, the stored HTML no longer
+            # matches the edited text, which would shift coding positions in the
+            # formatted viewer. Set it to NULL so the formatted tab falls back to
+            # the (now correct) plain text.
+            cur.execute("update source set fulltext_html=NULL where id=?", (self.file_['id'],))
             self.app.conn.commit()
             for item in self.code_deletions:
                 cur.execute(item)
@@ -6088,8 +6217,7 @@ class DialogCodeText(QtWidgets.QWidget):
 
         # repaint the margin after exiting edit mode. load_file (called
         # above) already restores visibility based on settings <- L
-        if hasattr(self, 'coding_margin') and self.coding_margin is not None:
-            self.coding_margin.update()
+        self._refresh_coding_margins()
         # Notify the fulltext edit to the bus: an open DialogCodePdf with this file
         # must reload and re-verify the page mapping; without this it keeps stale
         # text and positions in memory. Only when something was actually edited.

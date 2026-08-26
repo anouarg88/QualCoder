@@ -252,7 +252,7 @@ def getdocumenttext_html(document, zipfile_=None):
                         is_italic = True
                     if rpr.find(ns_w + 'u') is not None:
                         is_underline = True
-                    # Font family — try run-level first, then paragraph style,
+                    # Font family ?" try run-level first, then paragraph style,
                     # then document default
                     rfonts = rpr.find(ns_w + 'rFonts')
                     if rfonts is not None:
@@ -260,17 +260,19 @@ def getdocumenttext_html(document, zipfile_=None):
                                                   rfonts.get(ns_w + 'hAnsi', '')) or ''
                     if not font_family:
                         font_family = para_font or default_font
-                    # Font size in half-points — convert to pt.
-                    # Use run-level size if present, otherwise paragraph style size.
-                    if font_size_pt == 0 and para_size_pt > 0:
-                        font_size_pt = para_size_pt
+                    # Font size in half-points ?" convert to pt.
                     sz = rpr.find(ns_w + 'sz')
                     if sz is not None:
                         try:
                             font_size_pt = int(sz.get(ns_w + 'val', '0')) // 2
                         except (ValueError, TypeError):
                             pass
-                # Get run text
+                # Apply paragraph-style size/font to runs without explicit
+                # run-level formatting (e.g. plain runs in a styled paragraph).
+                if font_size_pt == 0:
+                    font_size_pt = para_size_pt
+                if not font_family:
+                    font_family = para_font or default_font
                 texts = []
                 for t in element.iter(ns_w + 't'):
                     if t.text:

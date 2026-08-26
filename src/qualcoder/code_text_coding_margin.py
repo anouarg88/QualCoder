@@ -189,6 +189,47 @@ class CodingMargin(QtWidgets.QWidget):
         dark_delta = abs(dark_candidate.lightness() - lightness)
         return light_candidate if light_delta <= dark_delta else dark_candidate
 
+    def _iter_visible_blocks(self):
+        """Yield (block, y_in_viewport, height_in_viewport) for the visible
+        blocks of the bound editor.
+
+        Works for BOTH QPlainTextEdit and QTextEdit:
+        - QPlainTextEdit exposes firstVisibleBlock()/blockBoundingGeometry().
+        - QTextEdit does not; we use cursorRect() at the start of each block,
+          which is viewport-relative and scroll-aware.
+        """
+        try:
+            if isinstance(self.editor, QtWidgets.QPlainTextEdit):
+                offset = self.editor.contentOffset()
+                block = self.editor.firstVisibleBlock()
+                while block.isValid():
+                    r = self.editor.blockBoundingGeometry(block).translated(offset)
+                    yield block, r.y(), r.height()
+                    if r.top() > self.height():
+                        break
+                    block = block.next()
+            else:  # QTextEdit (and subclasses)
+                doc = self.editor.document()
+                block = doc.begin()
+                while block.isValid():
+                    cur = QtGui.QTextCursor(block)
+                    r = self.editor.cursorRect(cur)
+                    lay = block.layout()
+                    # QTextDocument blocks can have an invisible trailing
+                    # 'paragraph separator' line; use the LAYOUT bounding rect
+                    # for the real block height (includes that spacing), and the
+                    # layout position y so stripes cover the full block.
+                    if lay is not None:
+                        block_height = max(1.0, float(lay.boundingRect().height()))
+                    else:
+                        block_height = max(1.0, float(r.height()))
+                    yield block, float(r.y()), block_height
+                    if r.top() > self.height():
+                        break
+                    block = block.next()
+        except Exception as e:
+            logger.debug(f"CodingMargin _iter_visible_blocks error: {e}")
+
     def paintEvent(self, event):
         try:
             painter = QtGui.QPainter(self)
@@ -198,8 +239,6 @@ class CodingMargin(QtWidgets.QWidget):
                 return
             font = QtGui.QFont(self.dialog.app.settings['font'], 9)
             painter.setFont(font)
-            offset = self.editor.contentOffset()
-            block = self.editor.firstVisibleBlock()
 
             ctid_columns, _sorted_codes, current_fid = self._compute_lane_layout()
             if current_fid is None:
@@ -207,13 +246,12 @@ class CodingMargin(QtWidgets.QWidget):
 
             drawn_ctids = set()
 
-            while block.isValid():
-                rect = self.editor.blockBoundingGeometry(block).translated(offset)
+            for block, y, height in self._iter_visible_blocks():
+                rect = QtCore.QRectF(0, y, self.width(), height)
                 if rect.top() > self.height():
                     break
                 if rect.bottom() >= 0:
                     self.draw_code_bars(painter, block, rect, drawn_ctids, current_fid, ctid_columns)
-                block = block.next()
         except Exception as e:
             logger.debug(f"CodingMargin paintEvent error: {e}")
 
@@ -268,18 +306,25 @@ class CodingMargin(QtWidgets.QWidget):
                 if start_line.isValid() and end_line.isValid():
                     first_line = start_line.lineNumber()
                     last_line = end_line.lineNumber()
-                    for line_number in range(first_line, last_line + 1):
-                        line = layout.lineAt(line_number)
-                        if not line.isValid():
-                            continue
+                    # Draw ONE continuous bar spanning the code's extent within
+                    # this block (instead of separate per-line bars that show
+                    # gaps where QTextEdit inserts paragraph spacing).
+                    _fl = layout.lineAt(first_line)
+                    _ll = layout.lineAt(last_line)
+                    if _fl.isValid() and _ll.isValid():
+                        _y0 = rect.top() + _fl.y()
+                        _y1 = rect.top() + _ll.y() + _ll.height()
                         painter.drawRect(
                             offset_x,
-                            int(rect.top() + line.y()),
+                            int(_y0),
                             bar_w,
-                            max(1, int(line.height()))
+                            max(1, int(_y1 - _y0))
                         )
+                    else:
+                        painter.drawRect(offset_x, int(rect.top()), bar_w, int(rect.height()))
                 else:
                     painter.drawRect(offset_x, int(rect.top()), bar_w, int(rect.height()))
+
 
                 if show_labels and ctid not in drawn_ctids and code['pos0'] >= block_start:
                     painter.setPen(self._label_color_for_background(color, background_color))
@@ -497,15 +542,15 @@ class CodingMargin(QtWidgets.QWidget):
                 file_start = self.dialog.file_.get('start', 0)
                 pos0 = code['pos0'] - file_start
                 pos1 = code['pos1'] - file_start
-                text_len = len(self.dialog.ui.plainTextEdit.toPlainText())
+                text_len = len(self.editor.toPlainText())
                 pos0 = max(0, min(pos0, text_len))
                 pos1 = max(0, min(pos1, text_len))
-                cursor = self.dialog.ui.plainTextEdit.textCursor()
+                cursor = self.editor.textCursor()
                 cursor.setPosition(pos0, QtGui.QTextCursor.MoveMode.MoveAnchor)
                 cursor.setPosition(pos1, QtGui.QTextCursor.MoveMode.KeepAnchor)
-                self.dialog.ui.plainTextEdit.setTextCursor(cursor)
-                self.dialog.ui.plainTextEdit.setFocus(QtCore.Qt.FocusReason.MouseFocusReason)
-                self.dialog.ui.plainTextEdit.ensureCursorVisible()
+                self.editor.setTextCursor(cursor)
+                self.editor.setFocus(QtCore.Qt.FocusReason.MouseFocusReason)
+                self.editor.ensureCursorVisible()
                 event.accept()
                 return
         super().mousePressEvent(event)

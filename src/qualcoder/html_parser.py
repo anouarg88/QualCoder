@@ -218,6 +218,28 @@ def clean_html_for_display(raw_html):
             return _apply_inline_style(m.group(0), css_rules)
         cleaned = re.sub(r'<[a-zA-Z][^>]*?(?:/>|>)', _inline_tag, cleaned)
 
+    # 3b. Ensure bare <h1>-<h6> headings get a visible size even when the
+    # source HTML does not style them (Qt's HTML renderer gives <h1> only
+    # bold, no larger font). Only apply when the tag has no font-size yet.
+    _HEADING_SIZES = {'h1': '24pt', 'h2': '20pt', 'h3': '17pt',
+                      'h4': '14pt', 'h5': '12pt', 'h6': '10pt'}
+    def _ensure_heading_size(m):
+        tag = m.group(0)
+        tag_name = re.match(r'<(\w+)', tag).group(1).lower()
+        size = _HEADING_SIZES.get(tag_name)
+        if size is None:
+            return tag
+        if re.search(r'font-size\s*:', tag, re.IGNORECASE):
+            return tag
+        if 'style="' in tag:
+            return tag.replace('style="', f'style="font-size: {size}; ', 1)
+        return tag[:-1] + f' style="font-size: {size};">'
+    cleaned = re.sub(
+        r'<h[1-6][^>]*>',
+        _ensure_heading_size,
+        cleaned,
+        flags=re.IGNORECASE)
+
     # 4. Ensure it's wrapped in a basic document structure
     if not cleaned.strip().lower().startswith('<html'):
         cleaned = '<html><body>' + cleaned + '</body></html>'
