@@ -246,12 +246,26 @@ def getdocumenttext_html(document, zipfile_=None):
                 font_family = ''
                 font_size_pt = 0
                 if rpr is not None:
-                    if rpr.find(ns_w + 'b') is not None:
-                        is_bold = True
-                    if rpr.find(ns_w + 'i') is not None:
-                        is_italic = True
-                    if rpr.find(ns_w + 'u') is not None:
-                        is_underline = True
+                    # Bold/italic/underline honor the w:val attribute: Word
+                    # writes explicit OFF values (<w:b w:val="false"/>,
+                    # <w:i w:val="0"/>, <w:u w:val="none"/>) in runs to
+                    # override inherited formatting. Those must NOT be treated
+                    # as "formatting on" - only absent/true values enable it.
+                    _b = rpr.find(ns_w + 'b')
+                    if _b is not None:
+                        _bv = _b.get(ns_w + 'val')
+                        if _bv is None or str(_bv).lower() in ('true', '1', 'on'):
+                            is_bold = True
+                    _i = rpr.find(ns_w + 'i')
+                    if _i is not None:
+                        _iv = _i.get(ns_w + 'val')
+                        if _iv is None or str(_iv).lower() in ('true', '1', 'on'):
+                            is_italic = True
+                    _u = rpr.find(ns_w + 'u')
+                    if _u is not None:
+                        _uv = _u.get(ns_w + 'val')
+                        if _uv is None or str(_uv).lower() != 'none':
+                            is_underline = True
                     # Font family ?" try run-level first, then paragraph style,
                     # then document default
                     rfonts = rpr.find(ns_w + 'rFonts')
