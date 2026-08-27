@@ -34,6 +34,7 @@ OTHER DEALINGS IN THE SOFTWARE.
 
 import html
 import logging
+import re
 import xml.etree.ElementTree as etree
 import zipfile
 
@@ -296,6 +297,14 @@ def getdocumenttext_html(document, zipfile_=None):
                 run_text = ''.join(texts)
                 if not run_text:
                     continue
+                # Preserve multiple spaces: QTextDocument collapses runs of
+                # regular spaces when rendering HTML. Convert any run of 2+
+                # spaces (and leading spaces) into &nbsp; so they survive the
+                # setHtml -> toPlainText round trip used to derive fulltext.
+                run_text = re.sub(
+                    r'(?:^| ) +',
+                    lambda m: '&nbsp;' * len(m.group(0)),
+                    run_text)
                 # Build an inline <span> with CSS for font/size
                 css_parts = []
                 if font_family:
