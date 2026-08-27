@@ -240,6 +240,34 @@ def clean_html_for_display(raw_html):
         cleaned,
         flags=re.IGNORECASE)
 
+    # 3c. Preserve runs of 2+ spaces (and leading spaces) in text content:
+    # QTextDocument collapses multiple regular spaces when rendering HTML, so
+    # transcripts/indented text would lose their alignment. Convert such runs
+    # to &nbsp; (Qt renders them back as normal spaces in toPlainText), but
+    # only in TEXT nodes - never inside tags (attribute values) and never in
+    # <pre>/<textarea> where whitespace is already significant.
+    # Split into tags and text segments; keep tags intact.
+    _segments = re.split(r'(<[^>]+>)', cleaned)
+    _in_pre = False
+    for _si in range(len(_segments)):
+        _seg = _segments[_si]
+        if _seg.startswith('<'):
+            # Track pre/textarea open/close so we skip their content.
+            _m = re.match(r'<(/)?(pre|textarea)\b', _seg, re.IGNORECASE)
+            if _m:
+                if _m.group(1):
+                    _in_pre = False
+                else:
+                    _in_pre = True
+            continue
+        if _in_pre or not _seg:
+            continue
+        # Convert runs of 2+ spaces (and leading spaces at segment start).
+        _segments[_si] = re.sub(
+            r'(?:^| ) +',
+            lambda mm: '&nbsp;' * len(mm.group(0)),
+            _seg)
+    cleaned = ''.join(_segments)
     # 4. Ensure it's wrapped in a basic document structure
     if not cleaned.strip().lower().startswith('<html'):
         cleaned = '<html><body>' + cleaned + '</body></html>'
