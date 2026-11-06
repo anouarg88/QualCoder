@@ -264,6 +264,7 @@ class RefiImport:
                     row = cur.fetchone()
                     if row is not None:
                         code_insert_id = row[0]
+                        self.codes.append({'guid': parent.get('guid'), 'cid': code_insert_id})
                 except sqlite3.Error:
                     pass
         # Child Codes of a codable code become its sub-codes (supercid)
@@ -441,8 +442,7 @@ class RefiImport:
             self.app.settings['codername'] = self.users[0]['name']
             self.app.write_config_ini(self.app.settings, self.app.ai_models)
         # Update vectorstore
-        if self.app.settings['ai_enable'] == 'True':
-            self.app.ai.sources_vectorstore.update_vectorstore()        
+        self.app.vectorstore_update()
         
         self.pd.close()
         msg = _("REFI-QDA PROJECT IMPORT EXPERIMENTAL FUNCTION - NOT FULLY TESTED\n")
@@ -889,6 +889,18 @@ class RefiImport:
             path_type = "absolute"
         return name, creating_user, create_date, source_path, path_type, rich_text_path
 
+    def unique_source_name(self, name):
+        """ Add _2, _3 etc before file extension, if source name is alreadytaken. """
+        stem, dot, ext = name.rpartition(".")
+        if not dot:
+            stem, ext = name, ""
+        cur = self.app.conn.cursor()
+        candidate, n = name, 1
+        while cur.execute("select 1 from source where name=?", [candidate]).fetchone():
+            n += 1
+            candidate = f"{stem}_{n}{dot}{ext}"
+        return candidate
+
     def load_picture_source(self, element):
         """ Load this picture source.
          Load the description and codings into sqlite.
@@ -901,6 +913,7 @@ class RefiImport:
 
         name, creating_user, create_date, source_path, path_type, rich_text_path = \
             self.name_creating_user_create_date_source_path_helper(element)
+        name = self.unique_source_name(name)
         media_path = "/images/" + name  # Default
         if path_type == "internal":
             # Copy file into .qda images folder and rename into original name
@@ -1355,6 +1368,7 @@ class RefiImport:
         # pdf suffix may need to be added on
         if name.lower()[-4:] != ".pdf":
             name += ".pdf"
+        name = self.unique_source_name(name)
         # print("source path: ", source_path, "name: ", name)
         media_path = f"/docs/{name}"  # Default
         if path_type == "internal":
@@ -1394,6 +1408,7 @@ class RefiImport:
         <CodeRef targetGUID="AE6D04CE‐D987‐4FC8‐AF97‐D72CA6FFD08F"/></Coding></PlainTextSelection>
         </Representation>
         """
+        cur = self.app.conn.cursor()
         for el in element:
             if el.tag == f"{{urn:QDA-XML:project:{self.xmlns_version}}}Representation":
                 # print("PDF Representation element found")
@@ -1402,13 +1417,16 @@ class RefiImport:
         # Coded areas over pages (PDFSelection): previously ignored, so area codings
         # were lost when importing a REFI-QDA project. Loaded after the Representation,
         # once the source row exists.
-        cur = self.app.conn.cursor()
         cur.execute("select id from source where name=?", [name])
         res_id = cur.fetchone()
         if res_id is not None:
             for el in element:
                 if el.tag == f"{{urn:QDA-XML:project:{self.xmlns_version}}}PDFSelection":
                     self.load_codings_for_pdf_areas(res_id[0], el)
+            else:
+                cur.execute("insert into source(name,fulltext,mediapath,memo,owner,date) values (?,?,?,?,?,?)",
+                    [name, "", media_path, "", creating_user, create_date])
+                self.app.conn.commit()
 
     def load_codings_for_pdf_areas(self, id_:int, element):
         """ Loads coded areas over PDF pages (PDFSelection) into code_image with pdf_page.
@@ -1729,8 +1747,11 @@ class RefiImport:
                         except KeyError:
                             pass
             sql = "insert into annotation (fid,pos0,pos1,memo,owner,date) values (?,?,?,?,?,?)"
-            cur.execute(sql, [source['id'], int(pos0), int(pos1), memo, creating_user, create_date])
-            self.app.conn.commit()
+            try:
+                cur.execute(sql, [source['id'], int(pos0), int(pos1), memo, creating_user, create_date])
+                self.app.conn.commit()
+            except sqlite3.IntegrityError:
+                self.parent_textedit.append(_("Duplicated annotation skipped."))
 
     def parse_notes(self, notes_element):
         """ Parse the Notes element.

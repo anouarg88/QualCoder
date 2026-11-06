@@ -21,12 +21,13 @@ https://qualcoder-org.github.io
 https://qualcoder.org/
 """
 
+from contextlib import closing
+import emoji
 import logging
 from pathlib import Path
-
+from PyQt6 import QtCore, QtGui, QtWidgets
 import qtawesome as qta  # see: https://pictogrammers.com/library/mdi/
-
-from PyQt6 import QtWidgets, QtCore
+import sqlite3
 
 from .code_text import DialogCodeText  # for isinstance()
 from .confirm_delete import DialogConfirmDelete
@@ -83,6 +84,8 @@ class DialogSpecialFunctions(QtWidgets.QDialog):
         self.ui.pushButton_select_project.pressed.connect(self.select_project_folder)
         self.ui.pushButton_merge.setEnabled(False)
         self.ui.pushButton_merge.pressed.connect(self.merge_projects)
+        self.ui.pushButton_update_seltext.setIcon(qta.icon('mdi6.alert-circle-outline', options=[{'scale_factor': 1.4}]))
+        self.ui.pushButton_update_seltext.pressed.connect(self.update_emoji_seltext)
         # Text positions, is here in case it is needed, but hidden for users as dangerous, Key Tilde to activate
         self.ui.groupBox_text_positions.hide()
 
@@ -101,25 +104,48 @@ class DialogSpecialFunctions(QtWidgets.QDialog):
             return
 
     # Functions to merge external project into this project
-    def select_project_folder(self):
-        """ Select another .qda project """
+    def select_project_folder(self) -> None:
+        """Select and validate another .qda project for merging."""
 
         self.merge_project_path = ""
+        self.ui.pushButton_merge.setEnabled(False)
         default_directory = self.app.settings['directory']
         if default_directory == "":
             default_directory = Path('~').expanduser()
-        self.merge_project_path = QtWidgets.QFileDialog.getExistingDirectory(self,
-                                                                             _('Open project directory'),
-                                                                             default_directory)
-        if self.merge_project_path is False or len(self.merge_project_path) < 5:
-            Message(self.app, _("Error"), _("No project selected")).exec()
+        selected_path = QtWidgets.QFileDialog.getExistingDirectory(
+            self, _('Open project directory'), default_directory
+        )
+        if not selected_path:
             return
-        if self.merge_project_path[-4:] != ".qda":
-            Message(self.app, _("Error"), _("Not a QualCoder project")).exec()
+        project_directory = Path(selected_path)
+        error_message = ""
+        try:
+            if project_directory.suffix.lower() != ".qda":
+                error_message = _("The selected folder is not a QualCoder project folder. "
+                                  "Its name must end with .qda.")
+            elif not project_directory.is_dir():
+                error_message = _("The project folder could not be found or accessed.")
+            elif project_directory.samefile(self.app.project_path):
+                error_message = _("The same project")
+            elif not (project_directory / "data.qda").is_file():
+                error_message = _("No data.qda database found in the selected folder.")
+            else:
+                # Read-only mode prevents validation from creating or changing a database.
+                database_uri = (project_directory / "data.qda").resolve().as_uri() + "?mode=ro"
+                with closing(sqlite3.connect(database_uri, uri=True)) as connection:
+                    result = connection.execute(
+                        "select databaseversion, date, memo, about from project"
+                    ).fetchone()
+                    if result is None or not isinstance(result[3], str) or "QualCoder" not in result[3]:
+                        error_message = _("Not a QualCoder project")
+        except sqlite3.DatabaseError as err:
+            error_message = _("The project database could not be opened.") + f"\n{err}"
+        except OSError as err:
+            error_message = _("The project folder could not be found or accessed.") + f"\n{err}"
+        if error_message:
+            Message(self.app, _("Error"), error_message).exec()
             return
-        if self.merge_project_path == self.app.project_path:
-            Message(self.app, _("Error"), _("The same project")).exec()
-            return
+        self.merge_project_path = project_directory.as_posix()
         msg = _("Merge") + f"\n{self.merge_project_path}\n" + _("into") + f"\n{self.app.project_path}\n"
         msg += _("Press Run Button to merge projects")
         Message(self.app, _("Merge projects"), msg).exec()
@@ -290,6 +316,53 @@ class DialogSpecialFunctions(QtWidgets.QDialog):
                 if isinstance(c, DialogCodeText):
                     c.get_coded_text_update_eventfilter_tooltips()
                     break
+
+    def update_emoji_seltext(self):
+        """ Fix out of sync stored seltext. where emoji character positions
+        have changed the recorded seltext. """
+
+        file_dicts = self.app.get_file_texts()
+        emoji_files = []
+        for file_dict in file_dicts:
+            has_emoji = any(emoji.is_emoji(char) for char in file_dict['fulltext'])
+            if has_emoji:
+                emoji_files.append(file_dict)
+        counter = 0
+        fixes_text = ""
+        cur = self.app.conn.cursor()
+        sql_coded = "select ctid, pos0, pos1, seltext from code_text where fid=?"
+        sql_fix = "update code_text set seltext=? where ctid=?"
+        for text_file in emoji_files:
+            text_edit = QtWidgets.QPlainTextEdit(text_file['fulltext'])
+            cur.execute(sql_coded, [text_file['id']])
+            res = cur.fetchall()
+            for r in res:
+                cursor = text_edit.textCursor()
+                cursor.setPosition(r[1])
+                cursor.setPosition(r[2], QtGui.QTextCursor.MoveMode.KeepAnchor)
+                seltext = cursor.selectedText()
+                if seltext != r[3]:
+                    line = f"{text_file['name']}, (ctid,pos0,pos1): {r[0:3]}\n- {r[3]}\n+ {seltext}\n\n"
+                    fixes_text += (line)
+                    counter += 1
+                    try:
+                        cur.execute(sql_fix, [seltext, r[0]])
+                        self.app.conn.commit()
+                    except Exception as e:
+                        logger.debug(e)
+                        print(e)
+
+        if fixes_text == "":
+            Message(self.app, _('No changes'), _("No inconsistencies found"), "information").exec()
+            return
+        filepath, ok = QtWidgets.QFileDialog.getSaveFileName(
+            self, _("Save changes for review"), self.app.settings['directory'],"Text Files (*.txt)")
+        if not filepath or not ok:
+            return
+        with open(filepath, 'w', encoding='utf-8') as f:
+            f.write(fixes_text)
+            msg = f"{counter} " + _("inconsistencies found and updated.")
+            Message(self.app, _('Changes exported'), msg, "information").exec()
 
     def accept(self):
         """ Override accept button. """

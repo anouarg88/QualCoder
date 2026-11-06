@@ -97,6 +97,14 @@ class DialogReportCodeSummary(QtWidgets.QDialog):
         self.ui.comboBox_stopwords.currentTextChanged.connect(self.fill_text_edit)
         self.app.project_events.project_data_changed.connect(self._on_project_data_changed)
 
+    def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:
+        """Keep unhandled Escape presses from closing the workspace."""
+
+        if event.key() == QtCore.Qt.Key.Key_Escape:
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
     def splitter_sizes(self):
         """ Detect size changes in splitter and store in app.settings variable. """
 
@@ -210,7 +218,7 @@ class DialogReportCodeSummary(QtWidgets.QDialog):
                 cat_name = c['name']
                 if self.truncated_code_names:
                     if len(c['name']) > 62:  # Keep category name short
-                        cat_name = c['name'][:30] + '..' + c['name'][-30:]
+                        cat_name = f"{c['name'][:30]}..{c['name'][-30:]}"
                         self.contains_long_names = True
                 top_item = QtWidgets.QTreeWidgetItem([cat_name, f'catid:{c["catid"]}', memo])
                 top_item.setToolTip(0, c['name'])
@@ -240,7 +248,7 @@ class DialogReportCodeSummary(QtWidgets.QDialog):
                         cat_name = c['name']
                         if self.truncated_code_names:
                             if len(c['name']) > 62:  # Keep category name short
-                                cat_name = c['name'][:30] + '..' + c['name'][-30:]
+                                cat_name = f"{c['name'][:30]}..{c['name'][-30:]}"
                                 self.contains_long_names = True
                         child = QtWidgets.QTreeWidgetItem([cat_name, f'catid:{c["catid"]}', memo])
                         child.setToolTip(0, c['name'])
@@ -268,14 +276,15 @@ class DialogReportCodeSummary(QtWidgets.QDialog):
                 code_name = c['name']
                 if self.truncated_code_names:
                     if len(c['name']) > 62:  # Keep category name short
-                        code_name = c['name'][:30] + '..' + c['name'][-30:]
+                        code_name = f"{c['name'][:30]}..{c['name'][-30:]}"
                         self.contains_long_names = True
                 top_item = QtWidgets.QTreeWidgetItem([code_name, f'cid:{c["cid"]}', memo])
                 top_item.setToolTip(0, c['name'])
                 top_item.setToolTip(2, c['memo'])
-                top_item.setBackground(0, QtGui.QBrush(QtGui.QColor(c['color']), Qt.BrushStyle.SolidPattern))
+                top_item.setIcon(0, qta.icon('mdi6.square-rounded', color=c['color']))
+                '''top_item.setBackground(0, QtGui.QBrush(QtGui.QColor(c['color']), Qt.BrushStyle.SolidPattern))
                 color = TextColor(c['color']).recommendation
-                top_item.setForeground(0, QtGui.QBrush(QtGui.QColor(color)))
+                top_item.setForeground(0, QtGui.QBrush(QtGui.QColor(color)))'''
                 top_item.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsUserCheckable |
                                   Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsDragEnabled)
                 self.ui.treeWidget.addTopLevelItem(top_item)
@@ -296,12 +305,13 @@ class DialogReportCodeSummary(QtWidgets.QDialog):
                     code_name = c['name']
                     if self.truncated_code_names:
                         if len(c['name']) > 62:  # Keep category name short
-                            code_name = c['name'][:30] + '..' + c['name'][-30:]
+                            code_name = f"{c['name'][:30]}..{c['name'][-30:]}"
                             self.contains_long_names = True
                     child = QtWidgets.QTreeWidgetItem([code_name, f'cid:{c["cid"]}', memo])
-                    child.setBackground(0, QtGui.QBrush(QtGui.QColor(c['color']), Qt.BrushStyle.SolidPattern))
+                    child.setIcon(0, qta.icon('mdi6.square-rounded', color=c['color']))
+                    '''child.setBackground(0, QtGui.QBrush(QtGui.QColor(c['color']), Qt.BrushStyle.SolidPattern))
                     color = TextColor(c['color']).recommendation
-                    child.setForeground(0, QtGui.QBrush(QtGui.QColor(color)))
+                    child.setForeground(0, QtGui.QBrush(QtGui.QColor(color)))'''
                     child.setToolTip(0, c['name'])
                     child.setToolTip(2, c['memo'])
                     child.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsUserCheckable |

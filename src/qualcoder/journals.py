@@ -35,8 +35,9 @@ from .add_item_name import DialogAddItemName
 from .add_attribute import DialogAddAttribute
 from .confirm_delete import DialogConfirmDelete
 from .GUI.ui_dialog_journals import Ui_Dialog_journals
+from .context_help import open_module_help
 from .helpers import Message, ExportDirectoryPathDialog, MarkdownHighlighter
-from .memo import DialogMemo
+from .memo import DialogMemo, DialogSelectQuote, DialogSelectReference
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +103,15 @@ class DialogJournals(QtWidgets.QDialog):
         self.ui.pushButton_help.pressed.connect(self.help)
         self.ui.pushButton_add_attribute.setIcon(qta.icon('mdi6.variable', options=[{'scale_factor': 1.4}]))
         self.ui.pushButton_add_attribute.clicked.connect(self.add_attribute)
+        # Editor toolbar: project-wide inserts, not scoped to one entity
+        self.ui.pushButton_insert_datetime.setIcon(qta.icon('mdi6.clock-outline', options=[{'scale_factor': 1.4}]))
+        self.ui.pushButton_insert_datetime.clicked.connect(self.insert_date)
+        self.ui.pushButton_insert_coded_segment.setIcon(
+            qta.icon('mdi6.format-quote-close', options=[{'scale_factor': 1.4}]))
+        self.ui.pushButton_insert_coded_segment.clicked.connect(self.insert_quote)
+        self.ui.pushButton_insert_reference.setIcon(
+            qta.icon('mdi6.book-open-variant', options=[{'scale_factor': 1.4}]))
+        self.ui.pushButton_insert_reference.clicked.connect(self.insert_reference)
 
         # Search text in journals
         self.ui.label_search_regex.setPixmap(qta.icon('mdi6.text-search').pixmap(22, 22))
@@ -122,13 +132,14 @@ class DialogJournals(QtWidgets.QDialog):
         # spell = SpellChecker()  # Was testing this out Dont use
         highlighter = MarkdownHighlighter(self.ui.textEdit, self.app)
         self.ui.tableWidget.setTabKeyNavigation(False)
-
+        self.ui.tableWidget.setShowGrid(False)
+        self.ui.tableWidget.setAlternatingRowColors(True)
         self.ui.tableWidget.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
         self.ui.tableWidget.customContextMenuRequested.connect(self.table_menu)
         self.ui.tableWidget.horizontalHeader().setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
         self.ui.tableWidget.horizontalHeader().customContextMenuRequested.connect(self.table_header_menu)
 
-        self.ui.textEdit.hide()
+        self.ui.widget_editor.hide()
         self.attribute_names = []  # For AddAttribute dialog
 
     def _emit_project_table_changes(self, tables):
@@ -204,7 +215,7 @@ class DialogJournals(QtWidgets.QDialog):
         self.ui.label_jname.setText(_("Journal: "))
         self.jid = None
         self.ui.textEdit.clear()
-        self.ui.textEdit.hide()
+        self.ui.widget_editor.hide()
 
     def add_attribute(self):
         """ When add button pressed, opens the AddAtribute dialog to get new attribute text.
@@ -285,9 +296,59 @@ class DialogJournals(QtWidgets.QDialog):
         if changed:
             self._emit_project_table_changes(['attribute'])
 
+    def insert_date(self):
+        """ Insert current date and time at the cursor position. """
+
+        if self.jid is None:
+            return
+        now = f'**{datetime.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M")}**'
+        cursor = self.ui.textEdit.textCursor()
+        if cursor.positionInBlock() > 0:
+            cursor.insertText("\n")
+        cursor.insertText(now + "\n")
+        self.ui.textEdit.setFocus()
+
+    def insert_quote(self):
+        """ Select coded segments from the whole project and insert them at the cursor. """
+
+        if self.jid is None:
+            return
+        ui = DialogSelectQuote(self.app, "project")
+        if not ui.quotes:
+            Message(self.app, _("Insert quotes"), _("No coded segments found in this project.")).exec()
+            return
+        if ui.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+        self.insert_lines(ui.get_selected())
+
+    def insert_reference(self):
+        """ Select bibliographic references from the whole project and insert them at the cursor. """
+
+        if self.jid is None:
+            return
+        ui = DialogSelectReference(self.app, "project")
+        if not ui.all_refs:
+            Message(self.app, _("Insert reference"), _("No references found in this project.")).exec()
+            return
+        if ui.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+        self.insert_lines(ui.get_selected())
+
+    def insert_lines(self, selected):
+        """ Insert lines at the cursor: own line, blank line between items,
+        cursor left on the next line. """
+
+        if not selected:
+            return
+        cursor = self.ui.textEdit.textCursor()
+        if cursor.positionInBlock() > 0:
+            cursor.insertText("\n")
+        cursor.insertText("\n\n".join(selected) + "\n")
+        self.ui.textEdit.setFocus()
+
     def help(self):
-        """ Open help for transcribe section in browser. """
-        self.app.help_wiki("5.2.-Journals")
+        """ Open help in browser. """
+        open_module_help(self.app, self)
 
     def keyPressEvent(self, event):
         """ Used to activate buttons. """
@@ -421,6 +482,8 @@ class DialogJournals(QtWidgets.QDialog):
             action_attribute_descending = menu.addAction(_("Descending"))
 
         action = menu.exec(self.ui.tableWidget.mapToGlobal(position))
+        if action is None:  # Dismissed menu: None matches unbuilt actions
+            return
         if action == action_modified_date_asc:
             self.load_journals("date asc")
             return
@@ -487,13 +550,14 @@ class DialogJournals(QtWidgets.QDialog):
         action_show_all = None
         if self.rows_hidden:
             action_show_all = menu.addAction(_("Show all rows Ctrl A"))
-            self.rows_hidden = False
         # Convert journal to source file <- L    
         action_convert_to_source = None
         if row != -1:
             action_convert_to_source = menu.addAction(_("Convert journal to source file"))
 
         action = menu.exec(self.ui.tableWidget.mapToGlobal(position))
+        if action is None:  # Dismissed menu: None matches unbuilt actions
+            return
         if action == action_modified_date_asc:
             self.load_journals("date asc")
             return
@@ -533,7 +597,7 @@ class DialogJournals(QtWidgets.QDialog):
             self.ui.label_jname.setText(_("Journal: "))
             self.jid = None
             self.ui.textEdit.clear()
-            self.ui.textEdit.hide()
+            self.ui.widget_editor.hide()
             return
         if action == action_show_values_like:
             text_value, ok = QtWidgets.QInputDialog.getText(self, _("Text filter"), _("Show values like:"),
@@ -548,7 +612,7 @@ class DialogJournals(QtWidgets.QDialog):
             self.ui.label_jname.setText(_("Journal: "))
             self.jid = None
             self.ui.textEdit.clear()
-            self.ui.textEdit.hide()
+            self.ui.widget_editor.hide()
             return
         if action == action_date_picker:
             ui = DialogMemo(self.app, "Date selector", "", "hide")
@@ -571,7 +635,7 @@ class DialogJournals(QtWidgets.QDialog):
             self.ui.label_jname.setText(_("Journal: "))
             self.jid = None
             self.ui.textEdit.clear()
-            self.ui.textEdit.hide()
+            self.ui.widget_editor.hide()
             return
         # convert journal to source <- L
         if action == action_convert_to_source:
@@ -762,7 +826,7 @@ class DialogJournals(QtWidgets.QDialog):
                 self.ui.tableWidget.blockSignals(False)
         self.ui.label_jname.setText(_("Journal: ") + self.journals[row]['name'])
         self.jid = jid
-        self.ui.textEdit.show()
+        self.ui.widget_editor.show()
         self.view()
 
     def cell_modified(self):
@@ -1012,8 +1076,7 @@ class DialogJournals(QtWidgets.QDialog):
         self.app.conn.commit()
         self._emit_project_table_changes(['source', 'attribute_type', 'attribute'])
 
-        if self.app.settings['ai_enable'] == 'True' and getattr(self.app, 'ai', None) is not None:
-            self.app.ai.sources_vectorstore.import_document(new_source_id, source_name, journal_text)
+        self.app.vectorstore_import_document(new_source_id, source_name, journal_text)
 
         msg = _("Journal converted to source document: ") + source_name
         self.parent_text_edit.append(msg)

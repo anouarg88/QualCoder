@@ -45,6 +45,7 @@ from .coder_names import DialogCoderNames
 from .color_selector import TextColor, colour_ranges, show_codes_of_colour_range
 from .confirm_delete import DialogConfirmDelete
 from .GUI.ui_dialog_code_av import Ui_Dialog_code_av
+from .context_help import open_module_help
 from .helpers import NumberBar, msecs_to_hours_mins_secs, Message, ToolTipEventFilter, CodeResizeHandle, \
     init_persistent_tree_header, ExportDirectoryPathDialog
 from .memo import DialogMemo
@@ -53,8 +54,8 @@ from .select_items import DialogSelectItems
 from .speakers import DialogSpeakers, speaker_coder_name
 from .ris import Ris
 from .ai_agent_prompts import AiAgentPromptsCatalog
-from .ai_chat import ai_chat_signal_emitter
-from .ai_prompt_library import DialogAiEditPrompts
+from .ai_runtime import ensure_ai_ready
+from .ai_ui import ai_chat_signal_emitter
 from .view_av_waveform import waveform_backend_available, waveform_png_is_current, generate_waveform_png_async, \
     waveform_colour, keyframe_interval_seconds  # noqa: F401  (WaveformSeekBar used via the promoted .ui widget)
 
@@ -179,8 +180,6 @@ class DialogCodeAV(QtWidgets.QDialog):
         self.ui.pushButton_rate_down.pressed.connect(self.decrease_play_rate)
         self.ui.pushButton_rate_up.setIcon(qta.icon('mdi6.speedometer', options=[{'scale_factor': 1.4}]))
         self.ui.pushButton_rate_up.pressed.connect(self.increase_play_rate)
-        self.ui.pushButton_help.setIcon(qta.icon('mdi6.help'))
-        self.ui.pushButton_help.pressed.connect(self.help)
         self.ui.pushButton_mark_speakers.setIcon(qta.icon('mdi6.pin-outline', options=[{'scale_factor': 1.3}]))
         self.ui.pushButton_mark_speakers.pressed.connect(self.mark_speakers)
         self.ui.pushButton_important.setIcon(qta.icon('mdi6.star-outline', options=[{'scale_factor': 1.3}]))
@@ -318,9 +317,6 @@ class DialogCodeAV(QtWidgets.QDialog):
         self.get_files()
         self.app.project_events.project_data_changed.connect(self._on_project_data_changed)
         self.code_tree.fill_tree()
-        # These signals after the tree is filled the first time
-        self.ui.treeWidget.itemCollapsed.connect(self.get_collapsed)
-        self.ui.treeWidget.itemExpanded.connect(self.get_collapsed)
 
         # Video incrustado en el propio diálogo (sin ventana separada)
         self.ui.frame_video.setAutoFillBackground(True)
@@ -765,8 +761,8 @@ class DialogCodeAV(QtWidgets.QDialog):
                     self.update_coder_names()
 
     def help(self):
-        """ Open help for transcribe section in browser. """
-        self.app.help_wiki("4.5.-Coding-Audio-and-Video")
+        """ Open help in browser. """
+        open_module_help(self.app, self)
 
     def find_code_in_tree(self):
         """ Find a code by name in the codes tree and select it.
@@ -1140,15 +1136,6 @@ class DialogCodeAV(QtWidgets.QDialog):
             self.ui.widget_tracks.set_code_structure(self.codes, self.categories)
             self.ui.widget_tracks.set_segments(self.segments)
 
-    def _strip_tree_color_icons(self):
-        """ No colour chips before code names in this dialog's tree. """
-        it = QtWidgets.QTreeWidgetItemIterator(self.ui.treeWidget)
-        while it.value():
-            item = it.value()
-            if item.text(1)[0:3] == 'cid':
-                item.setIcon(0, QtGui.QIcon())
-            it += 1
-
     def fill_code_counts_in_tree(self):
         """ Calculate the frequency of each code and category for this coder and the selected file.
         Add a list item to each code that can be used to display in treeWidget.
@@ -1268,8 +1255,6 @@ class DialogCodeAV(QtWidgets.QDialog):
                 else:
                     item.setText(3, str(own_n))
             iterator += 1  # Move to the next item
-        self._strip_tree_color_icons()
-
 
     def tree_item_clicked(self, item, column):
         """ Use to quicky open memo. Or,
@@ -1288,18 +1273,6 @@ class DialogCodeAV(QtWidgets.QDialog):
         selected_text = self.ui.plainTextEdit.textCursor().selectedText()
         if len(selected_text) > 0:
             self.mark()
-
-    def get_collapsed(self, item):
-        """ On category collapse or expansion signal, find the collapsed parent category items.
-        This will fill the self.app.collapsed_categories and is the expanded/collapsed tree is then replicated across
-        other areas of the app. """
-
-        if item.text(1)[:3] == "cid":
-            return
-        if not item.isExpanded() and item.text(1) not in self.app.collapsed_categories:
-            self.app.collapsed_categories.append(item.text(1))
-        if item.isExpanded() and item.text(1) in self.app.collapsed_categories:
-            self.app.collapsed_categories.remove(item.text(1))
 
     def file_menu(self, position):
         """ Context menu to select the next image alphabetically, or
@@ -2627,7 +2600,7 @@ class DialogCodeAV(QtWidgets.QDialog):
         sb.set_waveform_pixmap(None)
         sb.set_no_waveform_message(_("Generating waveform..."))
         thread = generate_waveform_png_async(self._waveform_media_abs_path(), waveform_path,
-                                             waveform_colour(self.app.settings['stylesheet']))
+                                             waveform_colour())
         file_id = self.file_['id']
         timer = QtCore.QTimer(self)
         timer.setInterval(300)
@@ -3102,7 +3075,10 @@ class DialogCodeAV(QtWidgets.QDialog):
         code_tree_changed = "code_cat" in tables or "code_name" in tables
 
         refresh_segments = "code_av" in tables or "code_text" in tables or ("code_name" in tables and bool(self.segments))
-        refresh_transcript = "code_text" in tables or ("code_name" in tables and bool(self.code_text))
+        refresh_annotations = "annotation" in tables
+        refresh_transcript = (
+            "code_text" in tables or refresh_annotations or ("code_name" in tables and bool(self.code_text))
+        )
         refresh_counts = "code_av" in tables or "code_text" in tables
 
         if code_tree_changed:
@@ -3111,6 +3087,8 @@ class DialogCodeAV(QtWidgets.QDialog):
         elif not refresh_counts and not refresh_segments and not refresh_transcript:
             return
 
+        if refresh_annotations:
+            self.annotations = self.app.get_annotations()
         if refresh_transcript:
             self.get_coded_text_update_eventfilter_tooltips()
         if refresh_segments and self.file_ is not None and self.media is not None:
@@ -4101,6 +4079,8 @@ class DialogCodeAV(QtWidgets.QDialog):
             self.display_handles_for_code(cursor.position())
             return
         if action.property('submenu') == 'ai_text_analysis':
+            if not ensure_ai_ready(self.app, _("AI Text Analysis")):
+                return
             if self.transcription is None:
                 Message(self.app, _('Warning'), _("No transcript for this file."), "warning").exec()
                 return
@@ -4113,6 +4093,8 @@ class DialogCodeAV(QtWidgets.QDialog):
                                                           action.data())
             return
         if action.property('submenu') == 'ai_text_analysis_prompts':
+            from .ai_prompt_library import DialogAiEditPrompts
+
             DialogAiEditPrompts(self.app, 'text_analysis').exec()
             return
         # Remaining actions will be the submenu codes
@@ -4998,29 +4980,38 @@ class DialogCodeAV(QtWidgets.QDialog):
                 coded_text_list.append(item)
         if not coded_text_list:
             return
-        code_to_handle = coded_text_list[-1]
+        codes_to_handle = [coded_text_list[-1]]
         if len(coded_text_list) > 1:
-            ui = DialogSelectItems(self.app, coded_text_list, _("Select code to resize"), "single")
+            ui = DialogSelectItems(self.app, coded_text_list, _("Select code to resize"), "multiple")
             if ui.exec():
-                code_to_handle = ui.get_selected()
+                codes_to_handle = ui.get_selected()
             else:
                 return
+        # Ensure all codes have same segment length
+        pos0 = codes_to_handle[0]['pos0']
+        pos1 = codes_to_handle[0]['pos1']
+        if len(codes_to_handle) > 1:
+            for c in codes_to_handle:
+                if c['pos0'] != pos0 or c['pos1'] != pos1:
+                    msg = _("Selected codes have differing start and end positions to other codes selected.\nMultiple selected coded segments must have identical positions")
+                    Message(self.app,_('Different positions'),msg, 'warning').exec()
+                    return
         self.hide_resize_handles()
 
         # Create start handle
         cursor_start = self.ui.plainTextEdit.textCursor()
-        cursor_start.setPosition(max(0, code_to_handle['pos0']))
+        cursor_start.setPosition(max(0, codes_to_handle[0]['pos0']))
         rect_start = self.ui.plainTextEdit.cursorRect(cursor_start)
-        h_start = CodeResizeHandle(self.ui.plainTextEdit, True, code_to_handle, self)
+        h_start = CodeResizeHandle(self.ui.plainTextEdit, True, codes_to_handle, self)
         # start teardrop tip is at its top-right corner -> shift left by full width
         h_start.move(rect_start.x() - h_start.width(), rect_start.y())
         self.active_handles.append(h_start)
 
         # Create end handle
         cursor_end = self.ui.plainTextEdit.textCursor()
-        cursor_end.setPosition(min(len(self.ui.plainTextEdit.toPlainText()), code_to_handle['pos1']))
+        cursor_end.setPosition(min(len(self.ui.plainTextEdit.toPlainText()), codes_to_handle[0]['pos1']))
         rect_end = self.ui.plainTextEdit.cursorRect(cursor_end)
-        h_end = CodeResizeHandle(self.ui.plainTextEdit, False, code_to_handle, self)
+        h_end = CodeResizeHandle(self.ui.plainTextEdit, False, codes_to_handle, self)
         # end teardrop tip is at its top-left corner -> align directly to the cursor x
         h_end.move(rect_end.x(), rect_end.y())
         self.active_handles.append(h_end)
@@ -5050,12 +5041,12 @@ class DialogCodeAV(QtWidgets.QDialog):
         if not getattr(self, 'active_handles', []):
             return
         for h in self.active_handles:
-            fresh = next((c for c in self.code_text if c.get('ctid') == h.code_item.get('ctid')), None)
+            fresh = next((c for c in self.code_text if c.get('ctid') == h.code_items[0].get('ctid')), None)
             if fresh is not None:
                 h.code_item = fresh
                 h.orig_pos0 = fresh['pos0']
                 h.orig_pos1 = fresh['pos1']
-            anchor = h.code_item['pos0'] if h.is_start else h.code_item['pos1']
+            anchor = h.code_items[0]['pos0'] if h.is_start else h.code_items[0]['pos1']
             cursor = self.ui.plainTextEdit.textCursor()
             cursor.setPosition(max(0, min(len(self.ui.plainTextEdit.toPlainText()), anchor)))
             rect = self.ui.plainTextEdit.cursorRect(cursor)
@@ -5065,30 +5056,39 @@ class DialogCodeAV(QtWidgets.QDialog):
                 h.move(rect.x(), rect.y())  # end tip at top-left
             h.raise_()
 
-    def update_code_position_from_handle(self, code_item, new_pos, is_start, orig_pos0, orig_pos1):
+    def update_code_position_from_handle(self, code_items, new_pos, is_start, orig_pos0, orig_pos1):
         """ Receive final drop coordinates from a handle and update the database. """
         if is_start:
-            if new_pos >= code_item['pos1']:
-                code_item['pos0'] = orig_pos0  # Revert visually
+            if new_pos >= code_items[0]['pos1']:
+                for code_item in code_items:
+                    code_item['pos0'] = orig_pos0  # Revert visually
                 self.hide_resize_handles()
                 self.unlight()
                 self.highlight()
                 return
-            code_item['pos0'] = new_pos
+            for code_item in code_items:
+                code_item['pos0'] = new_pos
         else:
-            if new_pos <= code_item['pos0']:
-                code_item['pos1'] = orig_pos1  # Revert visually
+            if new_pos <= code_items[0]['pos0']:
+                for code_item in code_items:
+                    code_item['pos1'] = orig_pos1  # Revert visually
                 self.hide_resize_handles()
                 self.unlight()
                 self.highlight()
                 return
-            code_item['pos1'] = new_pos
+            for code_item in code_items:
+                code_item['pos1'] = new_pos
 
-        cur = self.app.conn.cursor()
+        cursor = self.ui.plainTextEdit.textCursor()
+        cursor.setPosition(code_items[0]['pos0'])
+        cursor.setPosition(code_items[0]['pos1'], QtGui.QTextCursor.MoveMode.KeepAnchor)
+        seltext = cursor.selectedText()
+
+        ''' OLD 
+        for code_item in code_items:
         cur.execute("select substr(fulltext,?,?) from source where id=?",
                     [code_item['pos0'] + 1, code_item['pos1'] - code_item['pos0'], code_item['fid']])
         res = cur.fetchone()
-
         if not res:
             # Revert on extraction error
             code_item['pos0'] = orig_pos0
@@ -5097,21 +5097,23 @@ class DialogCodeAV(QtWidgets.QDialog):
             self.unlight()
             self.highlight()
             return
-        seltext = res[0]
+        seltext = res[0]'''
 
-        try:
-            sql = "update code_text set pos0=?, pos1=?, seltext=? where ctid=?"
-            cur.execute(sql, [code_item['pos0'], code_item['pos1'], seltext, code_item['ctid']])
-            self.app.conn.commit()
-            self.app.delete_backup = False
-            self._emit_project_table_changes(['code_text'])
-        except sqlite3.IntegrityError:
-            self.app.conn.rollback()
-            # Revert in-memory positions to undo temporary highlight
-            code_item['pos0'] = orig_pos0
-            code_item['pos1'] = orig_pos1
-            Message(self.app, _("Duplicate Error"),
-                    _("This code already exists at this exact location."), "warning").exec()
+        cur = self.app.conn.cursor()
+        sql = "update code_text set pos0=?, pos1=?, seltext=? where ctid=?"
+        for code_item in code_items:
+            try:  
+                cur.execute(sql, [code_item['pos0'], code_item['pos1'], seltext, code_item['ctid']])
+                self.app.conn.commit()
+                self.app.delete_backup = False
+                self._emit_project_table_changes(['code_text'])
+            except sqlite3.IntegrityError:
+                self.app.conn.rollback()
+                # Revert in-memory positions to undo temporary highlight
+                code_item['pos0'] = orig_pos0
+                code_item['pos1'] = orig_pos1
+                Message(self.app, _("Duplicate Error"),
+                        _("This code already exists at this exact location."), "warning").exec()
         # Keep handles active after a successful resize so the user can
         # adjust the other end without re-triggering the action
         self.get_coded_text_update_eventfilter_tooltips()

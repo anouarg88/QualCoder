@@ -45,6 +45,7 @@ from .color_selector import DialogColorSelect
 from .color_selector import colour_ranges, show_codes_of_colour_range
 from .GUI.ui_dialog_code_image import Ui_Dialog_code_image
 from .GUI.ui_dialog_view_image import Ui_Dialog_view_image
+from .context_help import open_module_help
 from .move_resize_rectangle import DialogMoveResizeRectangle
 from .helpers import ExportDirectoryPathDialog, Message, init_persistent_tree_header
 from .memo import DialogMemo
@@ -222,9 +223,6 @@ class DialogCodeImage(QtWidgets.QDialog):
         self.ui.splitter_2.splitterMoved.connect(self.update_sizes)
         self.app.project_events.project_data_changed.connect(self._on_project_data_changed)
         self.code_tree.fill_tree()
-        # These signals after the tree is filled the first time
-        self.ui.treeWidget.itemCollapsed.connect(self.get_collapsed)
-        self.ui.treeWidget.itemExpanded.connect(self.get_collapsed)
 
     def _emit_project_table_changes(self, tables):
         """Notify other open dialogs about changed project tables."""
@@ -645,18 +643,6 @@ class DialogCodeImage(QtWidgets.QDialog):
 
         if column == 2:
             self.code_tree.add_edit_cat_or_code_memo(item)
-
-    def get_collapsed(self, item):
-        """ On category collapse or expansion signal, find the collapsed parent category items.
-        This will fill the self.app.collapsed_categories and is the expanded/collapsed tree is then replicated across
-        other areas of the app. """
-
-        if item.text(1)[:3] == "cid":
-            return
-        if not item.isExpanded() and item.text(1) not in self.app.collapsed_categories:
-            self.app.collapsed_categories.append(item.text(1))
-        if item.isExpanded() and item.text(1) in self.app.collapsed_categories:
-            self.app.collapsed_categories.remove(item.text(1))
 
     def active_file_memo(self):
         """ Send active file to file_memo method.
@@ -1626,8 +1612,8 @@ class DialogCodeImage(QtWidgets.QDialog):
         draw.text(position, text, font=font, fill="black")
 
     def help(self):
-        """ Open help for transcribe section in browser. """
-        self.app.help_wiki("4.4.-Coding-Images")
+        """ Open help in browser. """
+        open_module_help(self.app, self)
 
     def eventFilter(self, object_, event):
         """ Using this event filter to identify treeWidgetItem drop events.

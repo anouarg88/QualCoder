@@ -43,21 +43,37 @@ from langchain_core.messages.human import HumanMessage
 from langchain_core.messages.system import SystemMessage
 from markdown_it import MarkdownIt
 from PyQt6 import QtWidgets, QtCore, QtGui
-from PyQt6.QtCore import Qt, QEvent, QObject, pyqtSignal
+from PyQt6.QtCore import Qt, QEvent, pyqtSignal
 from PyQt6.QtGui import QCursor, QGuiApplication, QAction, QPalette, QShortcut, QKeySequence, QStandardItemModel, QStandardItem
 from PyQt6.QtWidgets import QTextEdit
 import qtawesome as qta
 
-from .ai_agent_prompts import AiAgentPromptsCatalog, AgentPromptRecord, prompt_name_and_scope
+from .ai_agent_prompts import (
+    AiAgentPromptsCatalog,
+    AgentPromptRecord,
+    prompt_name_and_scope,
+    prompt_name_key,
+)
 from .ai_llm import extract_ai_memo, ai_quote_search, llm_content_to_text, strip_think_blocks, AICancelled
-from .ai_mcp_server import AiMcpServer
+from .ai_runtime import (
+    ensure_ai_ready,
+    runtime_status_bar_text,
+)
 from .ai_search_dialog import DialogAiSearch
+from .ai_ui import (
+    ai_chat_signal_emitter,
+    code_analysis_icon,
+    general_chat_icon,
+    text_analysis_icon,
+    topic_exploration_icon,
+)
 from .confirm_delete import DialogConfirmDelete
 from .error_dlg import qt_exception_hook
 from .GUI.ui_ai_chat import Ui_Dialog_ai_chat
 from .helpers import Message
 from .html_parser import html_to_text
 from .information import ai_agent_tab_info, render_tab_info_markdown
+from .themes import AI_RESPONSE_COLORS, palette_is_dark
 
 path = os.path.abspath(os.path.dirname(__file__))
 logger = logging.getLogger(__name__)
@@ -157,12 +173,6 @@ def render_markdown_to_html(text: str, hr_color: str = "#e6e6e6", hr_width_px: i
         rendered_html = rendered_html.replace(old, new)
 
     return f'<div style="margin-top: 4px;">{rendered_html}</div>'
-
-class AIChatSignalEmitter(QObject):
-    newTextChatSignal = pyqtSignal(int, str, str, int, object)  # will start a new text analysis chat
-
-ai_chat_signal_emitter = AIChatSignalEmitter()  # Create a global instance of the signal emitter
-
 
 class PrefixedComboBox(QtWidgets.QComboBox):
     """Draw a prefix in the closed combobox without changing the popup item texts."""
@@ -533,7 +543,7 @@ class PromptSlashReferenceHighlighter(QtGui.QSyntaxHighlighter):
             if not self.enabled_provider():
                 return
             prompt_names = {
-                str(prompt.name if prompt.name is not None else '').strip('/').casefold()
+                prompt_name_key(str(prompt.name if prompt.name is not None else '').strip('/'))
                 for prompt in self.records_provider()
             }
             prompt_names.discard('')
@@ -543,7 +553,7 @@ class PromptSlashReferenceHighlighter(QtGui.QSyntaxHighlighter):
 
         for match in PROMPT_SLASH_REF_PATTERN.finditer(text):
             token = match.group(0).strip()
-            prompt_name = token[1:].rstrip('/.,;:!?').casefold()
+            prompt_name = prompt_name_key(token[1:].rstrip('/.,;:!?'))
             if prompt_name not in prompt_names:
                 continue
             fmt = QtGui.QTextCharFormat()
@@ -645,13 +655,12 @@ class DialogAIChat(QtWidgets.QDialog):
         self.ui.splitter_ai_output.splitterMoved.connect(self.on_ai_output_splitter_moved)
         self.ui.ai_output.linkHovered.connect(self.on_linkHovered)
         self.ui.ai_output.linkActivated.connect(self.on_linkActivated)
-        self.ui.pushButton_help.pressed.connect(self.help)
         self.ui.pushButton_undo.pressed.connect(self._undo_ai_changes_shortcut)
         self.shortcut_undo_ai_changes = QShortcut(QKeySequence("Ctrl+Shift+U"), self)
         self.shortcut_undo_ai_changes.activated.connect(self._undo_ai_changes_shortcut)
         ai_chat_signal_emitter.newTextChatSignal.connect(self.new_text_chat)
         self.agent_prompts_catalog = AiAgentPromptsCatalog(self.app)
-        self.ai_mcp_server = AiMcpServer(self.app)
+        self.ai_mcp_server = self.app.ai_mcp_server
         self.ai_prompt = None
         self._multi_chat_selection_active = False
         self._setup_prompt_completion()
@@ -698,6 +707,10 @@ class DialogAIChat(QtWidgets.QDialog):
         self.ui.scrollArea_ai_output.verticalScrollBar().valueChanged.connect(self.on_ai_output_scroll)
         self.set_sidebar_mode(False)
         QtCore.QTimer.singleShot(0, self._hide_transient_chat_overlays)
+        project_events = getattr(self.app, "project_events", None)
+        project_data_changed = getattr(project_events, "project_data_changed", None)
+        if project_data_changed is not None and hasattr(project_data_changed, "connect"):
+            project_data_changed.connect(self._on_project_data_changed)
         self._update_undo_button_state()
 
     def _setup_prompt_completion(self) -> None:
@@ -850,29 +863,26 @@ class DialogAIChat(QtWidgets.QDialog):
         normalized_parent = str(parent if parent is not None else '').strip('/')
         if normalized_full == '':
             return None
-        if normalized_parent == '':
-            if '/' in normalized_full:
+        full_parts = normalized_full.split('/')
+        parent_parts = normalized_parent.split('/') if normalized_parent != '' else []
+        if len(full_parts) != len(parent_parts) + 1:
+            return None
+        for index, parent_part in enumerate(parent_parts):
+            if prompt_name_key(full_parts[index]) != prompt_name_key(parent_part):
                 return None
-            return normalized_full
-        prefix = normalized_parent + '/'
-        if not normalized_full.startswith(prefix):
-            return None
-        remainder = normalized_full[len(prefix):]
-        if remainder == '' or '/' in remainder:
-            return None
-        return remainder
+        return full_parts[-1]
 
     def _matching_prompt_completion_items(self, prefix: str) -> List[Dict[str, Any]]:
         """Return direct matching categories and prompts for the current token."""
 
         self._refresh_prompt_completion_records()
         parent, leaf = self._split_prompt_completion_query(prefix)
-        normalized_leaf = leaf.casefold()
+        normalized_leaf = prompt_name_key(leaf)
         items: List[Dict[str, Any]] = []
 
         for category in self._iter_prompt_completion_categories():
             child_name = self._is_direct_prompt_completion_child(category, parent)
-            if child_name is None or not child_name.casefold().startswith(normalized_leaf):
+            if child_name is None or not prompt_name_key(child_name).startswith(normalized_leaf):
                 continue
             full_insert = '/' + category + '/'
             items.append(
@@ -888,7 +898,7 @@ class DialogAIChat(QtWidgets.QDialog):
 
         for prompt in self._prompt_completion_records:
             child_name = self._is_direct_prompt_completion_child(prompt.name, parent)
-            if child_name is None or not child_name.casefold().startswith(normalized_leaf):
+            if child_name is None or not prompt_name_key(child_name).startswith(normalized_leaf):
                 continue
             tooltip_lines = []
             if prompt.description != '':
@@ -1255,7 +1265,7 @@ class DialogAIChat(QtWidgets.QDialog):
         """Return known slash-callable prompt names for the current chat."""
 
         return {
-            str(prompt.name if prompt.name is not None else '').strip('/').casefold()
+            prompt_name_key(str(prompt.name if prompt.name is not None else '').strip('/'))
             for prompt in self._prompt_completion_records
             if str(prompt.name if prompt.name is not None else '').strip('/') != ''
         }
@@ -1264,7 +1274,7 @@ class DialogAIChat(QtWidgets.QDialog):
         """Return prompt records keyed by normalized slash reference name."""
 
         return {
-            str(prompt.name if prompt.name is not None else '').strip('/').casefold(): prompt
+            prompt_name_key(str(prompt.name if prompt.name is not None else '').strip('/')): prompt
             for prompt in self._prompt_completion_records
             if str(prompt.name if prompt.name is not None else '').strip('/') != ''
         }
@@ -1272,7 +1282,7 @@ class DialogAIChat(QtWidgets.QDialog):
     def _resolve_prompt_reference_name(self, prompt_name: str) -> Optional[AgentPromptRecord]:
         """Resolve a slash prompt reference, with chat-type-local fallback for analysis prompts."""
 
-        normalized = str(prompt_name if prompt_name is not None else '').strip('/').casefold()
+        normalized = prompt_name_key(str(prompt_name if prompt_name is not None else '').strip('/'))
         if normalized == '':
             return None
         records_by_name = self._prompt_reference_records_by_name()
@@ -1290,9 +1300,9 @@ class DialogAIChat(QtWidgets.QDialog):
         prefix = prefix_map.get(analysis_type, '')
         if prefix == '':
             return None
-        if normalized.startswith(prefix.casefold()):
+        if normalized.startswith(prompt_name_key(prefix)):
             return None
-        return records_by_name.get((prefix + normalized).casefold())
+        return records_by_name.get(prompt_name_key(prefix + normalized))
 
     def _prompt_reference_tooltip(self, prompt: AgentPromptRecord) -> str:
         """Build tooltip text for a recognized slash prompt reference."""
@@ -1320,7 +1330,7 @@ class DialogAIChat(QtWidgets.QDialog):
             return None
         for match in PROMPT_SLASH_REF_PATTERN.finditer(text):
             if match.start() <= char_pos <= match.end():
-                prompt_name = match.group(0)[1:].rstrip('/.,;:!?').casefold()
+                prompt_name = match.group(0)[1:].rstrip('/.,;:!?')
                 return self._resolve_prompt_reference_name(prompt_name)
         return None
 
@@ -1391,7 +1401,7 @@ class DialogAIChat(QtWidgets.QDialog):
 
         def replace_prompt_ref(match: re.Match) -> str:
             token = match.group(0)
-            prompt_name = token[1:].rstrip('/.,;:!?').casefold()
+            prompt_name = token[1:].rstrip('/.,;:!?')
             placeholder = f"QUALCODER_PROMPT_REF_{len(replacements)}_TOKEN"
             replacements[placeholder] = self._prompt_reference_html_span(
                 token,
@@ -1416,7 +1426,7 @@ class DialogAIChat(QtWidgets.QDialog):
                     placeholder = f"QUALCODER_PROMPT_REF_{len(replacements)}_TOKEN"
                     replacements[placeholder] = self._prompt_reference_html_span(
                         matched_label,
-                        records_by_label.get(matched_label.casefold()),
+                        records_by_label.get(prompt_name_key(matched_label)),
                         style_role=style_role,
                     )
                     return placeholder
@@ -1458,6 +1468,27 @@ class DialogAIChat(QtWidgets.QDialog):
             rendered_html = rendered_html.replace(placeholder, replacement)
         return rendered_html
 
+    def _render_chat_summary(self, summary: str, analysis_type: str) -> str:
+        """Render a chat summary and emphasize topic exploration labels."""
+
+        if str(analysis_type).strip().lower() != 'topic_exploration':
+            return self._render_plain_text_with_prompt_refs(summary, style_role="info")
+
+        labels = set()
+        for translation_key in ('\nDescription:', '\nPrompt:', '\nMaterial:'):
+            labels.add(translation_key.removeprefix('\n'))
+            labels.add(_(translation_key).removeprefix('\n'))
+
+        rendered_lines = []
+        for line in str(summary if summary is not None else '').split('\n'):
+            label = next((item for item in labels if item != '' and line.startswith(item)), None)
+            if label is None:
+                rendered_lines.append(self._render_plain_text_with_prompt_refs(line, style_role="info"))
+                continue
+            rendered_value = self._render_plain_text_with_prompt_refs(line[len(label):], style_role="info")
+            rendered_lines.append(f'<b>{html_lib.escape(label)}</b>{rendered_value}')
+        return '<br />'.join(rendered_lines)
+
     def _open_prompt_record_in_library(self, prompt: AgentPromptRecord):
         """Open one prompt record in the prompt library dialog."""
 
@@ -1482,9 +1513,6 @@ class DialogAIChat(QtWidgets.QDialog):
             }}
         """)
         self._prompt_completion_popup.setFont(self.ui.plainTextEdit_question.font())
-        self.ui.pushButton_help.setIcon(qta.icon('mdi6.help'))
-        self.ui.pushButton_help.setFixedHeight(self.ui.pushButton_delete.height())
-        self.ui.pushButton_help.setFixedWidth(self.ui.pushButton_help.height())
         self.ui.pushButton_undo.setIcon(qta.icon('mdi6.undo'))
         self.ui.pushButton_undo.setFixedHeight(self.ui.pushButton_delete.height())
         self.ui.pushButton_undo.setFixedWidth(self.ui.pushButton_undo.height())
@@ -1493,55 +1521,21 @@ class DialogAIChat(QtWidgets.QDialog):
         self.ui.toolButton_edit_title.setIcon(qta.icon('mdi6.pencil-outline'))
         self.ui.toolButton_edit_title.setIconSize(QtCore.QSize(16, 16))
         doc_font = f'font: {self.app.settings["docfontsize"]}pt \'{self.app.settings["font"]}\';'
-        self.ai_response_color = "#356399"
-        self.ai_user_color = "#287368"
-        self.ai_status_color = "#808080"
-        self.ai_response_style = f'"{doc_font} color: #356399;"'
-        self.ai_user_style = f'"{doc_font} color: #287368;"'
+        light_colors = (AI_RESPONSE_COLORS[0], "#287368", "#666666")
+        dark_colors = (AI_RESPONSE_COLORS[1], "#4EC9B0", "#B5B5B5")
+
+        use_dark_colors = palette_is_dark(self.ui.plainTextEdit_question.palette())
+
+        (
+            self.ai_response_color,
+            self.ai_user_color,
+            self.ai_status_color,
+        ) = dark_colors if use_dark_colors else light_colors
+        self.ai_response_style = f'"{doc_font} color: {self.ai_response_color};"'
+        self.ai_user_style = f'"{doc_font} color: {self.ai_user_color};"'
         self.ai_info_style = f'"{doc_font}"'
-        self.ai_status_style = f'"{doc_font} color: #808080;"'
+        self.ai_status_style = f'"{doc_font} color: {self.ai_status_color};"'
         self.ai_actions_style = f'"{doc_font}"'
-        if self.app.settings['stylesheet'] in ['dark', 'rainbow']:
-            self.ai_response_color = "#8FB1D8"
-            self.ai_user_color = "#35998A"
-            self.ai_status_color = "#B5B5B5"
-            self.ai_response_style = f'"{doc_font} color: {self.ai_response_color};"'
-            self.ai_user_style = f'"{doc_font} color: {self.ai_user_color};"'
-            self.ai_info_style = f'"{doc_font}"'
-            self.ai_status_style = f'"{doc_font} color: {self.ai_status_color};"'
-        elif self.app.settings['stylesheet'] == 'native':
-            # Determine whether dark or light native style is active:
-            style_hints = QGuiApplication.styleHints()
-            # Older versions fot PyQt6 may not have QGuiApplication.styleHints().colorScheme() e.g. PtQ66 vers 6.2.3
-            try:
-                if style_hints.colorScheme() == QtCore.Qt.ColorScheme.Dark:
-                    self.ai_response_color = "#8FB1D8"
-                    self.ai_user_color = "#35998A"
-                    self.ai_status_color = "#B5B5B5"
-                    self.ai_response_style = f'"{doc_font} color: {self.ai_response_color};"'
-                    self.ai_user_style = f'"{doc_font} color: {self.ai_user_color};"'
-                    self.ai_info_style = f'"{doc_font}"'
-                    self.ai_status_style = f'"{doc_font} color: {self.ai_status_color};"'
-                else:
-                    self.ai_response_color = "#356399"
-                    self.ai_user_color = "#287368"
-                    self.ai_status_color = "#808080"
-                    self.ai_response_style = f'"{doc_font} color: {self.ai_response_color};"'
-                    self.ai_user_style = f'"{doc_font} color: {self.ai_user_color};"'
-                    self.ai_info_style = f'"{doc_font}"'
-                    self.ai_status_style = f'"{doc_font} color: {self.ai_status_color};"'
-            except AttributeError as e_:
-                print(f"Using older version of PyQT6? {e_}")
-                logger.debug(f"Using older version of PyQT6? {e_}")
-                pass
-        else:
-            self.ai_response_color = "#356399"
-            self.ai_user_color = "#287368"
-            self.ai_status_color = "#808080"
-            self.ai_response_style = f'"{doc_font} color: {self.ai_response_color};"'
-            self.ai_user_style = f'"{doc_font} color: {self.ai_user_color};"'
-            self.ai_info_style = f'"{doc_font}"'
-            self.ai_status_style = f'"{doc_font} color: {self.ai_status_color};"'
         self.ui.plainTextEdit_question.setStyleSheet(self.ai_user_style[1:-1])
         default_bg_color = self.ui.plainTextEdit_question.palette().color(
             self.ui.plainTextEdit_question.viewport().backgroundRole()
@@ -1573,26 +1567,8 @@ class DialogAIChat(QtWidgets.QDialog):
         self.ui.scrollArea_ai_output.setStyleSheet(f"QScrollArea#scrollArea_ai_output {{ {output_background_style} }}")
         self.ui.scrollArea_ai_output.viewport().setStyleSheet(output_background_style)
         self.ui.scrollArea_ai_output_contents.setStyleSheet(output_background_style)
-        default_panel_color = self.ui.widget_chat.palette().color(self.ui.widget_chat.backgroundRole())
-        combo_background_color = default_panel_color.name()
-        combo_text_color = self.ui.widget_chat.palette().color(QPalette.ColorRole.WindowText).name()
-        if self.app.settings['stylesheet'] not in ('dark', 'rainbow', 'native'):
-            combo_background_color = "#fafafa"
-            combo_text_color = "#000000"
-        combo_style = f"""
-            QComboBox {{
-                background-color: {combo_background_color};
-                color: {combo_text_color};
-            }}
-            QComboBox QAbstractItemView {{
-                background-color: {combo_background_color};
-                color: {combo_text_color};
-            }}
-        """
-        self.ui.comboBox_ai_chats.setStyleSheet(combo_style)
         tree_font = QtGui.QFont(self.app.settings["font"], self.app.settings["treefontsize"], QtGui.QFont.Weight.Normal)
         self.ui.comboBox_ai_chats.view().setFont(tree_font)
-        self.ui.comboBox_ai_permissions.setStyleSheet(combo_style)
         self.update_chat_window()
 
     def refresh_placeholder_if_visible(self) -> None:
@@ -1677,7 +1653,7 @@ class DialogAIChat(QtWidgets.QDialog):
     def init_ai_chat(self, app=None):
         if app is not None:
             self.app = app
-            self.ai_mcp_server = AiMcpServer(self.app)
+            self.ai_mcp_server = self.app.ai_mcp_server
             self.load_ai_permissions()
         self._close_chat_history_connection()
         # init chat history
@@ -1702,6 +1678,7 @@ class DialogAIChat(QtWidgets.QDialog):
                                 msg_type TEXT,
                                 msg_author TEXT,
                                 msg_content TEXT,
+                                date TEXT,
                                 FOREIGN KEY (chat_id) REFERENCES chats(id))''')
         
         cursor.execute('''CREATE TABLE IF NOT EXISTS topic_chat_embeddings (
@@ -1715,6 +1692,10 @@ class DialogAIChat(QtWidgets.QDialog):
         chat_columns = {str(row[1]).strip() for row in cursor.fetchall() if isinstance(row, tuple) and len(row) > 1}
         if 'compaction_frontier_msg_id' not in chat_columns:
             cursor.execute("ALTER TABLE chats ADD COLUMN compaction_frontier_msg_id INTEGER DEFAULT 0")
+        cursor.execute("PRAGMA table_info(chat_messages)")
+        message_columns = {row[1] for row in cursor.fetchall()}
+        if 'date' not in message_columns:
+            cursor.execute("ALTER TABLE chat_messages ADD COLUMN date TEXT")
         self.chat_history_conn.commit()
         self.current_chat_idx = -1
         self.fill_chat_list()
@@ -1786,10 +1767,6 @@ class DialogAIChat(QtWidgets.QDialog):
         self.persist_ai_output_splitter_setting()
         self.reset_for_project_close()
             
-    def help(self):
-        """ Open help in browser. """
-        self.app.help_wiki("5.1.-AI-chat-based-analysis")
-
     def _undo_ai_changes_shortcut(self):
         ai = getattr(self.app, "ai", None)
         if ai is None:
@@ -1809,6 +1786,11 @@ class DialogAIChat(QtWidgets.QDialog):
             except Exception:
                 enabled = False
         self.ui.pushButton_undo.setEnabled(enabled)
+
+    def _on_project_data_changed(self, tables, source):
+        """Refresh Undo after project writes, including external MCP writes."""
+
+        self._update_undo_button_state()
 
     def _get_saved_ai_output_splitter_bottom(self):
         """Return the saved bottom pane height for the AI output splitter."""
@@ -2018,13 +2000,13 @@ class DialogAIChat(QtWidgets.QDialog):
         """Return the icon for one New-menu target."""
 
         if target == 'new_general_chat':
-            return self.app.ai.general_chat_icon()
+            return general_chat_icon(self.app)
         if target == 'new_topic_exploration':
-            return self.app.ai.topic_exploration_icon()
+            return topic_exploration_icon(self.app)
         if target == 'new_text_analysis':
-            return self.app.ai.text_analysis_icon()
+            return text_analysis_icon(self.app)
         if target == 'new_code_analysis':
-            return self.app.ai.code_analysis_icon()
+            return code_analysis_icon(self.app)
         return QtGui.QIcon()
 
     def _create_new_chat_menu(self) -> tuple[QtWidgets.QMenu, dict[str, QtGui.QAction]]:
@@ -2077,6 +2059,8 @@ class DialogAIChat(QtWidgets.QDialog):
     def _popup_new_chat_menu(self, highlight_target: Optional[str] = None) -> None:
         """Show the New-session menu below the button and optionally highlight one entry."""
 
+        if not ensure_ai_ready(self.app, _("AI Agent")):
+            return
         if self._new_chat_popup_menu is not None:
             self._new_chat_popup_menu.close()
         menu, action_map = self._create_new_chat_menu()
@@ -2266,19 +2250,19 @@ class DialogAIChat(QtWidgets.QDialog):
 
             # Creating a new QListWidgetItem
             if str(analysis_type).strip().lower() == 'code_analysis':
-                icon = self.app.ai.code_analysis_icon()
+                icon = code_analysis_icon(self.app)
             elif str(analysis_type).strip().lower() == 'text_analysis':
-                icon = self.app.ai.text_analysis_icon()
+                icon = text_analysis_icon(self.app)
             elif str(analysis_type).strip().lower() == 'topic_exploration':
-                icon = self.app.ai.topic_exploration_icon()
+                icon = topic_exploration_icon(self.app)
             elif self._is_agent_chat_type(analysis_type):
-                icon = self.app.ai.general_chat_icon()
+                icon = general_chat_icon(self.app)
             elif analysis_type == 'topic chat':
-                icon = self.app.ai.topic_exploration_icon()
+                icon = topic_exploration_icon(self.app)
             elif analysis_type == 'text chat':
-                icon = self.app.ai.text_analysis_icon()
+                icon = text_analysis_icon(self.app)
             elif analysis_type == 'code chat':
-                icon = self.app.ai.code_analysis_icon()
+                icon = code_analysis_icon(self.app)
             else: # unknown type, ignore this chat altogether
                 continue
 
@@ -2360,6 +2344,7 @@ class DialogAIChat(QtWidgets.QDialog):
         cursor = self.chat_history_conn.cursor()
         cursor.execute('UPDATE chats SET name = ? WHERE id = ?', (clean_name, chat_id))
         self.chat_history_conn.commit()
+        self._emit_project_table_changes(["chats"])
         updated_chat = (chat[0], clean_name, chat[2], chat[3], chat[4], chat[5])
         self.chat_list[row] = updated_chat
         self._refresh_chat_list_item(row)
@@ -2491,6 +2476,11 @@ class DialogAIChat(QtWidgets.QDialog):
         return success
 
     def new_chat(self, name, analysis_type, summary, analysis_prompt):
+        if self.chat_history_conn is None:
+            if self.app.project_path == "":
+                Message(self.app, _('AI Agent'), _('No project open.'), "warning").exec()
+                return
+            self.init_ai_chat()
         self._clear_stream_preview_buffers()
         date = datetime.now()
         date_text = date.strftime('%Y-%m-%d %H:%M:%S')
@@ -2498,6 +2488,7 @@ class DialogAIChat(QtWidgets.QDialog):
         cursor.execute('''INSERT INTO chats (name, analysis_type, summary, date, analysis_prompt)
                             VALUES (?, ?, ?, ?, ?)''', (name, analysis_type, summary, date_text, analysis_prompt))
         self.chat_history_conn.commit()
+        self._emit_project_table_changes(["chats"])
         self.current_chat_idx = -1
         self.fill_chat_list()
         # select new chat
@@ -2509,6 +2500,8 @@ class DialogAIChat(QtWidgets.QDialog):
     def _can_start_general_chat(self) -> bool:
         """Return whether a general AI chat session can be started now."""
 
+        if not ensure_ai_ready(self.app, _("AI Agent")):
+            return False
         if self.app.project_name == "":
             msg = _('No project open.')
             Message(self.app, _('AI not enabled'), msg, "warning").exec()
@@ -2536,6 +2529,33 @@ class DialogAIChat(QtWidgets.QDialog):
             return
         self._start_general_chat_session(name, summary)
 
+    def new_project_ai_readiness_chat(self) -> None:
+        """Start an MCP-backed agent chat using the project AI-readiness prompt."""
+
+        if not self._can_start_general_chat():
+            return
+        prompt_name = "Check-project-AI-readiness"
+        readiness_prompt = self.agent_prompts_catalog.get_prompt(prompt_name)
+        if readiness_prompt is None:
+            msg = _('The AI-readiness prompt "Check-project-AI-readiness.md" could not be found.')
+            Message(self.app, _('AI Agent'), msg, "warning").exec()
+            return
+
+        chat_idx = self._start_general_chat_session(_('Project AI readiness check'), '')
+        if chat_idx is None or chat_idx < 0:
+            return
+
+        self._persist_agent_prompt_record(chat_idx, readiness_prompt, activation_source='bootstrap')
+        self.history_add_message(
+            'instruct',
+            '',
+            'Perform the activated project AI-readiness assessment now.',
+            chat_idx,
+        )
+        messages = self.history_get_ai_messages_compacted()
+        self._start_mcp_agent_worker(messages, chat_idx, self._mcp_general_chat_worker)
+        self.update_chat_window()
+
     def _support_chat_prompt_name(self) -> str:
         """Return the internal prompt name for Help-menu support sessions."""
 
@@ -2561,15 +2581,6 @@ class DialogAIChat(QtWidgets.QDialog):
 
         if not self._can_start_general_chat():
             return
-        if self.app.ai.is_busy():
-            msg = _('The AI is busy generating a response. Click on the button on the right to stop.')
-            Message(self.app, _('AI busy'), msg, "warning").exec()
-            return
-        if not self.app.ai.is_ready():
-            msg = _('The AI not yet fully loaded. Please wait and retry.')
-            Message(self.app, _('AI not ready'), msg, "warning").exec()
-            return
-
         support_prompt = self.agent_prompts_catalog.get_internal_prompt(self._support_chat_prompt_name())
         if support_prompt is None:
             msg = _('The internal AI support prompt "_help.md" could not be found.')
@@ -2720,7 +2731,7 @@ class DialogAIChat(QtWidgets.QDialog):
         base_prompt = self.agent_prompts_catalog.get_internal_prompt(self._agent_base_prompt_name())
         if base_prompt is not None:
             for prompt in self.agent_prompts_catalog.expand_prompt_references([base_prompt], include_internal=True):
-                prompt_key = str(prompt.name if prompt.name is not None else "").strip().casefold()
+                prompt_key = prompt_name_key(prompt.name)
                 if prompt_key == "" or prompt_key in included_prompt_keys:
                     continue
                 included_prompt_keys.add(prompt_key)
@@ -2729,9 +2740,9 @@ class DialogAIChat(QtWidgets.QDialog):
                     sections.append(prompt_text)
 
         project_memo = extract_ai_memo(self.app.get_project_memo())
-        if len(project_memo) > 0:
+        if project_memo.strip() != "":
             for prompt in self.agent_prompts_catalog.resolve_prompt_references(project_memo):
-                prompt_key = str(prompt.name if prompt.name is not None else "").strip().casefold()
+                prompt_key = prompt_name_key(prompt.name)
                 if prompt_key == "" or prompt_key in included_prompt_keys:
                     continue
                 included_prompt_keys.add(prompt_key)
@@ -2740,10 +2751,15 @@ class DialogAIChat(QtWidgets.QDialog):
                     sections.append(prompt_text)
 
             sections.append(
-                '# Information about the current project\n\n'
-                'Here is some background information about the research project the team is working on:\n'
+                '# Project memo\n\n'
+                'The following block is the current user-authored QualCoder project memo. '
+                'It contains background information about the research project that you are working on.\n\n'
+                '<project_memo>\n'
                 + project_memo
+                + '\n</project_memo>'
             )
+        else:
+            sections.append('# Project memo\n\nThe project memo is currently empty.')
 
         return '\n\n'.join(section for section in sections if section != ""), included_prompt_keys
 
@@ -2824,7 +2840,7 @@ class DialogAIChat(QtWidgets.QDialog):
 
         loaded_prompts: List[AgentPromptRecord] = []
         for prompt in prompts:
-            prompt_key = str(prompt.name if prompt.name is not None else '').strip().casefold()
+            prompt_key = prompt_name_key(prompt.name)
             if prompt_key == '' or prompt_key in base_prompt_keys:
                 continue
             prompt_message = self._build_turn_prompt_message(prompt)
@@ -3225,6 +3241,7 @@ class DialogAIChat(QtWidgets.QDialog):
             chat_idx,
             *worker_args,
             progress_callback=self.ai_mcp_progress_callback,
+            confirmation_callback=self._ai_internal_timeout_confirmation_callback,
             model_kind='large',
             scope_type='chat',
             scope_id=chat_idx,
@@ -3847,7 +3864,7 @@ class DialogAIChat(QtWidgets.QDialog):
             result["tool_messages"] = tool_messages
             return result
         except Exception as err:
-            result["error"] = _('Error during MCP-based topic exploration bootstrap: ') + str(err)
+            result["error"] = _('Error during MCP-based topic exploration bootstrap: ') + self.app.ai._exception_summary(err)
             return result
         finally:
             if ai_change_set_id != "":
@@ -4630,7 +4647,7 @@ class DialogAIChat(QtWidgets.QDialog):
             result["tool_messages"] = tool_messages
             return result
         except Exception as err:
-            result["error"] = _('Error during MCP-based code analysis bootstrap: ') + str(err)
+            result["error"] = _('Error during MCP-based code analysis bootstrap: ') + self.app.ai._exception_summary(err)
             return result
         finally:
             if ai_change_set_id != "":
@@ -4638,6 +4655,8 @@ class DialogAIChat(QtWidgets.QDialog):
 
     def new_text_analysis(self):
         """analyze a piece of text from an empirical document"""
+        if not ensure_ai_ready(self.app, _("AI Text Analysis")):
+            return
         if self.app.project_name == "":
             msg = _('No project open.')
             Message(self.app, _('AI not enabled'), msg, "warning").exec()
@@ -4664,6 +4683,8 @@ class DialogAIChat(QtWidgets.QDialog):
 
     def new_code_analysis(self):
         """Start a new code analysis as an MCP-backed AI agent chat."""
+        if not ensure_ai_ready(self.app, _("Code analysis")):
+            return
         if self.app.project_name == "":
             msg = _('No project open.')
             Message(self.app, _('AI not enabled'), msg, "warning").exec()
@@ -4739,6 +4760,8 @@ data collected. This information will accompany every prompt sent to the AI, res
  
     def new_topic_exploration(self):
         """Start a new topic exploration as an MCP-backed AI agent chat."""
+        if not ensure_ai_ready(self.app, _("Topic exploration")):
+            return
         if self.app.project_name == "":
             msg = _('No project open.')
             Message(self.app, _('AI not enabled'), msg, "warning").exec()
@@ -5434,7 +5457,7 @@ data collected. This information will accompany every prompt sent to the AI, res
             result["tool_messages"] = tool_messages
             return result
         except Exception as err:
-            result["error"] = _('Error during MCP-based text analysis bootstrap: ') + str(err)
+            result["error"] = _('Error during MCP-based text analysis bootstrap: ') + self.app.ai._exception_summary(err)
             return result
         finally:
             if ai_change_set_id != "":
@@ -5443,6 +5466,8 @@ data collected. This information will accompany every prompt sent to the AI, res
     def new_text_chat(self, doc_id, doc_name, text, start_pos, prompt):
         """Start one text analysis chat for the selected text passage."""
 
+        if not ensure_ai_ready(self.app, _("AI Text Analysis")):
+            return
         if self.app.project_name == "":
             msg = _('No project open.')
             Message(self.app, _('AI not enabled'), msg, "warning").exec()
@@ -5534,6 +5559,7 @@ data collected. This information will accompany every prompt sent to the AI, res
             print(e_)
             self.chat_history_conn.rollback()
             raise
+        self._emit_project_table_changes(["chats", "chat_messages"])
         self.current_chat_idx = selected_rows[0]
         self._multi_chat_selection_active = False
         self.fill_chat_list()
@@ -5560,14 +5586,12 @@ data collected. This information will accompany every prompt sent to the AI, res
                 self.ui.pushButton_question.setIcon(spin_icon)
                 self.ui.pushButton_question.setToolTip(_('Cancel AI generation'))
                 self.ui.progressBar_ai.setRange(0, 0)  # Starts the animation
-        # update ai status in the statusBar of the main window
-        if self.app.ai is not None:
-            if self.app.ai.get_status() == 'reading data' and self.app.ai.sources_vectorstore.reading_doc != '':
-                self.main_window.statusBar().showMessage(_('AI: ') + _('reading data') + ' (' + self.app.ai.sources_vectorstore.reading_doc + ')')
-            else:
-                self.main_window.statusBar().showMessage(_('AI: ') + _(self.app.ai.get_status()))
-        else: 
-            self.main_window.statusBar().showMessage('')
+        # Restore the runtime status after temporary menu status tips disappear.
+        external_mcp = getattr(self.main_window, "external_mcp", None)
+        mcp_active = bool(getattr(external_mcp, "is_running", False))
+        self.main_window.statusBar().showMessage(
+            runtime_status_bar_text(self.app, mcp_active)
+        )
 
     def on_ai_output_scroll(self, value):
         """Normally, if the AI is generating text, the scrollArea_ai_output scrolls to the bottom
@@ -5738,7 +5762,7 @@ data collected. This information will accompany every prompt sent to the AI, res
 
                 # Show title
                 html_parts.append(f'<h1 style={self.ai_info_style}>{self._display_chat_name(name, analysis_type)}</h1>')
-                summary_br = self._render_plain_text_with_prompt_refs(summary, style_role="info")
+                summary_br = self._render_chat_summary(summary, analysis_type)
                 display_type = self._display_chat_type_label(analysis_type, preserve_legacy_general=True)
                 if not self._is_agent_chat_type(analysis_type):
                     html_parts.append(
@@ -6187,18 +6211,19 @@ data collected. This information will accompany every prompt sent to the AI, res
             self.ui.scrollArea_ai_output.verticalScrollBar().setValue(self.ui.scrollArea_ai_output.verticalScrollBar().maximum())
             self.ai_output_autoscroll = True
                                 
-    def history_update_message_list(self, db_conn=None):
-        """Update sel.chat_msg_list from the database
+    def history_update_message_list(self, db_conn: Optional[sqlite3.Connection] = None) -> None:
+        """Update self.chat_msg_list from the database.
 
         Args:
-            db_conn: database conncetion, if None, use defaults to self.chat:history_conn
+            db_conn: Database connection; defaults to self.chat_history_conn.
         """
         if self.current_chat_idx > -1:
             curr_chat_id = self.chat_list[self.current_chat_idx][0]
             if db_conn is None:
                 db_conn = self.chat_history_conn 
             cursor = db_conn.cursor()
-            cursor.execute('SELECT * FROM chat_messages WHERE chat_id=? ORDER BY id', (curr_chat_id,))
+            cursor.execute('SELECT id, chat_id, msg_type, msg_author, msg_content '
+                           'FROM chat_messages WHERE chat_id=? ORDER BY id', (curr_chat_id,))
             self.chat_msg_list = cursor.fetchall()
         else:
             self.chat_msg_list.clear()
@@ -6258,7 +6283,7 @@ data collected. This information will accompany every prompt sent to the AI, res
                 prompt_name = str(msg[3] if msg[3] is not None else '').strip()
                 if prompt_name == '':
                     continue
-                if prompt_name.casefold() in base_prompt_keys:
+                if prompt_name_key(prompt_name) in base_prompt_keys:
                     continue
                 msg_id = self._safe_message_id(msg)
                 prev_id = latest_prompt_ids.get(prompt_name, -1)
@@ -6293,6 +6318,7 @@ data collected. This information will accompany every prompt sent to the AI, res
         if base_uri in (
             "qualcoder://codes/tree",
             "qualcoder://documents",
+            "qualcoder://annotations",
             "qualcoder://vector/search",
             "qualcoder://search/bm25",
             "qualcoder://search/regex",
@@ -6301,6 +6327,8 @@ data collected. This information will accompany every prompt sent to the AI, res
         if re.fullmatch(r"qualcoder://documents/text/\d+", base_uri):
             return True
         if re.fullmatch(r"qualcoder://codes/segments/\d+", base_uri):
+            return True
+        if re.fullmatch(r"qualcoder://annotations/\d+", base_uri):
             return True
         return False
 
@@ -6325,6 +6353,10 @@ data collected. This information will accompany every prompt sent to the AI, res
                             summary["hits"] = len(resource_payload.get("hits", []))
                         elif "documents" in resource_payload and isinstance(resource_payload.get("documents"), list):
                             summary["documents"] = len(resource_payload.get("documents", []))
+                        elif "annotations" in resource_payload and isinstance(resource_payload.get("annotations"), list):
+                            summary["annotations"] = len(resource_payload.get("annotations", []))
+                        elif "annotation" in resource_payload and isinstance(resource_payload.get("annotation"), dict):
+                            summary["annotations"] = 1
                         elif "text" in resource_payload:
                             summary["excerpt_chars"] = len(str(resource_payload.get("text", "")))
                             total_length = resource_payload.get("total_length", None)
@@ -6336,6 +6368,8 @@ data collected. This information will accompany every prompt sent to the AI, res
                                 summary["total_hits"] = selection.get("total_hits")
                             if "total_segments" in selection:
                                 summary["total_segments"] = selection.get("total_segments")
+                            if "total_annotations" in selection:
+                                summary["total_annotations"] = selection.get("total_annotations")
                             if "truncated" in selection:
                                 summary["truncated"] = bool(selection.get("truncated", False))
         elif method == "resources/list":
@@ -6399,7 +6433,7 @@ data collected. This information will accompany every prompt sent to the AI, res
                 prompt_name = str(msg[3] if msg[3] is not None else '').strip()
                 if prompt_name == '':
                     continue
-                if prompt_name.casefold() in base_prompt_keys:
+                if prompt_name_key(prompt_name) in base_prompt_keys:
                     continue
                 msg_id = self._safe_message_id(msg)
                 if msg_id != latest_prompt_ids.get(prompt_name, -1):
@@ -6599,7 +6633,24 @@ data collected. This information will accompany every prompt sent to the AI, res
             compact_frontier_msg_id=new_frontier,
         )
 
-    def history_add_message(self, msg_type, msg_author, msg_content, chat_idx=None, db_conn=None, refresh=True, commit=True):
+    def _emit_project_table_changes(self, tables: list[str]) -> None:
+        """Notify other views after committed chat history changes."""
+
+        if getattr(self.app, "project_events", None) is not None:
+            self.app.project_events.emit_table_changes(tables, source=self)
+
+    def history_add_message(self, msg_type: str, msg_author: str, msg_content: str,
+                            chat_idx: Optional[int] = None, db_conn: Optional[sqlite3.Connection] = None,
+                            refresh: bool = True, commit: bool = True) -> None:
+        """Save a timestamped message and optionally commit and refresh the history.
+
+        Args:
+            chat_idx: Chat list index; defaults to the current chat.
+            db_conn: Database connection; defaults to self.chat_history_conn.
+            refresh: Reload the current chat's message list after inserting.
+            commit: Commit now; callers batching writes must notify views after committing.
+        """
+
         if chat_idx is None:
             chat_idx = self.current_chat_idx
         if chat_idx > -1:
@@ -6610,15 +6661,23 @@ data collected. This information will accompany every prompt sent to the AI, res
                 db_conn = self.chat_history_conn
             cursor = db_conn.cursor()
             # Insert new message
-            cursor.execute('INSERT INTO chat_messages (chat_id, msg_type, msg_author, msg_content)'
-                           ' VALUES (?, ?, ?, ?)', (curr_chat_id, msg_type, msg_author, msg_content))
+            date_text = datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S')
+            cursor.execute('INSERT INTO chat_messages (chat_id, msg_type, msg_author, msg_content, date)'
+                           ' VALUES (?, ?, ?, ?, ?)', (curr_chat_id, msg_type, msg_author, msg_content, date_text))
             if commit:
                 db_conn.commit()
+                self._emit_project_table_changes(["chat_messages"])
             if refresh:
                 self.history_update_message_list(db_conn)
 
-    def history_add_or_append_agent_status(self, status_text: str, chat_idx=None, msg_author='ai_agent'):
-        """Persist one agent status line as its own DB row (not merged)."""
+    def history_add_or_append_agent_status(self, status_text: str, chat_idx: Optional[int] = None,
+                                          msg_author: str = 'ai_agent') -> None:
+        """Save a timestamped agent status, skipping immediate duplicates.
+
+        Args:
+            chat_idx: Chat list index; defaults to the current chat.
+            msg_author: AI profile identifier used to attribute the status.
+        """
         if chat_idx is None:
             chat_idx = self.current_chat_idx
         if chat_idx <= -1:
@@ -6643,9 +6702,11 @@ data collected. This information will accompany every prompt sent to the AI, res
             if prev_author == str(msg_author) and prev_content == status_line:
                 return
 
-        cursor.execute('INSERT INTO chat_messages (chat_id, msg_type, msg_author, msg_content)'
-                       ' VALUES (?, ?, ?, ?)', (curr_chat_id, 'agent_status', msg_author, status_line))
+        date_text = datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S')
+        cursor.execute('INSERT INTO chat_messages (chat_id, msg_type, msg_author, msg_content, date)'
+                       ' VALUES (?, ?, ?, ?, ?)', (curr_chat_id, 'agent_status', msg_author, status_line, date_text))
         self.chat_history_conn.commit()
+        self._emit_project_table_changes(["chat_messages"])
 
     def _chat_user_message_count(self, chat_id: int, db_conn=None) -> int:
         """Count persisted user messages for one chat."""
@@ -6771,6 +6832,7 @@ data collected. This information will accompany every prompt sent to the AI, res
             self.chat_history_conn.rollback()
             return
         self.chat_history_conn.commit()
+        self._emit_project_table_changes(["chats"])
 
         row_idx = self.find_chat_idx(chat_id)
         if row_idx is None:
@@ -6790,17 +6852,11 @@ data collected. This information will accompany every prompt sent to the AI, res
             self.send_user_question()
                     
     def send_user_question(self):
-        if self.app.settings['ai_enable'] != 'True':
-            msg = _('The AI is disabled. Go to "AI > Setup Wizard" first.')
-            Message(self.app, _('AI not enabled'), msg, "warning").exec()
-            return
-        elif self.app.ai.is_busy():
+        if self.app.get_ai_status() == 'busy':
             msg = _('The AI is busy generating a response. Click on the button on the right to stop.')
             Message(self.app, _('AI busy'), msg, "warning").exec()
             return
-        elif not self.app.ai.is_ready():
-            msg = _('The AI not yet fully loaded. Please wait and retry.')
-            Message(self.app, _('AI not ready'), msg, "warning").exec()
+        if not ensure_ai_ready(self.app, _("AI Agent")):
             return
         self.ai_output_autoscroll = True
         self._dismiss_prompt_completion(accept=False)
@@ -6920,6 +6976,7 @@ data collected. This information will accompany every prompt sent to the AI, res
                                             messages,
                                             chat_idx,
                                             progress_callback=self.ai_mcp_progress_callback,
+                                            confirmation_callback=self._ai_internal_timeout_confirmation_callback,
                                             model_kind='large',
                                             scope_type='chat',
                                             scope_id=chat_idx,
@@ -7427,7 +7484,6 @@ data collected. This information will accompany every prompt sent to the AI, res
                     "additionalProperties": False,
                 },
             ],
-            "additionalProperties": False,
         }
 
     def _mcp_planner_json_schema(self) -> Dict[str, Any]:
@@ -7645,6 +7701,56 @@ data collected. This information will accompany every prompt sent to the AI, res
         hard_timeout = read_timeout + 60.0
         return soft_timeout, hard_timeout
 
+    @staticmethod
+    def _internal_step_timeout_question(step_name: str, status_kind: str) -> str:
+        """Return the confirmation question for an internal AI step timeout."""
+
+        step_label = str(step_name).strip() or _("Internal step")
+        if str(status_kind).strip().lower() == "reflection":
+            return _(
+                '{step} has reached QualCoder\'s time limit. Do you want to stop the '
+                'reflection and generate a provisional answer from the results collected so far?'
+            ).format(step=step_label)
+        return _(
+            '{step} has reached QualCoder\'s time limit. Do you want to abort the AI process?'
+        ).format(step=step_label)
+
+    def _request_internal_step_timeout_confirmation(self, signals, chat_idx: int,
+                                                    step_name: str, status_kind: str,
+                                                    operation_finished: threading.Event) -> bool:
+        """Ask the GUI thread whether a timed-out internal AI step should stop.
+
+        Args:
+            signals: Worker signals used to reach the GUI thread.
+            chat_idx: Chat index associated with the running AI operation.
+            step_name: User-facing name of the internal step.
+            status_kind: Internal phase, such as planning or reflection.
+            operation_finished: Event set when the timed-out operation finishes.
+
+        Returns:
+            True when the user chose to stop, otherwise False.
+        """
+
+        confirmation_signal = getattr(signals, 'confirmation', None)
+        if confirmation_signal is None or not hasattr(confirmation_signal, 'emit'):
+            return True
+
+        answered = threading.Event()
+        request: Dict[str, Any] = {
+            "chat_idx": chat_idx,
+            "question": self._internal_step_timeout_question(step_name, status_kind),
+            "abort": True,
+            "answered": answered,
+            "operation_finished": operation_finished,
+        }
+        confirmation_signal.emit(request)
+
+        ai_service = getattr(self.app, 'ai', None)
+        while not answered.wait(0.2):
+            if ai_service is not None and ai_service.is_current_run_canceled():
+                return True
+        return bool(request.get("abort", True))
+
     def _invoke_json_llm_with_step_timeout(self, messages: List[Any], schema_name: str = '',
                                            response_schema: Optional[Dict[str, Any]] = None,
                                            context: str = 'mcp_json_control',
@@ -7653,6 +7759,9 @@ data collected. This information will accompany every prompt sent to the AI, res
                                            status_kind: str = '',
                                            signals=None, chat_idx: int = -1) -> Dict[str, Any]:
         """Run one internal JSON LLM step with a visible soft timeout and a hard wall-clock timeout."""
+
+        if status_kind == "reflection":
+            self._emit_mcp_status_text(signals, chat_idx, _("Analyzing..."), status_kind=status_kind)
 
         ai_service = getattr(self.app, 'ai', None)
         if ai_service is None:
@@ -7664,8 +7773,11 @@ data collected. This information will accompany every prompt sent to the AI, res
                 model_kind=model_kind,
             )
 
+        soft_timeout, hard_timeout = self._internal_json_step_timeouts()
+        step_label = str(step_name).strip() or _("Internal step")
         parent_context = ai_service._get_current_run_context()
         parent_run_id = str(getattr(parent_context, 'run_id', '')).strip()
+
         run_context = ai_service._create_run_context(
             model_kind=model_kind,
             purpose='invoke',
@@ -7711,19 +7823,16 @@ data collected. This information will accompany every prompt sent to the AI, res
         )
         thread.start()
 
-        soft_timeout, hard_timeout = self._internal_json_step_timeouts()
-        step_label = str(step_name).strip() or _("Internal step")
         soft_notice_sent = False
-        start_time = time.monotonic()
-
+        deadline = time.monotonic() + hard_timeout
         while not finished.wait(0.2):
             if ai_service.is_current_run_canceled():
                 ai_service._request_cancel_run(run_context)
                 thread.join(1.0)
                 raise AICancelled(parent_run_id if parent_run_id != '' else run_context.run_id)
 
-            elapsed = time.monotonic() - start_time
-            if not soft_notice_sent and elapsed >= soft_timeout:
+            remaining = deadline - time.monotonic()
+            if not soft_notice_sent and remaining <= hard_timeout - soft_timeout:
                 soft_notice_sent = True
                 self._emit_mcp_status_text(
                     signals,
@@ -7732,10 +7841,31 @@ data collected. This information will accompany every prompt sent to the AI, res
                     status_kind=status_kind,
                 )
 
-            if elapsed >= hard_timeout:
-                ai_service._request_cancel_run(run_context)
-                thread.join(2.0)
-                raise TimeoutError(step_label)
+            if remaining <= 0:
+                abort_requested = self._request_internal_step_timeout_confirmation(
+                    signals,
+                    chat_idx,
+                    step_label,
+                    status_kind,
+                    finished,
+                )
+                if ai_service.is_current_run_canceled():
+                    ai_service._request_cancel_run(run_context)
+                    thread.join(1.0)
+                    raise AICancelled(parent_run_id if parent_run_id != '' else run_context.run_id)
+                if finished.is_set():
+                    break
+                if abort_requested:
+                    ai_service._request_cancel_run(run_context)
+                    thread.join(2.0)
+                    raise TimeoutError(step_label)
+                self._emit_mcp_status_text(
+                    signals,
+                    chat_idx,
+                    _('{step} is continuing at your request...').format(step=step_label),
+                    status_kind=status_kind,
+                )
+                deadline = time.monotonic() + hard_timeout
 
         if "error" in error_holder:
             raise error_holder["error"]
@@ -8288,6 +8418,37 @@ data collected. This information will accompany every prompt sent to the AI, res
                             segment_quote,
                             seg.get("context_before", ""),
                             seg.get("context_after", ""),
+                        )
+                    )
+                continue
+
+            if uri == "qualcoder://annotations" or re.fullmatch(r"qualcoder://annotations/\d+", uri):
+                annotation_items = payload.get("annotations", [])
+                if re.fullmatch(r"qualcoder://annotations/\d+", uri):
+                    annotation = payload.get("annotation", None)
+                    annotation_items = [annotation] if isinstance(annotation, dict) else []
+                if not isinstance(annotation_items, list):
+                    continue
+                for annotation in annotation_items:
+                    if not isinstance(annotation, dict):
+                        continue
+                    source_id = self._safe_int(annotation.get("fid", None), -1)
+                    start = self._safe_int(annotation.get("pos0", None), -1)
+                    quote = str(annotation.get("quote", ""))
+                    if source_id <= 0 or start < 0 or quote.strip() == "":
+                        continue
+                    source_name = str(annotation.get("source_name", "")).strip()
+                    if source_name == "":
+                        source_name = self.get_filename(source_id)
+                    quote_truncated = bool(annotation.get("quote_truncated", False))
+                    candidates.extend(
+                        self._build_ref_candidates_for_excerpt(
+                            source_id,
+                            source_name,
+                            start,
+                            quote,
+                            "" if quote_truncated else annotation.get("context_before", ""),
+                            "" if quote_truncated else annotation.get("context_after", ""),
                         )
                     )
                 continue
@@ -9063,7 +9224,7 @@ data collected. This information will accompany every prompt sent to the AI, res
             result["stream_messages"] = final_stream_messages
             result["tool_messages"] = tool_messages
         except Exception as err:
-            result["error"] = _('Error during MCP-based AI agent chat: ') + str(err)
+            result["error"] = _('Error during MCP-based AI agent chat: ') + self.app.ai._exception_summary(err)
         finally:
             if ai_change_set_id != "":
                 self._discard_empty_ai_change_set(ai_change_set_id)
@@ -9115,6 +9276,7 @@ data collected. This information will accompany every prompt sent to the AI, res
                             commit_history=False,
                         )
                 db_conn.commit()
+                self._emit_project_table_changes(["chat_messages"])
                 self.history_update_message_list(db_conn)
             finally:
                 db_conn.close()
@@ -9155,6 +9317,43 @@ data collected. This information will accompany every prompt sent to the AI, res
         )
         self.update_chat_window()
         self._update_undo_button_state()
+
+    def _ai_internal_timeout_confirmation_callback(self, request: Dict[str, Any]) -> None:
+        """Show an internal-step timeout question on the GUI thread."""
+
+        if not isinstance(request, dict):
+            return
+        answered = request.get("answered")
+        try:
+            question = str(request.get("question", "")).strip()
+            if question == "":
+                request["abort"] = True
+                return
+            operation_finished = request.get("operation_finished")
+            if isinstance(operation_finished, threading.Event) and operation_finished.is_set():
+                request["abort"] = False
+                return
+            msg_box = Message(self.app, _('AI timeout'), question, icon='warning')
+            msg_box.setStandardButtons(
+                QtWidgets.QMessageBox.StandardButton.Yes |
+                QtWidgets.QMessageBox.StandardButton.No
+            )
+            msg_box.setDefaultButton(QtWidgets.QMessageBox.StandardButton.No)
+            completion_timer = QtCore.QTimer(msg_box)
+            completion_timer.setInterval(100)
+
+            def close_completed_timeout_dialog() -> None:
+                if isinstance(operation_finished, threading.Event) and operation_finished.is_set():
+                    msg_box.reject()
+
+            completion_timer.timeout.connect(close_completed_timeout_dialog)
+            completion_timer.start()
+            reply = msg_box.exec()
+            completion_timer.stop()
+            request["abort"] = reply == QtWidgets.QMessageBox.StandardButton.Yes
+        finally:
+            if isinstance(answered, threading.Event):
+                answered.set()
 
     def ai_mcp_progress_callback(self, progress_msg):
         """Receive live MCP status updates from the worker thread."""
@@ -9245,7 +9444,7 @@ data collected. This information will accompany every prompt sent to the AI, res
                 self.process_message('info', _('Error: The AI returned an empty result. This may indicate that the AI model is not available at the moment. Try again later or choose a different model.'), chat_idx)
             
     def ai_error_callback(self, exception_type, value, tb_obj):
-        """Called if the AI returns an error"""
+        """Display AI errors and their underlying causes in the chat."""
         self._cancel_pending_stream_render()
         run_id = str(getattr(self, 'current_streaming_run_id', '')).strip()
         partial_response = str(self.app.ai.get_streaming_output(run_id))
@@ -9287,10 +9486,16 @@ data collected. This information will accompany every prompt sent to the AI, res
                 fallback_to_current=True,
             )
             msg = _('Error communicating with ' + ai_model_name + '\n')
-            msg += exception_type.__name__ + ': ' + html_to_text(_safe_to_text(value))
+            if isinstance(value, BaseException):
+                msg += html_to_text(self.app.ai._exception_summary(value))
+            else:
+                msg += exception_type.__name__ + ': ' + html_to_text(_safe_to_text(value))
             if hasattr(value, 'message'):
                 msg += f' {_safe_to_text(getattr(value, "message", ""))}'
-            tb = '\n'.join(traceback.format_tb(tb_obj))
+            if isinstance(value, BaseException):
+                tb = ''.join(traceback.format_exception(exception_type, value, tb_obj))
+            else:
+                tb = '\n'.join(traceback.format_tb(tb_obj))
             if hasattr(value, 'body'):
                 tb += f'\n{_safe_to_text(getattr(value, "body", ""))}\n'
             logger.error(_("Uncaught exception: ") + msg + '\n' + tb)
@@ -9313,6 +9518,14 @@ data collected. This information will accompany every prompt sent to the AI, res
         finally:
             self._clear_chat_ai_profile_snapshot(self.current_streaming_chat_idx)
     
+    def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:
+        """Keep unhandled Escape presses from closing the chat workspace."""
+
+        if event.key() == Qt.Key.Key_Escape:
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
     def eventFilter(self, source, event):
         editor = self.ui.plainTextEdit_question
         editor_viewport = editor.viewport()

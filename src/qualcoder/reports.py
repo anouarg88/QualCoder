@@ -20,7 +20,7 @@ https://qualcoder.wordpress.com/
 https://qualcoder.org/
 """
 
-from copy import copy, deepcopy
+from copy import copy
 import datetime
 import logging
 import openpyxl
@@ -35,7 +35,7 @@ from PyQt6.QtGui import QBrush
 
 from .code_in_all_files import DialogCodeInAllFiles
 from .color_selector import TextColor
-from .GUI.ui_report_comparisons import Ui_Dialog_reportComparisons
+from .GUI.ui_dialog_report_comparisons import Ui_Dialog_reportComparisons
 from .GUI.ui_dialog_report_code_frequencies import Ui_Dialog_reportCodeFrequencies
 from .helpers import Message, ExportDirectoryPathDialog, init_persistent_tree_header, restore_persistent_tree_widths
 from .information import DialogInformation
@@ -59,18 +59,32 @@ class DialogReportCodeFrequencies(QtWidgets.QDialog):
         self.truncated_code_names = True
         self.contains_long_names = False
         self.file_ids = []
+        self.selected_case_names = []
+        self.code_selection_mode = "all"  # all, codes or categories
+        self.selected_cids = []
+        self.selected_catids = []
         self.get_data()
         self.calculate_code_frequencies()
         QtWidgets.QDialog.__init__(self)
         self.ui = Ui_Dialog_reportCodeFrequencies()
         self.ui.setupUi(self)
         self.setWindowFlags(self.windowFlags() & ~QtCore.Qt.WindowType.WindowContextHelpButtonHint)
-        self.ui.pushButton_file_attributes.setIcon(qta.icon('mdi6.variable', options=[{'scale_factor': 1.3}]))
+        self.ui.pushButton_select_codes.setIcon(qta.icon('mdi6.text', options=[{'scale_factor': 1.4}]))
+        self.ui.pushButton_select_codes.setToolTip(_("Select codes"))
+        self.ui.pushButton_select_codes.pressed.connect(self.select_codes)
+        self.ui.pushButton_select_categories.setIcon(qta.icon('mdi6.file-tree', options=[{'scale_factor': 1.4}]))
+        self.ui.pushButton_select_categories.setToolTip(_("Select categories"))
+        self.ui.pushButton_select_categories.pressed.connect(self.select_categories)
+        self.ui.pushButton_select_cases.pressed.connect(self.select_cases)
         self.ui.pushButton_file_attributes.pressed.connect(self.get_files_from_attributes)
-        self.ui.pushButton_exporttext.pressed.connect(self.export_text_file)
-        self.ui.pushButton_exporttext.setIcon(qta.icon('mdi6.export-variant', options=[{'scale_factor': 1.3}]))
-        self.ui.pushButton_export_excel.pressed.connect(self.export_excel_file)
-        self.ui.pushButton_export_excel.setIcon(qta.icon('mdi6.export', options=[{'scale_factor': 1.3}]))
+        self._set_file_filter_buttons(None)
+        self.ui.label_exports.setPixmap(qta.icon('mdi6.export').pixmap(22, 22))
+        # Canonical keys for .ui-defined items, labels may be translated
+        for i, key in enumerate(["", "txt", "xlsx"]):
+            self.ui.comboBox_export.setItemData(i, key)
+        self.ui.comboBox_export.currentIndexChanged.connect(self.export_option_selected)
+        for i, key in enumerate(["az", "za", "10-1", "1-10"]):
+            self.ui.comboBox_sort.setItemData(i, key)
         self.ui.pushButton_select_files.pressed.connect(self.select_files_button)
         font = f'font: {self.app.settings["fontsize"]}pt "{self.app.settings["font"]}";'
         self.setStyleSheet(font)
@@ -84,13 +98,20 @@ class DialogReportCodeFrequencies(QtWidgets.QDialog):
         self.ui.treeWidget.itemExpanded.connect(self.get_collapsed)
         self.ui.treeWidget.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.ui.treeWidget.customContextMenuRequested.connect(self.tree_menu)
-        self.ui.radioButton.clicked.connect(self.sort_by_alphabet)
-        self.ui.radioButton_2.clicked.connect(self.sort_by_totals)
+        self.ui.comboBox_sort.currentIndexChanged.connect(self._refresh_report)
         self.ui.checkBox_source_breakdown.stateChanged.connect(self._toggle_source_columns)
         tree_header = self.ui.treeWidget.header()
         tree_header.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         tree_header.customContextMenuRequested.connect(self._header_menu)
         self.app.project_events.project_data_changed.connect(self._on_project_data_changed)
+
+    def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:
+        """Keep unhandled Escape presses from closing the workspace."""
+
+        if event.key() == QtCore.Qt.Key.Key_Escape:
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def _toggle_source_columns(self):
         """ Show or hide the per-source (text / image / A-V) breakdown columns (2, 3, 4).
@@ -124,6 +145,44 @@ class DialogReportCodeFrequencies(QtWidgets.QDialog):
         elif action in show_actions:
             self.ui.treeWidget.setColumnHidden(show_actions[action], False)
 
+    def _set_file_filter_buttons(self, active, tooltip=""):
+        """ Show which file filter is in use: files, cases, attributes or None. """
+
+        buttons = {
+            'files': (self.ui.pushButton_select_files, 'mdi6.file-outline', 'mdi6.file', 1.2,
+                      _("Select files")),
+            'cases': (self.ui.pushButton_select_cases, 'mdi6.briefcase-outline', 'mdi6.briefcase', 1.4,
+                      _("Select cases")),
+            'attributes': (self.ui.pushButton_file_attributes, 'mdi6.variable', 'mdi6.variable-box', 1.3,
+                           _("Select files by attributes")),
+        }
+        for key, (button, icon_off, icon_on, scale, default_tip) in buttons.items():
+            is_active = key == active
+            button.setIcon(qta.icon(icon_on if is_active else icon_off, options=[{'scale_factor': scale}]))
+            button.setToolTip(tooltip if is_active and tooltip else default_tip)
+        if active != 'attributes':
+            self.attributes = []
+        if active != 'cases':
+            self.selected_case_names = []
+
+    @staticmethod
+    def _names_tooltip(title, names):
+        """ Tooltip text listing up to 20 names. """
+
+        text = title
+        for name in names[:20]:
+            text += f"\n{name}"
+        if len(names) > 20:
+            text += f"\n... ({len(names)})"
+        return text
+
+    def _refresh_report(self):
+        """ Reload data and redraw the tree. """
+
+        self.get_data()
+        self.calculate_code_frequencies()
+        self.fill_tree()
+
     def select_files_button(self):
         """ Report code frequencies for all files or selected files.
         Set:
@@ -133,24 +192,58 @@ class DialogReportCodeFrequencies(QtWidgets.QDialog):
         filenames = self.app.get_filenames()
         if len(filenames) == 0:
             return
-        ui = DialogSelectItems(self.app, filenames, _("Select files to view"), "many")
-        ok = ui.exec()
-        tooltip = _("Files selected: ")
-        self.attributes = []
-        self.ui.pushButton_file_attributes.setToolTip(_("File Attributes"))
-        self.file_ids = []
-        if ok:
-            selected_files = ui.get_selected()  # List of dictionaries
-            files_text = ""
-            for row in selected_files:
-                self.file_ids.append(row['id'])
-                files_text += f"\n{row['name']}"
-            tooltip += files_text
-            if len(self.file_ids) > 0:
-                self.ui.pushButton_select_files.setToolTip(tooltip)
-        self.get_data()
-        self.calculate_code_frequencies()
-        self.fill_tree()
+        selection_list = [{'id': -1, 'name': ''}] + filenames
+        preselected = self.file_ids if not self.attributes and not self.selected_case_names else []
+        ui = DialogSelectItems(self.app, selection_list, _("Select files"), "many", preselected=preselected)
+        if not ui.exec():
+            return
+        selected = ui.get_selected()
+        if not selected or any(row['id'] == -1 for row in selected):
+            self.file_ids = []
+            self._set_file_filter_buttons(None)
+            self.ui.pushButton_select_files.setToolTip(_("All files selected"))
+        else:
+            self.file_ids = [row['id'] for row in selected]
+            tooltip = self._names_tooltip(_("Files selected: "), [row['name'] for row in selected])
+            self._set_file_filter_buttons('files', tooltip)
+        self._refresh_report()
+
+    def select_cases(self):
+        """ Report code frequencies for the files linked to the selected cases.
+        Set:
+            self.file_ids
+        """
+
+        cases = self.app.get_casenames()
+        if not cases:
+            Message(self.app, _("No cases"), _("No cases")).exec()
+            return
+        selection_list = [{'id': -1, 'name': ''}] + cases
+        preselected = [c for c in cases if c['name'] in self.selected_case_names]
+        ui = DialogSelectItems(self.app, selection_list, _("Select cases"), "many", preselected=preselected)
+        if not ui.exec():
+            return
+        selected = ui.get_selected()
+        if not selected or any(row['id'] == -1 for row in selected):
+            self.file_ids = []
+            self._set_file_filter_buttons(None)
+            self._refresh_report()
+            return
+        case_ids = [row['id'] for row in selected]
+        cur = self.app.conn.cursor()
+        placeholders = ",".join("?" * len(case_ids))
+        cur.execute(f"select distinct fid from case_text where caseid in ({placeholders})", case_ids)
+        file_ids = [row[0] for row in cur.fetchall()]
+        if not file_ids:
+            Message(self.app, _("Nothing found") + " " * 20, _("No matching files found")).exec()
+            return
+        self.file_ids = file_ids
+        case_names = [row['name'] for row in selected]
+        tooltip = self._names_tooltip(_("Cases: ") + str(len(case_names)), case_names)
+        tooltip += "\n" + _("Files: ") + str(len(file_ids))
+        self._set_file_filter_buttons('cases', tooltip)
+        self.selected_case_names = case_names
+        self._refresh_report()
 
     def get_files_from_attributes(self):
         """ Select files based on attribute selections.
@@ -161,40 +254,23 @@ class DialogReportCodeFrequencies(QtWidgets.QDialog):
             self.file_ids
         """
 
-        # Clear ui
-        self.ui.pushButton_file_attributes.setToolTip(_("Attributes"))
         ui = DialogSelectAttributeParameters(self.app)
-
         ui.fill_parameters(self.attributes)
-        temp_attributes = deepcopy(self.attributes)
-        self.attributes = []
-
         ok = ui.exec()
         if not ok:
-            self.attributes = temp_attributes
-            self.ui.pushButton_file_attributes.setIcon(
-                qta.icon('mdi6.variable', options=[{'scale_factor': 1.3}]))
-            self.ui.pushButton_file_attributes.setToolTip(_("Attributes"))
-            if self.attributes:
-                self.ui.pushButton_file_attributes.setIcon(qta.icon('mdi6.variable-box', options=[{'scale_factor': 1.3}]))
             return
-        self.attributes = ui.parameters
-        if len(self.attributes) == 1:  # Boolean parameter, no attributes selected
-            self.ui.pushButton_file_attributes.setIcon(
-                qta.icon('mdi6.variable', options=[{'scale_factor': 1.3}]))
-            self.ui.pushButton_file_attributes.setToolTip(_("Attributes"))
-            self.attributes = []
+        if len(ui.parameters) == 1:  # Boolean parameter, no attributes selected
+            if self.attributes:
+                self.file_ids = []
+                self._set_file_filter_buttons(None)
+                self._refresh_report()
             return
         if not ui.result_file_ids:
             Message(self.app, _("Nothing found") + " " * 20, _("No matching files found")).exec()
-            self.ui.pushButton_file_attributes.setIcon(
-                qta.icon('mdi6.variable', options=[{'scale_factor': 1.3}]))
-            self.ui.pushButton_file_attributes.setToolTip(_("Attributes"))
             return
-        self.ui.pushButton_file_attributes.setIcon(qta.icon('mdi6.variable-box', options=[{'scale_factor': 1.3}]))
-        self.ui.pushButton_file_attributes.setToolTip(ui.tooltip_msg)
         self.file_ids = ui.result_file_ids
-        self.ui.pushButton_select_files.setToolTip(_("Select files"))
+        self._set_file_filter_buttons('attributes', ui.tooltip_msg)
+        self.attributes = ui.parameters
         msg = ""
         filenames = self.app.get_filenames()
         for i, f in enumerate(filenames):
@@ -204,9 +280,143 @@ class DialogReportCodeFrequencies(QtWidgets.QDialog):
         if len(ui.result_file_ids) > 20:
             msg += f"\nand more. Total files: {len(ui.result_file_ids)}"
         Message(self.app, _("Files selected by attributes"), msg).exec()
-        self.get_data()
-        self.calculate_code_frequencies()
-        self.fill_tree()
+        self._refresh_report()
+
+    def select_codes(self):
+        """ Limit the report to the selected codes and their nested sub-codes. """
+
+        cur = self.app.conn.cursor()
+        cur.execute("select cid, name from code_name order by lower(name)")
+        codes = [{'id': row[0], 'name': row[1]} for row in cur.fetchall()]
+        if not codes:
+            return
+        selection_list = [{'id': -1, 'name': ''}] + codes
+        preselected = self.selected_cids if self.code_selection_mode == "codes" else []
+        ui = DialogSelectItems(self.app, selection_list, _("Select codes"), "many", preselected=preselected)
+        if not ui.exec():
+            return
+        selected = ui.get_selected()
+        if not selected or any(row['id'] == -1 for row in selected):
+            self.code_selection_mode = "all"
+            self.selected_cids = []
+            self.ui.pushButton_select_codes.setToolTip(_("All codes selected"))
+        else:
+            self.code_selection_mode = "codes"
+            self.selected_cids = [row['id'] for row in selected]
+            self.ui.pushButton_select_codes.setToolTip(
+                self._names_tooltip(_("Codes selected"), [row['name'] for row in selected]))
+        self.selected_catids = []
+        self.ui.pushButton_select_categories.setToolTip(_("Select categories"))
+        self._refresh_report()
+
+    def select_categories(self):
+        """ Limit the report to the selected categories, their sub-categories and codes. """
+
+        cur = self.app.conn.cursor()
+        cur.execute("select catid, name from code_cat order by lower(name)")
+        categories = [{'id': row[0], 'name': row[1]} for row in cur.fetchall()]
+        if not categories:
+            return
+        selection_list = [{'id': -1, 'name': ''}] + categories
+        preselected = self.selected_catids if self.code_selection_mode == "categories" else []
+        ui = DialogSelectItems(self.app, selection_list, _("Select categories"), "many",
+                               preselected=preselected)
+        if not ui.exec():
+            return
+        selected = ui.get_selected()
+        if not selected or any(row['id'] == -1 for row in selected):
+            self.code_selection_mode = "all"
+            self.selected_catids = []
+            self.ui.pushButton_select_categories.setToolTip(_("Select categories"))
+        else:
+            self.code_selection_mode = "categories"
+            self.selected_catids = [row['id'] for row in selected]
+            self.ui.pushButton_select_categories.setToolTip(
+                self._names_tooltip(_("Categories selected"), [row['name'] for row in selected]))
+        self.selected_cids = []
+        self.ui.pushButton_select_codes.setToolTip(_("Select codes"))
+        self._refresh_report()
+
+    def _apply_code_selection(self):
+        """ Prune self.codes and self.categories to the user's code or category selection.
+        Category totals then reflect only the codes shown. """
+
+        if self.code_selection_mode == "all":
+            return
+        code_by_cid = {c['cid']: c for c in self.codes}
+        cat_by_id = {c['catid']: c for c in self.categories}
+
+        def code_catid(code):
+            """ Category of the code or of its top ancestor code. """
+            seen = set()
+            cur = code
+            while cur is not None and cur['cid'] not in seen:
+                seen.add(cur['cid'])
+                if cur['catid'] is not None:
+                    return cur['catid']
+                cur = code_by_cid.get(cur['supercid'])
+            return None
+
+        def expand(start_ids, items, id_key, parent_key):
+            """ Add every descendant id to the starting ids. """
+            keep = set(start_ids)
+            changed = True
+            while changed:
+                changed = False
+                for item in items:
+                    if item[id_key] not in keep and item[parent_key] in keep:
+                        keep.add(item[id_key])
+                        changed = True
+            return keep
+
+        if self.code_selection_mode == "codes":
+            keep_catids = set()
+            keep_cids = expand([cid for cid in self.selected_cids if cid in code_by_cid],
+                               self.codes, 'cid', 'supercid')
+        else:
+            keep_catids = expand([catid for catid in self.selected_catids if catid in cat_by_id],
+                                 self.categories, 'catid', 'supercatid')
+            keep_cids = {c['cid'] for c in self.codes if code_catid(c) in keep_catids}
+        top_catid = {cid: code_catid(code_by_cid[cid]) for cid in keep_cids}
+        codes = []
+        for c in self.codes:
+            if c['cid'] not in keep_cids:
+                continue
+            # A selected sub-code whose parent is not shown hangs from its category
+            if c['supercid'] is not None and c['supercid'] not in keep_cids:
+                c['catid'] = top_catid[c['cid']]
+                c['supercid'] = None
+            codes.append(c)
+            if c['catid'] is not None:
+                keep_catids.add(c['catid'])
+        # Keep the parent chain so the tree keeps its structure
+        for catid in list(keep_catids):
+            seen = set()
+            cat = cat_by_id.get(catid)
+            while cat is not None and cat['supercatid'] is not None and cat['catid'] not in seen:
+                seen.add(cat['catid'])
+                keep_catids.add(cat['supercatid'])
+                cat = cat_by_id.get(cat['supercatid'])
+        self.codes = codes
+        self.categories = [c for c in self.categories if c['catid'] in keep_catids]
+
+    def _selection_summary(self):
+        """ Lines describing the active selections, for exports. """
+
+        lines = []
+        if self.file_ids:
+            lines.append(_("Files: ") + f"{len(self.file_ids)} " + _("selected"))
+        else:
+            lines.append(_("Files: ") + _("All files"))
+        if self.selected_case_names:
+            lines.append(_("Cases: ") + "; ".join(self.selected_case_names))
+        if self.attributes:
+            lines.append(_("Attributes: ") + self.ui.pushButton_file_attributes.toolTip().replace("\n", " "))
+        if self.code_selection_mode == "codes":
+            lines.append(_("Codes selected") + f": {len(self.selected_cids)}")
+        if self.code_selection_mode == "categories":
+            lines.append(_("Categories selected") + f": {len(self.selected_catids)}")
+        return lines
 
     def get_data(self):
         """ Called from init.
@@ -231,6 +441,7 @@ class DialogReportCodeFrequencies(QtWidgets.QDialog):
             self.codes.append({'name': row[0], 'memo': row[1], 'owner': row[2], 'date': row[3],
                                'cid': row[4], 'catid': row[5], 'color': row[6], 'supercid': row[7],
                                'display_list': [row[0], 'cid:' + str(row[4])]})
+        self._apply_code_selection()
         self.coders = []
         cur.execute("select distinct owner from code_text union select distinct owner from code_image union "
                     "select distinct owner from code_av")
@@ -283,6 +494,30 @@ class DialogReportCodeFrequencies(QtWidgets.QDialog):
                         total += 1
                 c['display_list'].append(count)
             c['display_list'].append(total)
+
+        # Roll up each code's counts with all its nested sub-codes, as in the code tree
+        code_by_cid = {c['cid']: c for c in self.codes}
+        self.subcode_children = {}
+        for c in self.codes:
+            if c.get('supercid') is not None and c['supercid'] in code_by_cid:
+                self.subcode_children.setdefault(c['supercid'], []).append(c['cid'])
+        rollup_cache = {}
+
+        def rolled_counts(cid):
+            """ Own counts plus all descendant sub-code counts. Memoized, cycle-safe. """
+            if cid in rollup_cache:
+                return rollup_cache[cid]
+            own = code_by_cid[cid]['display_list'][2:]
+            rollup_cache[cid] = [0] * len(own)  # Re-entry through a cycle adds nothing
+            sums = list(own)
+            for child_cid in self.subcode_children.get(cid, []):
+                for i, n in enumerate(rolled_counts(child_cid)):
+                    sums[i] += n
+            rollup_cache[cid] = sums
+            return sums
+
+        for c in self.codes:
+            c['rollup_list'] = rolled_counts(c['cid'])
 
         # Map each code to the category of its top ancestor code, so a sub-code's codings
         # are counted under the category that its parent code belongs to.
@@ -340,23 +575,17 @@ class DialogReportCodeFrequencies(QtWidgets.QDialog):
             header.append(coder)
         header.append("Total")
 
-    def sort_by_totals(self, ):
-        """ Sort by totals descending. """
+    def export_option_selected(self):
+        """ ComboBox export option selected, routed by the item's canonical key. """
 
-        self.get_data()
-        self.calculate_code_frequencies()
-        self.categories = sorted(self.categories, key=lambda i: (i['display_list'][-1]), reverse=True)
-        self.codes = sorted(self.codes, key=lambda i: (i['display_list'][-1]), reverse=True)
-        self.fill_tree()
-
-    def sort_by_alphabet(self, ):
-        """ Sort alphabetically ascending. """
-
-        self.get_data()
-        self.calculate_code_frequencies()
-        self.categories = sorted(self.categories, key=lambda i: (i['display_list'][0]))
-        self.codes = sorted(self.codes, key=lambda i: (i['display_list'][0]))
-        self.fill_tree()
+        key = self.ui.comboBox_export.currentData()
+        if key in (None, ""):
+            return
+        if key == "txt":
+            self.export_text_file()
+        elif key == "xlsx":
+            self.export_excel_file()
+        self.ui.comboBox_export.setCurrentIndex(0)
 
     def _on_project_data_changed(self, tables, source):
         """Handle project change events from other dialogs.
@@ -372,10 +601,7 @@ class DialogReportCodeFrequencies(QtWidgets.QDialog):
         watched_tables = {"code_cat", "code_name", "code_text", "code_av", "code_image"}
         if watched_tables.isdisjoint(tables):
             return
-        if self.ui.radioButton_2.isChecked():
-            self.sort_by_totals()
-            return
-        self.sort_by_alphabet()
+        self._refresh_report()
 
     def depthgauge(self, item):
         """ Get depth for treewidget item. """
@@ -399,10 +625,8 @@ class DialogReportCodeFrequencies(QtWidgets.QDialog):
         text_ = _("Code frequencies") + "\n"
         text_ += _("Project: ") + f"{self.app.project_name}\n"
         text_ += _("Date: ") + datetime.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S") + "\n"
-        if self.file_ids:
-            text_ += _("Files: ") + f"{len(self.file_ids)} " + _("selected") + "\n"
-        else:
-            text_ += _("Files: ") + _("All files") + "\n"
+        for line in self._selection_summary():
+            text_ += line + "\n"
         text_ += "\n"
         headers = self.ui.treeWidget.headerItem()
         visible_cols = [i for i in range(1, self.ui.treeWidget.columnCount())
@@ -464,14 +688,21 @@ class DialogReportCodeFrequencies(QtWidgets.QDialog):
             cat_chain = [n for n, code_flag in chain if not code_flag]
             code_chain = [n for n, code_flag in chain if code_flag]
             values = []
+            own_values = []  # Own counts only, without the '(branch total)' suffix
             for col in visible_cols:
+                cell_text = item.text(col)
                 try:
-                    values.append(int(item.text(col)))
+                    values.append(int(cell_text))
+                    own_values.append(int(cell_text))
                 except ValueError:
-                    values.append(item.text(col))
+                    values.append(cell_text)
+                    try:
+                        own_values.append(int(cell_text.split(" (")[0]))
+                    except ValueError:
+                        own_values.append(cell_text)
             rows.append({'depth': len(ancestors), 'name': name, 'is_code': is_code,
                          'color': color, 'cat_chain': cat_chain, 'code_chain': code_chain,
-                         'values': values})
+                         'values': values, 'own_values': own_values})
             it += 1
             item = it.value()
 
@@ -489,6 +720,9 @@ class DialogReportCodeFrequencies(QtWidgets.QDialog):
                     value=_("Code frequencies") + " - " + self.app.project_name).font = Font(b=True, size=12)
             ws.cell(column=1, row=2, value=_("Date: ") + date_str)
             ws.cell(column=1, row=3, value=_("Files: ") + files_txt)
+            extra_selection = self._selection_summary()[1:]
+            if extra_selection:
+                ws.cell(column=1, row=4, value=" | ".join(extra_selection))
             header_row = 5
             for col, head in enumerate(header):
                 ws.cell(column=col + 1, row=header_row, value=head).font = Font(b=True)
@@ -545,7 +779,7 @@ class DialogReportCodeFrequencies(QtWidgets.QDialog):
                 ws3.cell(column=max_cat + 1 + j, row=row_i, value=level_name)
             base = max_cat + max_code + 1  # 1-based column of Depth
             ws3.cell(column=base, row=row_i, value=r['depth'] + 1)
-            for off, value in enumerate(r['values']):
+            for off, value in enumerate(r['own_values']):
                 ws3.cell(column=base + 1 + off, row=row_i, value=value)
         for i in range(max_cat + max_code):
             ws3.column_dimensions[get_column_letter(i + 1)].width = 28
@@ -620,6 +854,51 @@ class DialogReportCodeFrequencies(QtWidgets.QDialog):
                 taken.setExpanded(True)
                 moved = True
                 break
+
+    def _code_display_strings(self, code):
+        """ Display texts for a code row; codes with sub-codes show 'own (branch total)'. """
+
+        display_list = [str(code['display_list'][0]), str(code['display_list'][1])]
+        own_counts = code['display_list'][2:]
+        rolled = code.get('rollup_list', own_counts)
+        has_children = code['cid'] in getattr(self, 'subcode_children', {})
+        for own, total in zip(own_counts, rolled):
+            if has_children and total != own:
+                display_list.append(f"{own} ({total})")
+            else:
+                display_list.append(str(own))
+        return display_list
+
+    def _sort_tree_by_totals(self, descending=True):
+        """ Order every tree level by total, then by name. """
+
+        tree = self.ui.treeWidget
+        total_col = tree.columnCount() - 1
+
+        def sort_key(item):
+            text = item.text(total_col)
+            # Codes with sub-codes show 'own (branch total)': sort by the branch total
+            if "(" in text:
+                text = text.split("(")[1].rstrip(")")
+            try:
+                total = int(text)
+            except ValueError:
+                total = 0
+            name = item.toolTip(0) if item.toolTip(0) != "" else item.text(0)
+            return -total if descending else total, name.lower()
+
+        def sort_children(parent):
+            children = parent.takeChildren()
+            children.sort(key=sort_key)
+            parent.addChildren(children)
+            for child in children:
+                sort_children(child)
+
+        top_items = [tree.takeTopLevelItem(0) for _i in range(tree.topLevelItemCount())]
+        top_items.sort(key=sort_key)
+        tree.addTopLevelItems(top_items)
+        for item in top_items:
+            sort_children(item)
 
     def fill_tree(self):
         """ Fill tree widget, top level items are main categories and unlinked codes. """
@@ -696,16 +975,15 @@ class DialogReportCodeFrequencies(QtWidgets.QDialog):
         remove_items = []
         for c in codes:
             if c['catid'] is None:
-                display_list = []
-                for i in c['display_list']:
-                    display_list.append(str(i))
+                display_list = self._code_display_strings(c)
                 if self.truncated_code_names and len(display_list[0]) > 62:
                     display_list[0] = f"{display_list[0][:30]}..{display_list[0][-30:]}"
                     self.contains_long_names = True
                 top_item = QtWidgets.QTreeWidgetItem(display_list)
-                top_item.setBackground(0, QBrush(QtGui.QColor(c['color']), Qt.BrushStyle.SolidPattern))
+                top_item.setIcon(0, qta.icon('mdi6.square-rounded', color=c['color']))
+                '''top_item.setBackground(0, QBrush(QtGui.QColor(c['color']), Qt.BrushStyle.SolidPattern))
                 color = TextColor(c['color']).recommendation
-                top_item.setForeground(0, QBrush(QtGui.QColor(color)))
+                top_item.setForeground(0, QBrush(QtGui.QColor(color)))'''
                 top_item.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
                 top_item.setToolTip(0, c['name'])
                 self.ui.treeWidget.addTopLevelItem(top_item)
@@ -719,23 +997,30 @@ class DialogReportCodeFrequencies(QtWidgets.QDialog):
             item = it.value()
             while item:
                 if item.text(1) == f'catid:{c["catid"]}':
-                    display_list = []
-                    for i in c['display_list']:
-                        display_list.append(str(i))
+                    display_list = self._code_display_strings(c)
                     if self.truncated_code_names and len(display_list[0]) > 62:
                         display_list[0] = f"{display_list[0][:30]}..{display_list[0][-30:]}"
                         self.contains_long_names = True
                     child = QtWidgets.QTreeWidgetItem(display_list)
-                    child.setBackground(0, QBrush(QtGui.QColor(c['color']), Qt.BrushStyle.SolidPattern))
+                    child.setIcon(0, qta.icon('mdi6.square-rounded', color=c['color']))
+                    '''child.setBackground(0, QBrush(QtGui.QColor(c['color']), Qt.BrushStyle.SolidPattern))
                     color = TextColor(c['color']).recommendation
-                    child.setForeground(0, QBrush(QtGui.QColor(color)))
+                    child.setForeground(0, QBrush(QtGui.QColor(color)))'''
                     child.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
                     child.setToolTip(0, c['name'])
                     item.addChild(child)
                 it += 1
                 item = it.value()
         self._nest_subcodes_in_tree()
-        self.ui.treeWidget.sortByColumn(0, QtCore.Qt.SortOrder.AscendingOrder)
+        sort_key = self.ui.comboBox_sort.currentData()
+        if sort_key == "10-1":
+            self._sort_tree_by_totals(descending=True)
+        elif sort_key == "1-10":
+            self._sort_tree_by_totals(descending=False)
+        elif sort_key == "za":
+            self.ui.treeWidget.sortByColumn(0, QtCore.Qt.SortOrder.DescendingOrder)
+        else:
+            self.ui.treeWidget.sortByColumn(0, QtCore.Qt.SortOrder.AscendingOrder)
         restore_persistent_tree_widths(self.ui.treeWidget)
         # Show the full hierarchy expanded (categories, sub-categories, codes and
         # sub-codes), without altering the app-wide collapsed-categories memory.
@@ -829,6 +1114,8 @@ class DialogReportCoderComparisons(QtWidgets.QDialog):
         self.coders = []
         self.selected_coders = []
         self.file_summaries = []
+        self.file_names = {}
+        self.selected_file_ids = None
         self.codes = []
         self.categories = []
         self.truncated_code_names = True
@@ -840,6 +1127,8 @@ class DialogReportCoderComparisons(QtWidgets.QDialog):
         self.setWindowFlags(self.windowFlags() & ~QtCore.Qt.WindowType.WindowContextHelpButtonHint)
         self.ui.pushButton_run.setEnabled(False)
         self.ui.pushButton_run.pressed.connect(self.calculate_statistics)
+        self.ui.pushButton_files.setIcon(qta.icon('mdi6.file-document-multiple-outline', options=[{'scale_factor': 1.4}]))
+        self.ui.pushButton_files.pressed.connect(self.select_files)
         self.ui.pushButton_run.setIcon(qta.icon('mdi6.play', options=[{'scale_factor': 1.4}]))
         self.ui.pushButton_clear.pressed.connect(self.clear_selection)
         self.ui.pushButton_clear.setIcon(qta.icon('mdi6.refresh', options=[{'scale_factor': 1.4}]))
@@ -848,7 +1137,7 @@ class DialogReportCoderComparisons(QtWidgets.QDialog):
         self.ui.pushButton_export.setIcon(qta.icon('mdi6.export', options=[{'scale_factor': 1.4}]))
         self.ui.pushButton_help1.setIcon(qta.icon('mdi6.help'))
         self.ui.pushButton_help1.pressed.connect(self.information)
-        self.ui.label_coders.setPixmap(qta.icon('mdi6.account-multiple').pixmap(26, 28))
+        self.ui.label_selections.setPixmap(qta.icon('mdi6.account-multiple').pixmap(26, 28))
         font = f'font: {self.app.settings["fontsize"]}pt "{self.app.settings["font"]}";'
         self.setStyleSheet(font)
         font = f'font: {self.app.settings["treefontsize"]}pt "{self.app.settings["font"]}";'
@@ -868,14 +1157,24 @@ class DialogReportCoderComparisons(QtWidgets.QDialog):
         self.ui.treeWidget.itemExpanded.connect(self.get_collapsed)
         self.app.project_events.project_data_changed.connect(self._on_project_data_changed)
 
+    def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:
+        """Keep unhandled Escape presses from closing the workspace."""
+
+        if event.key() == QtCore.Qt.Key.Key_Escape:
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
     def get_data(self):
         """ Called from init. gets coders, codes, categories, file_summaries.
         Images and A/V files are not used. """
 
         self.codes, self.categories = self.app.get_codes_categories()
         cur = self.app.conn.cursor()
-        cur.execute("select id, length(fulltext) from source where fulltext is not null")
-        self.file_summaries = cur.fetchall()
+        cur.execute("select id, name, length(fulltext) from source where fulltext is not null")
+        rows = cur.fetchall()
+        self.file_summaries = [(row[0], row[2]) for row in rows]
+        self.file_names = {row[0]: row[1] for row in rows}
         sql = "select owner from  code_image union select owner from code_text union select owner from code_av"
         cur.execute(sql)
         result = cur.fetchall()
@@ -926,7 +1225,9 @@ class DialogReportCoderComparisons(QtWidgets.QDialog):
         """
 
         self.selected_coders = []
+        self.selected_file_ids = None
         self.ui.pushButton_run.setEnabled(False)
+        self.ui.label_files.setText(_("Files: All"))
         it = QtWidgets.QTreeWidgetItemIterator(self.ui.treeWidget)
         item = it.value()
         while item:  # while there is an item in the list
@@ -991,6 +1292,11 @@ class DialogReportCoderComparisons(QtWidgets.QDialog):
         self.text_data = "====" + _("CODER COMPARISON") + "====\n" + _("Selected coders: ")
         self.text_data += self.selected_coders[0] + ", " + self.selected_coders[1] + "\n"
         self.excel_data = []
+        files_description = _("All")
+        if self.selected_file_ids is not None:
+            files_description = _("Selected files: ") + ", ".join(
+                self.file_names.get(fid, str(fid)) for fid in self.selected_file_ids)
+        self.text_data += _("Files: ") + files_description + "\n"
         it = QtWidgets.QTreeWidgetItemIterator(self.ui.treeWidget)
         item = it.value()
         row = 0
@@ -1053,6 +1359,8 @@ class DialogReportCoderComparisons(QtWidgets.QDialog):
         cur = self.app.conn.cursor()
         sql = "select pos0,pos1,fid from code_text where fid=? and cid=? and owner=?"
         for f in self.file_summaries:
+            if self.selected_file_ids is not None and f[0] not in self.selected_file_ids:
+                continue
             cur.execute(sql, [f[0], cid, self.selected_coders[0]])
             result0 = cur.fetchall()
             cur.execute(sql, [f[0], cid, self.selected_coders[1]])
@@ -1106,13 +1414,13 @@ class DialogReportCoderComparisons(QtWidgets.QDialog):
             try:
                 total['agree_coded_only'] = round(100 * total['dual_coded'] / (total['dual_coded'] + total['single_coded']), 2)
             except ZeroDivisionError:
-                total['agree_coded_only'] = "zero div"
+                total['agree_coded_only'] = "n/a"
         else:
-            total['agreement'] = "zero div"
-            total['dual_percent'] = "zero div"
-            total['uncoded_percent'] = "zero div"
-            total['disagreement'] = "zero div"
-            total['agree_coded_only'] = "zero div"
+            total['agreement'] = "n/a"
+            total['dual_percent'] = "n/a"
+            total['uncoded_percent'] = "n/a"
+            total['disagreement'] = "n/a"
+            total['agree_coded_only'] = "n/a"
         # Cohen's Kappa
         '''
         https://en.wikipedia.org/wiki/Cohen%27s_kappa
@@ -1137,7 +1445,7 @@ class DialogReportCoderComparisons(QtWidgets.QDialog):
         BELOW IS BETTER - ONLY LOOKS AT PROPORTIONS OF CODED CHARACTERS
         NEED TO CONFIRM THIS IS THE CORRECT APPROACH
         '''
-        total['kappa'] = "zerodiv"
+        total['kappa'] = "n/a"
         try:
             unique_codings = total['coded0'] + total['coded1'] - total['dual_coded']
             Po = total['dual_coded'] / unique_codings
@@ -1150,6 +1458,28 @@ class DialogReportCoderComparisons(QtWidgets.QDialog):
         except ZeroDivisionError:
             pass
         return total
+
+    def select_files(self):
+        """ Select a subcorpus of text files for the comparison statistics.
+        All text files are used when no subcorpus is selected. """
+
+        data = [{"id": f[0], "name": self.file_names.get(f[0], str(f[0]))} for f in self.file_summaries]
+        if not data:
+            Message(self.app, _("Select files"), _("No text files in this project.")).exec()
+            return
+        preselected = self.selected_file_ids if self.selected_file_ids is not None else [d["id"] for d in data]
+        ui = DialogSelectItems(self.app, data, _("Select files for the comparison subcorpus"), "many",
+                               preselected=preselected, with_checkboxes=True)
+        ui.exec()
+        selected = ui.get_selected()
+        if selected is None:
+            return
+        self.selected_file_ids = [s["id"] for s in selected]
+        if not self.selected_file_ids or len(self.selected_file_ids) == len(self.file_summaries):
+            self.selected_file_ids = None
+            self.ui.label_files.setText(_("Files: All"))
+        else:
+            self.ui.label_files.setText(_("Files: ") + str(len(self.selected_file_ids)))
 
     def get_collapsed(self, item):
         """ On category collapse or expansion signal, find the collapsed parent category items.
@@ -1275,9 +1605,10 @@ class DialogReportCoderComparisons(QtWidgets.QDialog):
                 if self.truncated_code_names and len(c['name']) > 62:
                     top_item.setText(0, f"{c['name'][:30]}..{c['name'][-30:]}")
                     self.contains_long_names = True
-                top_item.setBackground(0, QBrush(QtGui.QColor(c['color']), Qt.BrushStyle.SolidPattern))
+                top_item.setIcon(0, qta.icon('mdi6.square-rounded', color=c['color']))
+                '''top_item.setBackground(0, QBrush(QtGui.QColor(c['color']), Qt.BrushStyle.SolidPattern))
                 color = TextColor(c['color']).recommendation
-                top_item.setForeground(0, QBrush(QtGui.QColor(color)))
+                top_item.setForeground(0, QBrush(QtGui.QColor(color)))'''
                 top_item.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
                 top_item.setToolTip(0, c['name'])
                 self.ui.treeWidget.addTopLevelItem(top_item)
@@ -1295,9 +1626,10 @@ class DialogReportCoderComparisons(QtWidgets.QDialog):
                     if self.truncated_code_names and len(c['name']) > 62:
                         child.setText(0, f"{c['name'][:30]}..{c['name'][-30:]}")
                         self.contains_long_names = True
-                    child.setBackground(0, QBrush(QtGui.QColor(c['color']), Qt.BrushStyle.SolidPattern))
+                    child.setIcon(0, qta.icon('mdi6.square-rounded', color=c['color']))
+                    '''child.setBackground(0, QBrush(QtGui.QColor(c['color']), Qt.BrushStyle.SolidPattern))
                     color = TextColor(c['color']).recommendation
-                    child.setForeground(0, QBrush(QtGui.QColor(color)))
+                    child.setForeground(0, QBrush(QtGui.QColor(color)))'''
                     child.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
                     child.setToolTip(0, c['name'])
                     item.addChild(child)
@@ -1393,3 +1725,4 @@ info = "<b>Agree %</b>" \
        "</p>" \
        "<b>Kappa</b><p>Used to measure inter-rater reliability. " \
        "Calculations are based on this site https://en.wikipedia.org/wiki/Cohen%27s_kappa</p>"
+

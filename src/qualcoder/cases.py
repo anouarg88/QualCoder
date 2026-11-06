@@ -39,6 +39,7 @@ from .add_item_name import DialogAddItemName
 from .case_file_manager import DialogCaseFileManager
 from .confirm_delete import DialogConfirmDelete
 from .GUI.ui_dialog_cases import Ui_Dialog_cases
+from .context_help import open_module_help
 from .helpers import Message, ExportDirectoryPathDialog
 
 from .memo import DialogMemo
@@ -90,8 +91,6 @@ class DialogCases(QtWidgets.QDialog):
         self.ui.pushButton_import_cases.clicked.connect(self.import_cases_and_attributes)
         self.ui.pushButton_export_attributes.setIcon(qta.icon('mdi6.file-export-outline', options=[{'scale_factor': 1.4}]))
         self.ui.pushButton_export_attributes.clicked.connect(self.export_attributes)
-        self.ui.pushButton_help.setIcon(qta.icon('mdi6.help'))
-        self.ui.pushButton_help.pressed.connect(self.help)
         self.ui.textBrowser.setText("")
         self.ui.textBrowser.setAutoFillBackground(True)
         self.ui.textBrowser.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -99,6 +98,8 @@ class DialogCases(QtWidgets.QDialog):
         self.ui.textBrowser.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.ui.textBrowser.customContextMenuRequested.connect(self.text_edit_menu)
         self.insert_nonexisting_attribute_placeholders()
+        self.ui.tableWidget.setShowGrid(False)
+        self.ui.tableWidget.setAlternatingRowColors(True)
         self.ui.tableWidget.itemSelectionChanged.connect(self.count_selected_items)
         self.ui.tableWidget.horizontalHeader().setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
         self.ui.tableWidget.horizontalHeader().customContextMenuRequested.connect(self.table_header_menu)
@@ -251,8 +252,8 @@ class DialogCases(QtWidgets.QDialog):
         if inserted:
             self._emit_project_table_changes(['attribute'])
     def help(self):
-        """ Open help for transcribe section in browser. """
-        self.app.help_wiki("3.3.-Cases")
+        """ Open help in browser. """
+        open_module_help(self.app, self)
 
     # Revise
     def count_selected_items(self):
@@ -845,6 +846,8 @@ class DialogCases(QtWidgets.QDialog):
         action_hide_columns_starting = menu.addAction(_("Hide columns starting with"))
         action_show_columns_starting = menu.addAction(_("Show columns starting with"))
         action = menu.exec(self.ui.tableWidget.mapToGlobal(position))
+        if action is None:  # Dismissed menu: None matches unbuilt actions
+            return
         if action == action_show_all_columns:
             for c in range(0, self.ui.tableWidget.columnCount()):
                 self.ui.tableWidget.setColumnHidden(c, False)
@@ -858,6 +861,8 @@ class DialogCases(QtWidgets.QDialog):
             msg = _("Hide columns starting with:")
             hide_col, ok = QtWidgets.QInputDialog.getText(self, _("Hide Columns"), msg,
                                                             QtWidgets.QLineEdit.EchoMode.Normal)
+            if not ok or hide_col == "":  # Empty prefix matched every column
+                return
             for c in range(1, self.ui.tableWidget.columnCount()):
                 h_text = self.ui.tableWidget.horizontalHeaderItem(c).text()
                 if len(h_text) >= len(hide_col) and hide_col == h_text[:len(hide_col)]:
@@ -867,6 +872,8 @@ class DialogCases(QtWidgets.QDialog):
             msg = _("Show columns starting with:")
             show_col, ok = QtWidgets.QInputDialog.getText(self, _("Show Columns"), msg,
                                                             QtWidgets.QLineEdit.EchoMode.Normal)
+            if not ok or show_col == "":  # Cancel must not rearrange columns
+                return
             for c in range(3, self.ui.tableWidget.columnCount()):
                 h_text = self.ui.tableWidget.horizontalHeaderItem(c).text()
                 if len(h_text) >= len(show_col) and show_col == h_text[:len(show_col)]:
@@ -1114,22 +1121,17 @@ class DialogCases(QtWidgets.QDialog):
                                  'av_text_id': av_text_id})
 
         format_reg = QtGui.QTextCharFormat()
-        brush = QtGui.QBrush(QtGui.QColor(QtCore.Qt.GlobalColor.black))
-        if self.app.settings['stylesheet'] in ('dark', 'rainbow'):
-            brush = QtGui.QBrush(QtGui.QColor("#eeeeee"))
+        brush = self.ui.textBrowser.palette().brush(QtGui.QPalette.ColorRole.Text)
         format_reg.setForeground(brush)
 
         format_bold = QtGui.QTextCharFormat()
         format_bold.setFontWeight(QtGui.QFont.Weight.Bold)
-        brush_bold = QtGui.QBrush(QtGui.QColor(QtCore.Qt.GlobalColor.black))
-        if self.app.settings['stylesheet'] in ('dark', 'rainbow'):
-            brush_bold = QtGui.QBrush(QtGui.QColor("#eeeeee"))
+        brush_bold = self.ui.textBrowser.palette().brush(QtGui.QPalette.ColorRole.Text)
         format_bold.setForeground(brush_bold)
 
-        format_blue = QtGui.QTextCharFormat()
-        format_blue.setFontWeight(QtGui.QFont.Weight.Bold)
-        # This blue colour good on dark and light background
-        format_blue.setForeground(QtGui.QBrush(QtGui.QColor("#9090e3")))
+        format_accent = QtGui.QTextCharFormat()
+        format_accent.setFontWeight(QtGui.QFont.Weight.Bold)
+        format_accent.setForeground(self.ui.textBrowser.palette().brush(QtGui.QPalette.ColorRole.Link))
 
         cursor = self.ui.textBrowser.textCursor()
         for c in display_text:
@@ -1155,7 +1157,7 @@ class DialogCases(QtWidgets.QDialog):
                 cursor.setPosition(pos0, QtGui.QTextCursor.MoveMode.MoveAnchor)
                 pos1 = len(self.ui.textBrowser.toPlainText())
                 cursor.setPosition(pos1, QtGui.QTextCursor.MoveMode.KeepAnchor)
-                cursor.setCharFormat(format_blue)
+                cursor.setCharFormat(format_accent)
                 data = {'pos0': pos0, 'pos1': pos1, 'id': c['fid'], 'mediapath': c['mediapath'],
                         'owner': c['owner'], 'date': c['date'], 'memo': c['memo'], 'name': c['name']}
                 self.display_text_links.append(data)
@@ -1167,7 +1169,7 @@ class DialogCases(QtWidgets.QDialog):
                 cursor.setPosition(pos0, QtGui.QTextCursor.MoveMode.MoveAnchor)
                 pos1 = len(self.ui.textBrowser.toPlainText())
                 cursor.setPosition(pos1, QtGui.QTextCursor.MoveMode.KeepAnchor)
-                cursor.setCharFormat(format_blue)
+                cursor.setCharFormat(format_accent)
                 data = {'pos0': pos0, 'pos1': pos1, 'id': c['fid'], 'mediapath': c['mediapath'],
                         'owner': c['owner'], 'date': c['date'], 'memo': c['memo'], 'name': c['name'],
                         'av_text_id': c['av_text_id']}

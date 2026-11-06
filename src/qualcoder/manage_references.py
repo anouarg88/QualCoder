@@ -23,24 +23,26 @@ https://qualcoder.org/
 
 import datetime
 import os
+from pathlib import Path
 from rispy import TAG_KEY_MAPPING
 import logging
 from operator import itemgetter
-from shutil import copyfile
-import qtawesome as qta
-import re
-
 from PyQt6 import QtWidgets, QtCore, QtGui
+import qtawesome as qta  # see: https://pictogrammers.com/library/mdi/
+import re
+from shutil import copyfile
+import webbrowser
 
 from .GUI.ui_reference_editor import Ui_DialogReferenceEditor
 from .GUI.ui_manage_references import Ui_Dialog_manage_references
 from .confirm_delete import DialogConfirmDelete
 from .information import DialogInformation
-from .helpers import Message, extract_epub_fulltext
+from .helpers import Message, extract_epub_fulltext, ExportDirectoryPathDialog
 from .pdf_preview import DialogPdfPreview
 from .manage_references_import import ATTACHMENT_EXTENSIONS, existing_reference_signatures, \
     reference_signature
 from .ris import Ris, RisImport
+from .select_items import DialogSelectItems
 from .view_av import DialogViewAV
 from .view_image import DialogViewImage
 
@@ -77,7 +79,7 @@ class DialogReferenceManager(QtWidgets.QDialog):
         self.parent_text_edit = parent_text_edit
         # Per import session tri-state: code the highlights of attached PDFs.
         self.pdf_import_code_highlights = None
-        # Attachments imported in the current batch, to update the AI memory once.
+        # Attachments imported in the current batch, to update the search index once.
         self.attachments_imported = 0
         self.files = []
         self.av_dialog_open = None
@@ -95,6 +97,9 @@ class DialogReferenceManager(QtWidgets.QDialog):
         self.ui.tableWidget_files.customContextMenuRequested.connect(self.table_files_menu)
         self.ui.tableWidget_files.horizontalHeader().setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
         self.ui.tableWidget_files.horizontalHeader().customContextMenuRequested.connect(self.table_files_header_menu)
+        self.ui.tableWidget_files.setShowGrid(False)
+        self.ui.tableWidget_files.setAlternatingRowColors(True)
+        self.ui.tableWidget_files.verticalHeader().hide()
         self.ui.tableWidget_refs.setStyleSheet(font2)
         self.ui.tableWidget_refs.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
         self.ui.tableWidget_refs.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
@@ -102,6 +107,9 @@ class DialogReferenceManager(QtWidgets.QDialog):
         self.ui.tableWidget_refs.customContextMenuRequested.connect(self.table_refs_menu)
         self.ui.tableWidget_refs.horizontalHeader().setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
         self.ui.tableWidget_refs.horizontalHeader().customContextMenuRequested.connect(self.table_refs_header_menu)
+        self.ui.tableWidget_refs.setShowGrid(False)
+        self.ui.tableWidget_refs.setAlternatingRowColors(True)
+        self.ui.tableWidget_refs.verticalHeader().hide()
         self.ui.pushButton_import.setIcon(qta.icon('mdi.file-import-outline', options=[{'scale_factor': 1.4}]))
         self.ui.pushButton_import.pressed.connect(self.import_references)
         self.ui.pushButton_link.setIcon(QtGui.QIcon(qta.icon('mdi6.link', options=[{'scale_factor': 1.4}])))
@@ -112,12 +120,10 @@ class DialogReferenceManager(QtWidgets.QDialog):
         self.ui.pushButton_edit_ref.pressed.connect(self.edit_reference)
         self.ui.pushButton_delete_ref.setIcon(qta.icon('mdi6.delete-outline', options=[{'scale_factor': 1.4}]))
         self.ui.pushButton_delete_ref.pressed.connect(self.delete_reference)
-        self.ui.pushButton_delete_unused_refs.setIcon(
-            qta.icon('mdi6.file-document-remove-outline', options=[{'scale_factor': 1.4}]))
-        self.ui.pushButton_delete_unused_refs.setEnabled(False)
-        self.ui.pushButton_delete_unused_refs.hide()
         self.ui.pushButton_auto_link.setIcon(qta.icon('mdi6.magic-staff', options=[{'scale_factor': 1.4}]))
         self.ui.pushButton_auto_link.pressed.connect(self.auto_link_files_to_references)
+        self.ui.pushButton_export.setIcon(qta.icon('mdi6.export', options=[{'scale_factor': 1.4}]))
+        self.ui.pushButton_export.pressed.connect(self.export_references)
 
         self.get_data()
         self.ui.tableWidget_refs.setTabKeyNavigation(False)
@@ -247,10 +253,26 @@ class DialogReferenceManager(QtWidgets.QDialog):
         action_file_view = menu.addAction(_("View file"))
         action_files_asc = menu.addAction(_("Ascending"))
         action_files_desc = menu.addAction(_("Descending"))
+        action_url = None
+        row = self.ui.tableWidget_refs.currentRow()
+        ref_text = self.ui.tableWidget_refs.item(row, 0).text()
+        if ref_text is None:
+            ref_text = ""
+        # Regex HTTP HTTPS protocol
+        regex_http = QtCore.QRegularExpression(
+            r"https?:\/\/(?:www\.)?[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,63}\b(?:[-a-zA-Z0-9()@:%_\+.~#?&\/=]*)")
+        # Regex Protocol optional
+        regex_no_protocol = QtCore.QRegularExpression(r"www\.[a-zA-Z0-9()]{1,63}\b(?:[-a-zA-Z0-9()@:%_\+.~#?&\/=]*)")
+        if regex_no_protocol.match(ref_text).hasMatch() or regex_http.match(ref_text).hasMatch():
+            action_url = menu.addAction(_("Open URL"))
         action_show_all_rows = None
         if self.table_files_rows_hidden:
             action_show_all_rows = menu.addAction(_("Show all rows"))
         action = menu.exec(self.ui.tableWidget_files.mapToGlobal(position))
+        if action is None:  # Dismissed menu: None matches unbuilt actions
+            return
+        if action == action_url:
+            print("fggdgd")
         if action == action_show_all_rows:
             for r in range(0, self.ui.tableWidget_files.rowCount()):
                 self.ui.tableWidget_files.setRowHidden(r, False)
@@ -540,6 +562,8 @@ class DialogReferenceManager(QtWidgets.QDialog):
             action_keywords_descending = menu.addAction(_("Descending"))
 
         action = menu.exec(self.ui.tableWidget_refs.mapToGlobal(position))
+        if action is None:  # Dismissed menu: None matches unbuilt actions
+            return
         if action == action_id_asc:
             sorted_list = sorted(self.refs, key=lambda x: x['risid'])
             self.refs = sorted_list
@@ -643,8 +667,26 @@ class DialogReferenceManager(QtWidgets.QDialog):
         action_copy_to_clipboard = menu.addAction(_("Copy to clipboard"))
         action_copy_apa_to_clipboard = menu.addAction(_("Copy to clipboard.  APA style"))
         action_edit_reference = menu.addAction(_("Edit reference"))
+        action_add_field = menu.addAction(_("Add fields"))
         action_delete_reference = menu.addAction(_("Delete"))
+        action_url = None
+        url = None
+        for ref in self.refs:
+            ref_id = self.ui.tableWidget_refs.item(row, REF_ID).text()
+            if int(ref_id) == ref['risid']:
+                url = ref.get("UR")
+                # Regex HTTP HTTPS protocol
+                regex_http = QtCore.QRegularExpression(
+                    r"^https?:\/\/(?:www\.)?[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,63}\b(?:[-a-zA-Z0-9()@:%_\+.~#?&\/=]*)$")
+                # Regex Protocol optional
+                regex_no_protocol = QtCore.QRegularExpression(
+                    r"^www\.[a-zA-Z0-9()]{1,63}\b(?:[-a-zA-Z0-9()@:%_\+.~#?&\/=]*)$")
+                if url and (regex_no_protocol.match(url).hasMatch() or regex_http.match(url).hasMatch()):
+                    action_url = menu.addAction(_("Open URL"))
+
         action = menu.exec(self.ui.tableWidget_refs.mapToGlobal(position))
+        if action is None:  # Dismissed menu: None matches unbuilt actions
+            return
         if action == action_show_all_rows:
             for r in range(0, self.ui.tableWidget_refs.rowCount()):
                 self.ui.tableWidget_refs.setRowHidden(r, False)
@@ -680,8 +722,78 @@ class DialogReferenceManager(QtWidgets.QDialog):
                     return
         if action == action_edit_reference:
             self.edit_reference()
+            return
         if action == action_delete_reference:
             self.delete_reference()
+            return
+        if action == action_url:
+            webbrowser.open(url)
+            return
+        if action == action_add_field:
+            self.add_fields()
+
+    def add_fields(self):
+        """ Add extra fields to RIS data. """
+
+        ris_id = self.ui.tableWidget_refs.item(self.ui.tableWidget_refs.currentRow(), REF_ID).text()
+        reference = None
+        for r in self.refs:
+            if r['risid'] == int(ris_id):
+                reference = r
+        if reference is None:  # Same guard.
+            return
+        unused_fields = []
+        selection_options =[]
+        for tagkey in TAG_KEY_MAPPING:
+            if tagkey not in reference and tagkey not in ["A4","C1", "C2", "C3", "C4", "C5", "C6", "C7", "C8", "ER", "ID", "JA","JF", "L1", "L2","L4", "UK"]:
+                unused_fields.append({tagkey:TAG_KEY_MAPPING[tagkey]})
+                selection_options.append({"name": f"{tagkey}: {TAG_KEY_MAPPING[tagkey]}"})
+
+        ui = DialogSelectItems(self.app, selection_options, _("Add fields to reference"), "multi")
+        ok = ui.exec()
+        if not ok:
+            return
+        selection = ui.get_selected()
+        if not selection:
+            return
+        cur = self.app.conn.cursor()
+        for s in selection:
+            short_tag, long_tag = s['name'].split(": ")
+            cur.execute("insert into ris (risid,tag,longtag, value) values(?,?,?,'')", [int(ris_id), short_tag, long_tag])
+            self.app.conn.commit()
+        self.get_data()
+        self.app.delete_backup = False
+        self._emit_project_table_changes(['attribute_type'])
+
+    def export_references(self):
+        """ Export references to .ris file. """
+
+        exp_directory = ExportDirectoryPathDialog(self.app, "QC_references.ris")
+        filepath = exp_directory.filepath
+        if filepath is None:
+            return
+        lines = []
+        cur = self.app.conn.cursor()
+        cur.execute("select distinct risid from ris order by risid asc")
+        ris_ids = cur.fetchall()
+        for ris_id in ris_ids:
+            # First RIS key value is TY
+            cur.execute("SELECT value from ris where tag='TY' and risid=?", [ris_id[0]])
+            ty = cur.fetchone()
+            if ty:
+                lines.append(f"TY  - {ty[0]}")
+            else:
+                lines.append("TY  - JOUR")  # JOUR a default value
+            cur.execute("SELECT tag,value from ris where tag != 'TY' and risid=?", [ris_id[0]])
+            res = cur.fetchall()
+            for r in res:
+                lines.append(f"{r[0]}  - {r[1]}")
+            lines.append("ER  - ")  # End record
+        with open(filepath, 'w', encoding='utf-8') as f:
+            for line in lines:
+                print(line, file=f)
+        self.parent_text_edit.append(_("References exported: ") + filepath)
+        Message(self.app, _("References exported"), filepath).exec()
 
     def import_references(self):
         """
@@ -709,19 +821,17 @@ class DialogReferenceManager(QtWidgets.QDialog):
         elif clicked == button_zotero:
             self.import_from_zotero()
 
-    def _update_ai_vectorstore(self):
+    def _update_vectorstore(self):
         """
-        A single pass over the AI memory when the batch is done, instead of one per attachment.
+        A single pass over the search index when the batch is done, instead of one per attachment.
         update_vectorstore() reindexes everything missing in the project in one worker, so it
         covers every imported attachment and queues one job instead of one per file.
         """
 
         if not self.attachments_imported:
             return
-        if self.app.settings.get('ai_enable') != 'True':
-            return
         try:
-            self.app.ai.sources_vectorstore.update_vectorstore()
+            self.app.vectorstore_update()
         except Exception as err:
             logger.warning(f"Attachment vectorstore update failed: {err}")
 
@@ -733,7 +843,7 @@ class DialogReferenceManager(QtWidgets.QDialog):
         self.pdf_import_code_highlights = None  # Asked once.
         self.attachments_imported = 0
         RisImport(self.app, self.parent_text_edit, self)  # self: For dialog and db.
-        self._update_ai_vectorstore()
+        self._update_vectorstore()
         self.get_data()
 
     def import_from_zotero(self):
@@ -745,7 +855,7 @@ class DialogReferenceManager(QtWidgets.QDialog):
         self.attachments_imported = 0
         from .manage_references_import_zotero import ZoteroImport
         ZoteroImport(self.app, self.parent_text_edit, self).run()
-        self._update_ai_vectorstore()
+        self._update_vectorstore()
 
     def _reference_signature(self, tag_value_pairs):
         """
@@ -900,9 +1010,9 @@ class DialogReferenceManager(QtWidgets.QDialog):
             cur.execute("insert into attribute (name, attr_type, value, id, date, owner) "
                         "values(?,'file','',?,?,?)", [a[0], fid, now, self.app.settings['codername']])
         self.app.conn.commit()
-        # The AI memory is not touched per file: import_document queues a worker that rebuilds the
+        # The search index is not touched per file: import_document queues a worker that rebuilds the
         # whole FAISS index, and a batch would queue one rebuild per attachment. Counted here only;
-        # _update_ai_vectorstore does the single pass when the batch ends.
+        # _update_vectorstore does the single pass when the batch ends.
         self.attachments_imported += 1
         if notify:
             self._emit_project_table_changes(['source', 'attribute'])
@@ -1127,9 +1237,9 @@ class DialogReferenceManager(QtWidgets.QDialog):
             ris_item = QtWidgets.QTableWidgetItem(key)
             ris_item.setFlags(ris_item.flags() ^ QtCore.Qt.ItemFlag.ItemIsEditable)
             for tagkey in TAG_KEY_MAPPING:
-                # print(tk, TAG_KEY_MAPPING[tk])
                 if key == tagkey:
-                    ris_item.setToolTip(TAG_KEY_MAPPING[tagkey])
+                    tooltip_longtag = TAG_KEY_MAPPING[tagkey]
+                    ris_item.setToolTip(tooltip_longtag)
             ui_re.tableWidget.setItem(row, 0, ris_item)
             value_item = QtWidgets.QTableWidgetItem(short_dict[key])
             ui_re.tableWidget.setItem(row, 1, value_item)
@@ -1143,6 +1253,12 @@ class DialogReferenceManager(QtWidgets.QDialog):
         cur = self.app.conn.cursor()
         ref_edited = False
         for row, key in enumerate(short_dict):
+            # Check if key is present in ris table, if not, insert it
+            cur.execute("select tag from ris where risid=? and tag=?", [ris_id, key])
+            key_exists = cur.fetchone()
+            if not key_exists:
+                cur.execute("insert into ris (risid,tag,longtag,value) values(?,?,?,'')", [ris_id, key,tooltip_longtag])
+                self.app.conn.commit()
             if ui_re.tableWidget.item(row, 1).text() != short_dict[key]:
                 cur.execute("update ris set value=? where risid=? and tag=?",
                             [ui_re.tableWidget.item(row, 1).text(), ris_id, key])

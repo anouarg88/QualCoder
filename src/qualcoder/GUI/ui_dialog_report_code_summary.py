@@ -65,18 +65,8 @@ class Ui_Dialog_code_summary(object):
     def retranslateUi(self, Dialog_code_summary):
         _translate = QtCore.QCoreApplication.translate
         Dialog_code_summary.setWindowTitle(_translate("Dialog_code_summary", "Code summary"))
-        self.pushButton_search_next.setToolTip(_translate("Dialog_code_summary", "Search for next occurence in results"))
+        self.pushButton_search_next.setToolTip(_translate("Dialog_code_summary", "Search for next occurrence in results"))
         self.lineEdit_search_results.setToolTip(_translate("Dialog_code_summary", "Search results for text"))
         self.label_search_results.setText(_translate("Dialog_code_summary", "Search:"))
         self.label_codes.setText(_translate("Dialog_code_summary", "Code summary report"))
         self.comboBox_stopwords.setToolTip(_translate("Dialog_code_summary", "Select stopwords list by language"))
-
-
-if __name__ == "__main__":
-    import sys
-    app = QtWidgets.QApplication(sys.argv)
-    Dialog_code_summary = QtWidgets.QDialog()
-    ui = Ui_Dialog_code_summary()
-    ui.setupUi(Dialog_code_summary)
-    Dialog_code_summary.show()
-    sys.exit(app.exec())

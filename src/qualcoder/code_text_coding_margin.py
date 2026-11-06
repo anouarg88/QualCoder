@@ -97,6 +97,9 @@ class CodingMargin(QtWidgets.QWidget):
 
         if not self.dialog.file_ or not self.dialog.code_text:
             return None, [], None
+        if getattr(self.dialog, 'ai_search_message_shown', False):
+            # the editor holds a search message, not the file text
+            return None, [], None
 
         current_fid = self.dialog.file_['id']
         important_only = getattr(self.dialog, 'important', False)
@@ -237,6 +240,8 @@ class CodingMargin(QtWidgets.QWidget):
             painter.fillRect(event.rect(), background_color)
             if not self.dialog.file_ or not self.dialog.code_text:
                 return
+            if getattr(self.dialog, 'ai_search_message_shown', False):
+                return
             font = QtGui.QFont(self.dialog.app.settings['font'], 9)
             painter.setFont(font)
 
@@ -366,6 +371,8 @@ class CodingMargin(QtWidgets.QWidget):
         Matches both the coloured stripe and the code name label"""
 
         if not self.dialog.file_ or not self.dialog.code_text:
+            return None
+        if getattr(self.dialog, 'ai_search_message_shown', False):
             return None
 
         ctid_columns, _sorted, current_fid = self._compute_lane_layout()

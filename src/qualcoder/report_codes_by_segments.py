@@ -111,6 +111,14 @@ class DialogCodesBySegments(QtWidgets.QDialog):
         self.xlsx_results = []  # For export
         self.app.project_events.project_data_changed.connect(self._on_project_data_changed)
 
+    def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:
+        """Keep unhandled Escape presses from closing the workspace."""
+
+        if event.key() == QtCore.Qt.Key.Key_Escape:
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
     def get_files_and_cases(self, file_sort="name asc"):
         """ Get text files with additional details and fill files list widget.
         Get cases and fill case list widget
@@ -503,9 +511,10 @@ class DialogCodesBySegments(QtWidgets.QDialog):
                         self.contains_long_names = True
                 top_item = QtWidgets.QTreeWidgetItem([code_name, f'cid:{c["cid"]}', memo])
                 top_item.setToolTip(0, c['name'])
-                top_item.setBackground(0, QBrush(QtGui.QColor(c['color']), Qt.BrushStyle.SolidPattern))
+                top_item.setIcon(0, qta.icon('mdi6.square-rounded', color=c['color']))
+                '''top_item.setBackground(0, QBrush(QtGui.QColor(c['color']), Qt.BrushStyle.SolidPattern))
                 color = TextColor(c['color']).recommendation
-                top_item.setForeground(0, QBrush(QtGui.QColor(color)))
+                top_item.setForeground(0, QBrush(QtGui.QColor(color)))'''
                 top_item.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
                 top_item.setToolTip(0, c['name'])
                 top_item.setToolTip(2, c['memo'])
@@ -530,9 +539,10 @@ class DialogCodesBySegments(QtWidgets.QDialog):
                             code_name = f"{c['name'][:30]}..{c['name'][-30:]}"
                             self.contains_long_names = True
                     child = QtWidgets.QTreeWidgetItem([code_name, f"cid:{c['cid']}", memo])
-                    child.setBackground(0, QBrush(QtGui.QColor(c['color']), Qt.BrushStyle.SolidPattern))
+                    child.setIcon(0, qta.icon('mdi6.square-rounded', color=c['color']))
+                    '''child.setBackground(0, QBrush(QtGui.QColor(c['color']), Qt.BrushStyle.SolidPattern))
                     color = TextColor(c['color']).recommendation
-                    child.setForeground(0, QBrush(QtGui.QColor(color)))
+                    child.setForeground(0, QBrush(QtGui.QColor(color)))'''
                     child.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
                     child.setToolTip(2, c['memo'])
                     item.addChild(child)

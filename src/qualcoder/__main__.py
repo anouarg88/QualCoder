@@ -22,28 +22,59 @@ https://qualcoder.wordpress.com/
 https://qualcoder.org/
 """
 
-import multiprocessing
 import base64
 import datetime
 import gettext
-import json  # To get the latest GitHub release information
+import html
+#import json  # To get the latest GitHub release information
 import logging
 from logging.handlers import RotatingFileHandler
+import multiprocessing
 import os
 from pathlib import Path
 import platform
 import shutil
-import sys
 import sqlite3
-import urllib.request
+import sys
+import traceback
+from typing import Any, Optional
+#import urllib.request
 import webbrowser
+
+if __name__ == "__main__":
+    # Handle frozen child processes and stdio before importing the GUI.
+    multiprocessing.freeze_support()
+    if "--mcp-stdio" in sys.argv[1:]:
+        from qualcoder.mcp_stdio import main as mcp_stdio_main
+        sys.exit(mcp_stdio_main([arg for arg in sys.argv[1:] if arg != "--mcp-stdio"]))
+
+# Hugging Face tokenizers otherwise creates a native Rayon thread pool which can
+# outlive the Qt window in frozen macOS builds and crash during QApplication teardown.
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 from PyQt6 import QtCore, QtGui, QtWidgets
 import qtawesome as qta
-from qualcoder.ai_chat import DialogAIChat
-from qualcoder.ai_prompt_library import DialogAiEditPrompts
 from qualcoder.app import App
+from qualcoder.ai_runtime import (
+    AI_DISABLED,
+    AI_FAILED,
+    AI_INITIALIZING,
+    AI_LOADING,
+    AI_READY,
+    AiImportThread,
+    VECTORSTORE_DISABLED,
+    VECTORSTORE_FAILED,
+    VECTORSTORE_LOADING,
+    VECTORSTORE_UNLOADED,
+    VectorstoreImportThread,
+    ai_runtime_ready,
+    ensure_ai_loaded,
+    ensure_ai_ready,
+    show_ai_runtime_not_ready,
+    vectorstore_required,
+)
 from qualcoder.error_dlg import qt_exception_hook
+from qualcoder.external_mcp import ExternalMcpController
 from qualcoder.attributes import DialogManageAttributes
 from qualcoder.cases import DialogCases
 from qualcoder.code_av import DialogCodeAV
@@ -51,15 +82,19 @@ from qualcoder.code_color_scheme import DialogCodeColorScheme
 from qualcoder.code_organiser import CodeOrganiser
 from qualcoder.code_text import DialogCodeText
 from qualcoder.code_pdf import DialogCodePdf
-from qualcoder.codebook import Codebook
+from qualcoder.codebook import Codebook, ImportPlainTextCodes
+from qualcoder.coder_names import DialogCoderNames
+from qualcoder.context_help import ContextHelp
 from qualcoder.GUI.base64_droidsansmono_helper import DroidSansMono
 from qualcoder.GUI.base64_notosans_helper import NotoSans
 from qualcoder.GUI.ui_main import Ui_MainWindow
-from qualcoder.helpers import get_default_user_directory, Message, ImportPlainTextCodes
+from qualcoder.helpers import ComboWheelGuard, ElidedLabel, get_default_user_directory, Message
 from qualcoder.import_survey import DialogImportSurvey
 from qualcoder.information import DialogInformation, menu_shortcuts_display, coding_shortcuts_display
-from qualcoder.information import manage_tab_info, coding_tab_info, reports_tab_info, render_tab_info_markdown
-from qualcoder.journals import DialogJournals
+from qualcoder.information import project_tab_info, manage_tab_info, coding_tab_info, reports_tab_info, render_tab_info_markdown
+from qualcoder.journals import DialogJournals, JID_COLUMN
+from qualcoder.main_tab_rail import MainTabRail
+from qualcoder.recent_projects_delegate import RecentProjectDelegate, DATE_ROLE, PATH_ROLE
 from qualcoder.manage_files import DialogManageFiles
 from qualcoder.manage_links import DialogManageLinks
 from qualcoder.manage_references import DialogReferenceManager
@@ -80,6 +115,7 @@ from qualcoder.rqda import RqdaImport
 from qualcoder.settings import DialogSettings
 from qualcoder.special_functions import DialogSpecialFunctions
 from qualcoder.taguette_import import TaguetteImport
+from qualcoder.sonal_import import SonalImport
 from qualcoder.view_charts import ViewCharts
 from qualcoder.view_graph import ViewGraph
 from qualcoder.view_image import DialogCodeImage
@@ -129,6 +165,16 @@ BUILTIN_LANGUAGE_LABELS = [
 ]
 
 
+class ProjectOpenError(Exception):
+    """Describe why a selected folder cannot be opened as a QualCoder project."""
+
+    def __init__(self, reason: str, project_path: str, details: str = "") -> None:
+        super().__init__(details)
+        self.reason = reason
+        self.project_path = project_path
+        self.details = details
+
+
 class MainWindow(QtWidgets.QMainWindow):
     """ Main GUI window.
     Project data is stored in a directory with .qda suffix
@@ -151,8 +197,69 @@ class MainWindow(QtWidgets.QMainWindow):
                 return idx
         return -1
 
+    @staticmethod
+    def _open_project_connection(project_path: str) -> tuple[str, sqlite3.Connection]:
+        """Normalize and validate a project path, then open its database.
+
+        Args:
+            project_path: Selected project directory.
+
+        Returns:
+            The normalized project path and an open database connection.
+
+        Raises:
+            ProjectOpenError: The folder or database is not a QualCoder project.
+        """
+
+        # QFileDialog normally returns forward slashes on every platform and much
+        # of QualCoder relies on that internal convention. Path also removes a
+        # trailing separator without converting Windows paths to backslashes.
+        normalized_path = Path(project_path).as_posix()
+        project_directory = Path(normalized_path)
+        if project_directory.suffix.lower() != ".qda":
+            raise ProjectOpenError("wrong_suffix", normalized_path)
+        if not project_directory.is_dir():
+            raise ProjectOpenError("folder_unavailable", normalized_path)
+
+        database_path = project_directory / "data.qda"
+        if not database_path.is_file():
+            raise ProjectOpenError("missing_database", normalized_path)
+
+        try:
+            connection = sqlite3.connect(database_path)
+        except (OSError, sqlite3.Error) as err:
+            raise ProjectOpenError("database_unavailable", normalized_path, str(err)) from err
+
+        try:
+            result = connection.execute(
+                "select databaseversion, date, memo, about from project"
+            ).fetchone()
+            if result is None or not isinstance(result[3], str) or "QualCoder" not in result[3]:
+                raise ProjectOpenError("invalid_database", normalized_path)
+        except ProjectOpenError:
+            connection.close()
+            raise
+        except (IndexError, sqlite3.Error) as err:
+            connection.close()
+            raise ProjectOpenError("invalid_database", normalized_path, str(err)) from err
+
+        try:
+            # Acquire and release a write transaction without changing the database.
+            # This catches read-only, locked, or incompletely downloaded cloud files
+            # before the active project is closed.
+            connection.execute("begin immediate")
+            connection.rollback()
+        except sqlite3.Error as err:
+            connection.close()
+            raise ProjectOpenError("database_unavailable", normalized_path, str(err)) from err
+
+        return normalized_path, connection
+
     def _show_pending_ai_model_upgrade_offer(self) -> None:
         """Show one deferred AI-profile upgrade offer after the main window is visible."""
+
+        if self.app.settings.get('ai_enable', 'False') != 'True':
+            return
 
         offer = getattr(self.app, 'pending_ai_model_upgrade_offer', None)
         if not isinstance(offer, dict) or len(offer) == 0:
@@ -162,14 +269,23 @@ class MainWindow(QtWidgets.QMainWindow):
         suggested_model_name = str(offer.get('suggested_model_name', '')).strip()
         current_index = self._find_ai_model_index_by_name(self.app.ai_models, current_model_name)
         suggested_index = self._find_ai_model_index_by_name(self.app.ai_models, suggested_model_name)
-        if current_index < 0 or suggested_index < 0 or current_index == suggested_index:
+        try:
+            selected_index = int(self.app.settings.get('ai_model_index', -1))
+        except (TypeError, ValueError):
+            selected_index = -1
+        if current_index < 0 or suggested_index < 0 or current_index == suggested_index or \
+                selected_index != current_index:
             self.app.pending_ai_model_upgrade_offer = None
+            self.app.settings['ai_model_upgrade_offer_pending'] = ''
+            self.app.write_config_ini(self.app.settings, self.app.ai_models)
             return
 
         seen_value = str(self.app.settings.get('ai_model_upgrade_offers_seen', '')).strip()
         seen_offers = {item for item in seen_value.split('||') if item != ''}
         if suggested_model_name in seen_offers:
             self.app.pending_ai_model_upgrade_offer = None
+            self.app.settings['ai_model_upgrade_offer_pending'] = ''
+            self.app.write_config_ini(self.app.settings, self.app.ai_models)
             return
 
         current_model = self.app.ai_models[current_index]
@@ -195,6 +311,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if msg_box.clickedButton() == switch_button:
             suggested_model['api_key'] = current_model.get('api_key', '')
             self.app.settings['ai_model_index'] = suggested_index
+        self.app.settings['ai_model_upgrade_offer_pending'] = ''
         self.app.write_config_ini(self.app.settings, self.app.ai_models)
         self.app.pending_ai_model_upgrade_offer = None
 
@@ -204,33 +321,39 @@ class MainWindow(QtWidgets.QMainWindow):
         self.force_quit = force_quit
         self.journal_display = None
         self.ai_chat_window = None
+        self.ai_import_thread = None
+        self.vectorstore_import_thread = None
+        self.ai_initialize_llm_after_load = True
         self.ai_chat_sidebar_mode = False
         self.ai_chat_tab_label = None
         self.ai_chat_tab_sidebar_button = None
         self.last_non_ai_chat_tab = None
         self.project = {"databaseversion": "", "date": "", "memo": "", "about": ""}
         self.recent_projects = []  # a list of recent projects for the qmenu
-
-        if platform.system() == "Windows" and self.app.settings['stylesheet'] == "native":
-            # Make 'Fusion' the standard native style on Windows https://www.qt.io/blog/dark-mode-on-windows-11-with-qt-6.5
-            # The default 'Windows' style seems partially broken at the moment, in combination with the native dark mode.
-            # On macOS, 'Fusion' is the default style anyways (automatically chosen by Qt).
-            QtWidgets.QApplication.instance().setStyle("Fusion")
+        self.project_cards = {}  # Clickable frames in the Project tab mapped to their handlers
+        self.project_panel_colors = {}
+        self.action_log_visible = True
 
         QtWidgets.QMainWindow.__init__(self)
+        self.external_mcp = ExternalMcpController(self.app, self)
+        self.external_mcp.status_changed.connect(self._external_mcp_status_changed)
+        self.external_mcp.start_failed.connect(self._external_mcp_start_failed)
         self.ai_sidebar_splitter_save_timer = QtCore.QTimer(self)
         self.ai_sidebar_splitter_save_timer.setSingleShot(True)
         self.ai_sidebar_splitter_save_timer.timeout.connect(self.persist_ai_sidebar_splitter_setting)
         self.ai_sidebar_splitter_is_restoring = False
         self.ui = Ui_MainWindow()
         self.ui.setupUi(self)
+        # Blend every workspace page into the navigation background, without a tab frame.
+        self.ui.tabWidget.setDocumentMode(True)
+        self.init_action_log()
         self.init_placeholder_tab_layouts()
-        # Test of macOS menu bar
-        if self.app.settings['stylesheet'] == "native":
-            self.ui.menubar.setNativeMenuBar(True)
-        else:
-            self.ui.menubar.setNativeMenuBar(False)
-        self.get_latest_github_release()
+        # Keep platform menu integration consistent across themes.
+        self.ui.menubar.setNativeMenuBar(True)
+        self.ui.textEdit.append(
+                    f'<p><b>{html.escape(self.app.version)}</b> &middot; '
+                    f'<a href="qualcoder://action/about">{html.escape(_("About"))}</a></p>')
+        # self.get_latest_github_release()
         try:
             # Restore main window geometry (size, position, maximized state) from config
             geometry_hex = self.app.settings.get('mainwindow_geometry', '')
@@ -247,63 +370,247 @@ class MainWindow(QtWidgets.QMainWindow):
         QtWidgets.QApplication.processEvents() 
         QtCore.QTimer.singleShot(0, self._restore_ai_splitters_after_show)
         self._show_pending_ai_model_upgrade_offer()
-        # Setup AI
+        # Start expensive AI imports only after this constructor returns and
+        # the normal Qt event loop can keep the visible window responsive.
+        QtCore.QTimer.singleShot(0, self.external_mcp.sync_with_application_state)
+        QtCore.QTimer.singleShot(0, self.start_vectorstore_background_loading)
+        QtCore.QTimer.singleShot(0, self.start_ai_background_loading)
+        QtCore.QTimer.singleShot(0, self._offer_first_ai_setup)
+
+    def start_vectorstore_background_loading(self) -> None:
+        """Load and initialize the shared vectorstore when a consumer needs it."""
+
+        if not vectorstore_required(self.app):
+            if getattr(self.app, "vectorstore", None) is not None:
+                self.app.vectorstore.close()
+            self.app.vectorstore_runtime_state = VECTORSTORE_DISABLED
+            self.app.vectorstore_runtime_error = ""
+            return
+        if getattr(self.app, "vectorstore", None) is not None:
+            self._initialize_shared_vectorstore()
+            return
+        # The full AI loader also imports and constructs the vectorstore. The
+        # dedicated loader is only needed for the MCP-only configuration.
+        if self.app.settings['ai_enable'] == 'True':
+            return
+        if (
+                self.vectorstore_import_thread is not None
+                and self.vectorstore_import_thread.isRunning()
+        ):
+            return
+
+        self.app.vectorstore_runtime_state = VECTORSTORE_LOADING
+        self.app.vectorstore_runtime_error = ""
+        self.ui.textEdit.append(_("Search: Loading components in the background..."))
+        self.vectorstore_import_thread = VectorstoreImportThread(self)
+        self.vectorstore_import_thread.loaded.connect(
+            self._finish_vectorstore_runtime_initialization
+        )
+        self.vectorstore_import_thread.failed.connect(
+            self._vectorstore_runtime_loading_failed
+        )
+        self.vectorstore_import_thread.start(QtCore.QThread.Priority.LowPriority)
+
+    @QtCore.pyqtSlot()
+    def _finish_vectorstore_runtime_initialization(self) -> None:
+        """Construct and initialize the shared vectorstore on the GUI thread."""
+
+        if not vectorstore_required(self.app):
+            self.app.vectorstore_runtime_state = VECTORSTORE_DISABLED
+            self.app.vectorstore_runtime_error = ""
+            return
         try:
-            global AiLLM
-            from qualcoder.ai_llm import AiLLM  # import after showing the UI because this takes several seconds
+            from qualcoder.ai_vectorstore import AiVectorstore
+
+            if getattr(self.app, "vectorstore", None) is None:
+                self.app.vectorstore = AiVectorstore(
+                    self.app,
+                    self.ui.textEdit,
+                    "qualcoder",
+                )
+                self.app.vectorstore_runtime_state = VECTORSTORE_UNLOADED
+                self.app.vectorstore_runtime_error = ""
+            self._initialize_shared_vectorstore()
+        except Exception as err:
+            self._vectorstore_runtime_loading_failed(
+                "".join(traceback.format_exception(type(err), err, err.__traceback__))
+            )
+
+    def _initialize_shared_vectorstore(self) -> None:
+        """Open the project index unless it is already open or being prepared."""
+
+        vectorstore = getattr(self.app, "vectorstore", None)
+        if vectorstore is None or vectorstore.is_open() or vectorstore.ai_worker_running():
+            return
+        vectorstore.init_vectorstore()
+
+    @QtCore.pyqtSlot(str)
+    def _vectorstore_runtime_loading_failed(self, error_text: str) -> None:
+        """Record a failure while importing or constructing the vectorstore."""
+
+        self.app.vectorstore_runtime_state = VECTORSTORE_FAILED
+        self.app.vectorstore_runtime_error = error_text
+        logger.error("Vectorstore background loading failed:\n%s", error_text)
+        self.ui.textEdit.append(
+            _("Search: Components could not be loaded. See the log for details.")
+        )
+
+    def start_ai_background_loading(
+            self, force: bool = False, initialize_llm_after_load: bool = True) -> None:
+        """Preload optional AI packages on a low-priority worker thread."""
+
+        if ai_runtime_ready(self.app):
+            return
+        # Joining an existing load must preserve its initialization intent.
+        # Settings may wait for startup and then be cancelled.
+        if self.ai_import_thread is not None and self.ai_import_thread.isRunning():
+            return
+        if self.app.settings['ai_enable'] != 'True' and not force:
+            self.app.ai_runtime_state = AI_DISABLED
+            return
+        self.ai_initialize_llm_after_load = initialize_llm_after_load
+        self.app.ai_runtime_state = AI_LOADING
+        self.ui.textEdit.append(_("AI: Loading components in the background..."))
+        self.ai_import_thread = AiImportThread(self)
+        self.ai_import_thread.loaded.connect(self._finish_ai_runtime_initialization)
+        self.ai_import_thread.failed.connect(self._ai_runtime_loading_failed)
+        self.ai_import_thread.start(QtCore.QThread.Priority.LowPriority)
+
+    @QtCore.pyqtSlot()
+    def _finish_ai_runtime_initialization(self) -> None:
+        """Construct AI Qt objects on the GUI thread after imports finish."""
+
+        self.app.ai_runtime_state = AI_INITIALIZING
+        try:
+            from qualcoder.ai_llm import AiLLM
+
+            if self.ai_chat_window is None:
+                self.ai_chat()
             self.app.ai = AiLLM(self.app, self.ui.textEdit)
-            # First start? Ask if user wants to enable ai integration or not
-            if self.app.settings['ai_first_startup'] == 'True' and self.app.settings['ai_enable'] == 'False':
-                msg = _('Welcome\n\n\
+            self.app.ai_runtime_state = AI_READY
+            self.app.ai_runtime_error = ""
+            if self.ai_initialize_llm_after_load:
+                self.app.ai.init_llm(self)
+            self.app.write_config_ini(self.app.settings, self.app.ai_models)
+            self.ui.textEdit.append(_("AI: Components loaded."))
+        except Exception as err:
+            self._ai_runtime_loading_failed(
+                "".join(traceback.format_exception(type(err), err, err.__traceback__))
+            )
+
+    @QtCore.pyqtSlot(str)
+    def _ai_runtime_loading_failed(self, error_text: str) -> None:
+        """Keep QualCoder usable when optional AI imports fail."""
+
+        self.app.ai_runtime_state = AI_FAILED
+        self.app.ai_runtime_error = error_text
+        logger.error("AI background loading failed:\n%s", error_text)
+        self.ui.textEdit.append(_("AI: Components could not be loaded. See the log for details."))
+
+    def load_ai_runtime_modal(
+            self, title: str, parent: Optional[QtWidgets.QWidget] = None) -> bool:
+        """Load AI packages in the background while displaying a modal step."""
+
+        if ai_runtime_ready(self.app):
+            return True
+        self.start_ai_background_loading(
+            force=True,
+            initialize_llm_after_load=self.app.settings['ai_enable'] == 'True',
+        )
+        progress = QtWidgets.QProgressDialog(
+            _("Loading AI components..."),
+            "",
+            0,
+            0,
+            parent if parent is not None else self,
+        )
+        progress.setWindowTitle(title)
+        progress.setCancelButton(None)
+        progress.setWindowModality(QtCore.Qt.WindowModality.ApplicationModal)
+        progress.setMinimumDuration(0)
+        poll_timer = QtCore.QTimer(progress)
+
+        def finish_when_loaded() -> None:
+            if self.app.ai_runtime_state not in (AI_LOADING, AI_INITIALIZING):
+                progress.accept()
+
+        poll_timer.timeout.connect(finish_when_loaded)
+        poll_timer.start(50)
+        progress.exec()
+        poll_timer.stop()
+        if ai_runtime_ready(self.app):
+            return True
+        show_ai_runtime_not_ready(self.app, title)
+        return False
+
+    def _offer_first_ai_setup(self) -> None:
+        """Offer the lightweight first-run setup without preloading AI packages."""
+
+        if self.app.settings['ai_first_startup'] != 'True' or self.app.settings['ai_enable'] == 'True':
+            return
+        msg = _('Welcome\n\n\
 The new AI enhanced functions in QualCoder need some additional setup. \
 Do you want to enable the AI and start the setup? \
 You can also do this later by starting the AI Setup Wizard from the AI menu in the main window. \
 Click "Yes" to start now.')
-                msg_box = QtWidgets.QMessageBox(self)
-                msg_box.setWindowTitle(_('AI Integration'))
-                msg_box.setText(msg)
-                msg_box.setStyleSheet(f"* {{font-size:{self.app.settings['fontsize']}pt}} ")
-                msg_box.addButton(QtWidgets.QMessageBox.StandardButton.Yes)
-                msg_box.addButton(QtWidgets.QMessageBox.StandardButton.No)
-                msg_box.addButton(QtWidgets.QMessageBox.StandardButton.Help)
-                reply = None
-                while reply is None or reply == QtWidgets.QMessageBox.StandardButton.Help:
-                    reply = msg_box.exec()
-                    if reply == QtWidgets.QMessageBox.StandardButton.Help:
-                        self.app.help_wiki("2.3.-AI-Setup")                
-                if reply == QtWidgets.QMessageBox.StandardButton.Yes:
-                    self.ai_setup_wizard()  # (will also init the llm)
-            else:
-                self.app.ai.init_llm(self)      
-            self.app.settings['ai_first_startup'] = 'False'
-            self.app.write_config_ini(self.app.settings, self.app.ai_models)
-        except Exception as err:
-            type_e = type(err)
-            value = err
-            tb_obj = err.__traceback__
-            # log the exception and show error msg
-            qt_exception_hook.exception_hook(type_e, value, tb_obj)
+        msg_box = QtWidgets.QMessageBox(self)
+        msg_box.setWindowTitle(_('AI Integration'))
+        msg_box.setText(msg)
+        msg_box.setStyleSheet(f"* {{font-size:{self.app.settings['fontsize']}pt}} ")
+        msg_box.addButton(QtWidgets.QMessageBox.StandardButton.Yes)
+        msg_box.addButton(QtWidgets.QMessageBox.StandardButton.No)
+        msg_box.addButton(QtWidgets.QMessageBox.StandardButton.Help)
+        reply = None
+        while reply is None or reply == QtWidgets.QMessageBox.StandardButton.Help:
+            reply = msg_box.exec()
+            if reply == QtWidgets.QMessageBox.StandardButton.Help:
+                self.app.help_wiki("2.3.-AI-Setup")
+        if reply == QtWidgets.QMessageBox.StandardButton.Yes:
+            self.ai_setup_wizard()
+        self.app.settings['ai_first_startup'] = 'False'
+        self.app.write_config_ini(self.app.settings, self.app.ai_models)
 
     def init_placeholder_tab_layouts(self):
         """Put the startup placeholder browsers into real tab layouts."""
 
         self.tab_placeholders = {
+            self.ui.tab_action_log: self.ui.textBrowser_project,
             self.ui.tab_manage: self.ui.textBrowser_manage,
             self.ui.tab_coding: self.ui.textBrowser_coding,
             self.ui.tab_reports: self.ui.textBrowser_reports,
         }
         for tab_widget, placeholder in self.tab_placeholders.items():
-            layout = tab_widget.layout()
-            if layout is None:
-                layout = QtWidgets.QVBoxLayout(tab_widget)
-                layout.setContentsMargins(9, 9, 9, 9)
-            if layout.indexOf(placeholder) == -1:
-                layout.addWidget(placeholder)
+            # The project placeholder already lives in the Project tab splitter.
+            if placeholder.parentWidget() is tab_widget:
+                layout = tab_widget.layout()
+                if layout is None:
+                    layout = QtWidgets.QVBoxLayout(tab_widget)
+                    layout.setContentsMargins(9, 9, 9, 9)
+                if layout.indexOf(placeholder) == -1:
+                    layout.addWidget(placeholder)
             placeholder.setOpenExternalLinks(False)
             placeholder.setOpenLinks(False)
             placeholder.anchorClicked.connect(self.handle_placeholder_link)
             placeholder.show()
         self.update_placeholder_tab_styles()
+
+    @QtCore.pyqtSlot(str)
+    def _external_mcp_status_changed(self, message: str) -> None:
+        """Show External MCP lifecycle information in the action log."""
+
+        logger.info(message)
+        if getattr(self, "ui", None) is not None and hasattr(self.ui, "textEdit"):
+            endpoint = html.escape(self.external_mcp.endpoint)
+            message_html = html.escape(message).replace(endpoint, '<br />' + endpoint)
+            self.ui.textEdit.append(f'<p>{message_html}</p>')
+
+    @QtCore.pyqtSlot(str)
+    def _external_mcp_start_failed(self, message: str) -> None:
+        """Make failed MCP activation visible even outside the action log."""
+
+        dialog = Message(self.app, _("External MCP"), message, "warning")
+        dialog.setTextFormat(QtCore.Qt.TextFormat.PlainText)
+        dialog.exec()
 
     @staticmethod
     def _object_name_aliases(object_name):
@@ -501,17 +808,16 @@ Click "Yes" to start now.')
     def update_placeholder_tab_styles(self):
         """Match placeholder browser colors and link styling to the application theme."""
 
-        action_log_background = self.ui.textEdit.viewport().palette().color(
-            QtGui.QPalette.ColorRole.Base
-        ).name()
-        text_color = self.ui.textEdit.viewport().palette().color(QtGui.QPalette.ColorRole.Text).name()
+        workspace_palette = self.ui.tabWidget.palette()
+        workspace_background = workspace_palette.color(QtGui.QPalette.ColorRole.Window).name()
+        text_color = workspace_palette.color(QtGui.QPalette.ColorRole.WindowText).name()
         browser_style = f"""
             QTextBrowser {{
-                background-color: {action_log_background};
+                background-color: {workspace_background};
                 border: none;
             }}
             QTextBrowser:focus {{
-                background-color: {action_log_background};
+                background-color: {workspace_background};
                 border: none;
             }}
         """
@@ -519,13 +825,14 @@ Click "Yes" to start now.')
             placeholder.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
             placeholder.setFrameShadow(QtWidgets.QFrame.Shadow.Plain)
             placeholder.viewport().setStyleSheet(
-                f"background-color: {action_log_background}; border: none;"
+                f"background-color: {workspace_background}; border: none;"
             )
             placeholder.setStyleSheet(browser_style)
             placeholder.document().setDefaultStyleSheet(
                 f"a {{ color: {text_color}; }} "
                 f"a:visited {{ color: {text_color}; }}"
             )
+        self.update_project_panel_styles()
         self.refresh_placeholder_tab_content()
 
     def refresh_placeholder_tab_content(self):
@@ -541,10 +848,11 @@ Click "Yes" to start now.')
         if placeholder is None:
             return
         highlight_color = self.app.highlight_color()
-        text_color = self.ui.textEdit.viewport().palette().color(QtGui.QPalette.ColorRole.Text).name()
+        text_color = self.ui.tabWidget.palette().color(QtGui.QPalette.ColorRole.WindowText).name()
         doc_font_size = self.app.settings["docfontsize"]
         doc_font_family = self.app.settings.get("docfont", self.app.settings["font"])
         placeholder_map = {
+            self.ui.tab_action_log: (project_tab_info, "mdi6.folder-outline"),
             self.ui.tab_manage: (manage_tab_info, "mdi6.file-outline"),
             self.ui.tab_coding: (coding_tab_info, "mdi6.tag-text-outline"),
             self.ui.tab_reports: (reports_tab_info, "mdi6.format-list-group"),
@@ -565,6 +873,8 @@ Click "Yes" to start now.')
     def clear_tab_widgets(self, tab_widget, show_placeholder=True):
         """Remove loaded tab content and optionally show the placeholder browser."""
 
+        if tab_widget is self.ui.tab_action_log:
+            return  # The Project tab never hosts module widgets
         layout = tab_widget.layout()
         if layout is None:
             return
@@ -595,17 +905,18 @@ Click "Yes" to start now.')
         self.fill_recent_projects_menu_actions()
         self.ui.actionProject_Memo.triggered.connect(self.project_memo)
         self.ui.actionProject_Memo.setShortcut('Ctrl+M')
-        self.ui.actionClose_Project.triggered.connect(self.close_project)
+        self.ui.actionClose_Project.triggered.connect(self.close_project_requested)
         self.ui.actionClose_Project.setShortcut('Alt+X')
         self.ui.actionSettings.triggered.connect(self.change_settings)
         self.ui.actionSettings.setShortcut('Alt+S')
-        self.ui.actionProject_summary.triggered.connect(self.project_summary_report)
+        self.ui.actionProject_summary.triggered.connect(self.project_summary_requested)
         self.ui.actionProject_Exchange_Export.triggered.connect(self.refi_project_export)
         self.ui.actionREFI_Codebook_export.triggered.connect(self.refi_codebook_export)
         self.ui.actionREFI_Codebook_import.triggered.connect(self.refi_codebook_import)
         self.ui.actionREFI_QDA_Project_import.triggered.connect(self.refi_project_import)
         self.ui.actionRQDA_Project_import.triggered.connect(self.rqda_project_import)
         self.ui.actionTaguette_import.triggered.connect(self.taguette_project_import)
+        self.ui.actionSonal_import.triggered.connect(self.sonal_project_import)
         self.ui.actionExport_codebook.triggered.connect(self.codebook)
         self.ui.actionExport_codebook_with_memos.triggered.connect(self.codebook_with_memos)
         self.ui.actionExit.triggered.connect(self.close)
@@ -647,6 +958,9 @@ Click "Yes" to start now.')
         self.ui.actionText_segments_by_codes.triggered.connect(self.text_segments_codes_table)
         self.ui.actionView_Graph.setShortcut('Alt+G')
         self.ui.actionView_Graph.triggered.connect(self.view_graph_original)
+        self.ui.actionAI_topic_exploration.triggered.connect(self.ai_go_analysis)
+        self.ui.actionAI_text_analysis.triggered.connect(self.ai_go_analysis)
+        self.ui.actionAI_code_analysis.triggered.connect(self.ai_go_analysis)
         # Reports menu
         self.ui.actionCoding_comparison.setShortcut('Alt+L')
         self.ui.actionCoding_comparison.triggered.connect(self.report_coding_comparison)
@@ -674,6 +988,7 @@ Click "Yes" to start now.')
         self.ui.actionAI_Agent_Sidebar.setCheckable(True)
         self.ui.actionAI_Agent_Sidebar.toggled.connect(self.toggle_ai_chat_sidebar)
         self.ui.actionAI_Search_and_Coding.triggered.connect(self.ai_go_search)
+        self.ui.actionCheck_project_AI_readiness.triggered.connect(self.ai_check_project_readiness)
         self.ui.tabWidget.currentChanged.connect(self.remember_last_non_ai_chat_tab)
         # Help menu
         self.ui.actionContents.setShortcut('Alt+H')
@@ -691,31 +1006,875 @@ Click "Yes" to start now.')
         self.ui.splitter.setCollapsible(1, False)
         self.ui.sidebar.setMinimumWidth(0)
         self.ui.splitter.splitterMoved.connect(self.on_main_splitter_moved)
-        self.settings_report()
         
         self.ui.tabWidget.setCurrentIndex(0)
         self.last_non_ai_chat_tab = self.ui.tab_action_log
         self.ai_chat()
-
         self.refresh_placeholder_tab_content()
 
         # Add tab widget icons
         try:
-            self.ui.tabWidget.setTabIcon(0, qta.icon('mdi6.cog', color=self.app.highlight_color()))  # Action Log
+            self.ui.tabWidget.setTabIcon(0, qta.icon('mdi6.folder-outline', color=self.app.highlight_color()))  # Project
             self.ui.tabWidget.setTabIcon(1, qta.icon('mdi6.file-outline', color=self.app.highlight_color()))  # Manage
             self.ui.tabWidget.setTabIcon(2, qta.icon('mdi6.tag-text-outline', color=self.app.highlight_color()))  # Coding
             self.ui.tabWidget.setTabIcon(3, qta.icon('mdi6.format-list-group', color=self.app.highlight_color()))  # Reports
             self.ui.tabWidget.setTabIcon(4, qta.icon('mdi6.message-processing-outline', color=self.app.highlight_color()))  # Ai Chat
         except Exception as e_:
             logger.log(e_)
-        self._setup_ai_chat_tab_sidebar_button()
+        self.ai_tab_icon = self.ui.tabWidget.tabIcon(self.ui.tabWidget.indexOf(self.ui.tab_ai_agent))
+        self.main_tab_rail = MainTabRail(self.ui.tabWidget, lambda: self.app.highlight_color())
+        self._setup_main_tab_context_menu()
+        self.apply_main_tabs_position()
+        self.init_project_panel()
         self.update_ai_menu_options()
-        
+
+    def init_project_panel(self):
+        """Wire the project cards, recent projects list and log toggle in the Project tab."""
+
+        self.project_cards = {
+            self.ui.frame_new_project: lambda: self.activate_project_panel_action(
+                self.ui.actionCreate_New_Project, self.ui.label_project_title),
+            self.ui.frame_open_project: lambda: self.activate_project_panel_action(
+                self.ui.actionOpen_Project, self.ui.label_project_title),
+        }
+        for card in self.project_cards:
+            card.installEventFilter(self)
+            for child in card.findChildren(QtWidgets.QWidget):
+                child.setAttribute(QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+                child.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
+        combo = self.ui.comboBox_recent_projects
+        combo.setItemDelegate(RecentProjectDelegate(self.recent_project_colors, combo))
+        combo.activated.connect(self.open_recent_project_from_combo)
+        # Wheel and arrow keys on the closed combo must not open another project
+        combo.installEventFilter(self)
+        # Own chevron, so the arrow follows the theme colours
+        self.recent_projects_arrow = QtWidgets.QLabel(combo)
+        self.recent_projects_arrow.setAttribute(QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        arrow_layout = QtWidgets.QHBoxLayout(combo)
+        arrow_layout.setContentsMargins(0, 0, 8, 0)
+        arrow_layout.addStretch()
+        arrow_layout.addWidget(self.recent_projects_arrow)
+        files_label = self.ui.label_project_summary_files
+        for link_label in (files_label, self.ui.label_project_summary_warning):
+            link_label.setTextFormat(QtCore.Qt.TextFormat.RichText)
+            link_label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.LinksAccessibleByMouse |
+                                              QtCore.Qt.TextInteractionFlag.LinksAccessibleByKeyboard)
+        files_label.linkActivated.connect(self.open_coding_for_file_type)
+        self.ui.label_project_summary_warning.linkActivated.connect(self.project_summary_warning_link)
+        # Project contents refresh after database changes and when the Project tab is shown
+        self.project_summary_timer = QtCore.QTimer(self)
+        self.project_summary_timer.setSingleShot(True)
+        self.project_summary_timer.setInterval(300)
+        self.project_summary_timer.timeout.connect(self.update_project_summary_panel)
+        self.project_summary_dirty = True
+        self.project_summary_check_links = True
+        self.project_summary_events = None
+        self.connect_project_summary_events()
+        self.ui.tabWidget.currentChanged.connect(self.project_tab_shown)
+        QtGui.QGuiApplication.instance().applicationStateChanged.connect(self.application_state_changed)
+        self.ui.pushButton_action_log.toggled.connect(self.set_action_log_visible)
+        self.ui.pushButton_hide_side_panel.clicked.connect(lambda: self.set_side_panel_visible(False))
+        self.ui.pushButton_show_side_panel.clicked.connect(lambda: self.set_side_panel_visible(True))
+        self.set_side_panel_visible(self.app.settings.get('project_side_panel', 'True') != 'False', persist=False)
+        self.build_project_summary_tiles()
+        self.build_recent_activity_rows()
+        self.update_project_panel_styles()
+        # New users see the guide, everyone else the action log
+        self.set_action_log_visible(bool(self.recent_projects), persist=False)
+
+    def update_project_panel_styles(self):
+        """Match the project cards and recent list to the current theme and highlight colour."""
+
+        if not hasattr(self.ui, "frame_new_project"):
+            return
+        palette = self.ui.textEdit.viewport().palette()
+        base = palette.color(QtGui.QPalette.ColorRole.Base)
+        text = palette.color(QtGui.QPalette.ColorRole.Text)
+        highlight = QtGui.QColor(self.app.highlight_color())
+
+        def blend(first, second, ratio):
+            return QtGui.QColor(
+                round(first.red() * ratio + second.red() * (1 - ratio)),
+                round(first.green() * ratio + second.green() * (1 - ratio)),
+                round(first.blue() * ratio + second.blue() * (1 - ratio)),
+            )
+
+        border = blend(text, base, 0.25).name()
+        secondary = blend(text, base, 0.6).name()
+        self.project_panel_colors = {"text": text.name(), "secondary": secondary, "border": border}
+        # Scale the log panel with the font
+        metrics = QtGui.QFontMetrics(QtGui.QFont(self.app.settings['font'], int(self.app.settings['fontsize'])))
+        self.ui.frame_log_panel.setFixedWidth(max(320, metrics.horizontalAdvance("M") * 22))
+        font_size = int(self.app.settings['fontsize'])
+        self.ui.label_project_title.setStyleSheet(
+            f"color: {text.name()}; font-size: {font_size + 12}pt; font-weight: bold; background: transparent;")
+        for label in (self.ui.label_recent_activity, self.ui.label_project_summary, self.ui.label_log_title):
+            label.setStyleSheet(f"color: {text.name()}; font-size: {font_size + 1}pt; background: transparent;")
+        try:
+            self.ui.label_project_icon.setPixmap(qta.icon('mdi6.folder-outline', color=highlight.name()).pixmap(44, 44))
+        except Exception as err:
+            logger.debug(str(err))
+        card_icons = {
+            self.ui.frame_new_project: (self.ui.label_new_project_icon, "mdi6.folder-plus-outline"),
+            self.ui.frame_open_project: (self.ui.label_open_project_icon, "mdi6.folder-open-outline"),
+        }
+        for card, (icon_label, icon_name) in card_icons.items():
+            name = card.objectName()
+            card.setStyleSheet(
+                f"QFrame#{name} {{background-color: {base.name()}; border: 1px solid {border}; border-radius: 10px;}}"
+                f"QFrame#{name}:hover {{border: 1px solid {highlight.name()};}}"
+                f"QFrame#{name}:focus {{border: 2px solid {highlight.name()};}}"
+                f"QFrame#{name} QLabel {{background-color: transparent; border: none; color: {text.name()};}}"
+            )
+            try:
+                icon_label.setPixmap(qta.icon(icon_name, color=highlight.name()).pixmap(26, 26))
+            except Exception as err:
+                logger.debug(str(err))
+        for label in (self.ui.label_new_project_description, self.ui.label_open_project_description,
+                      self.ui.label_project_summary_files, self.ui.label_project_summary_empty,
+                      self.ui.label_recent_activity_empty):
+            label.setStyleSheet(f"color: {secondary}; background-color: transparent; border: none;")
+        self.project_panel_colors["highlight"] = highlight.name()
+        self.project_panel_colors["base"] = base.name()
+        self.ui.textEdit.document().setDefaultStyleSheet(
+            f"p {{margin-top: 0; margin-bottom: 8px;}} a {{color: {highlight.name()};}}")
+        tint = f"rgba({highlight.red()}, {highlight.green()}, {highlight.blue()}, 18)"
+        self.ui.comboBox_recent_projects.setStyleSheet(
+            f"QComboBox#comboBox_recent_projects {{background-color: {base.name()}; color: {text.name()};"
+            f" border: 1px solid {border}; border-radius: 8px; padding: 4px 30px 4px 10px;}}"
+            f"QComboBox#comboBox_recent_projects:hover {{border: 1px solid {highlight.name()};}}"
+            f"QComboBox#comboBox_recent_projects:focus {{border: 2px solid {highlight.name()};}}"
+            f"QComboBox#comboBox_recent_projects::drop-down {{subcontrol-origin: padding;"
+            f" subcontrol-position: center right; width: 22px; border: none;}}"
+            f"QComboBox#comboBox_recent_projects::down-arrow {{image: none; width: 0px; height: 0px;}}"
+            f"QComboBox#comboBox_recent_projects QAbstractItemView {{background-color: {base.name()};"
+            f" border: 1px solid {border}; outline: none;}}"
+        )
+        hover = f"rgba({highlight.red()}, {highlight.green()}, {highlight.blue()}, 22)"
+        for frame in (self.ui.frame_project_summary, self.ui.frame_recent_activity):
+            name = frame.objectName()
+            frame.setStyleSheet(
+                f"QFrame#{name} {{background-color: {base.name()}; border: 1px solid {border}; border-radius: 10px;}}"
+                f"QFrame#{name} QLabel {{background-color: transparent; border: none;}}"
+                f"QFrame[summary_tile=\"true\"] {{background-color: {tint}; border: 1px solid transparent;"
+                f" border-radius: 8px;}}"
+                f"QFrame[summary_tile=\"true\"][clickable=\"true\"]:hover {{border: 1px solid {highlight.name()};}}"
+                f"QFrame[summary_tile=\"true\"][clickable=\"true\"]:focus {{border: 2px solid {highlight.name()};}}"
+                f"QFrame[activity_row=\"true\"] {{background-color: transparent; border: 1px solid transparent;"
+                f" border-radius: 8px;}}"
+                f"QFrame[activity_row=\"true\"]:hover {{background-color: {hover}; border: 1px solid {highlight.name()};}}"
+                f"QFrame[activity_row=\"true\"]:focus {{border: 2px solid {highlight.name()};}}"
+            )
+        for button, icon_name in ((self.ui.pushButton_action_log, None),
+                                  (self.ui.pushButton_hide_side_panel, 'mdi6.chevron-double-right'),
+                                  (self.ui.pushButton_show_side_panel, 'mdi6.chevron-double-left')):
+            name = button.objectName()
+            button.setStyleSheet(
+                f"QPushButton#{name} {{background-color: transparent; border: 1px solid {border}; border-radius: 6px;}}"
+                f"QPushButton#{name}:hover {{border: 1px solid {highlight.name()};}}"
+                f"QPushButton#{name}:focus {{border: 2px solid {highlight.name()};}}")
+            if icon_name:
+                try:
+                    button.setIcon(qta.icon(icon_name, color=text.name()))
+                except Exception as err:
+                    logger.debug(str(err))
+        # Log and guide share one rounded box
+        for widget in (self.ui.textEdit, self.ui.textBrowser_project):
+            widget.setStyleSheet(
+                f"{type(widget).__name__}#{widget.objectName()} {{background-color: {base.name()};"
+                f" border: 1px solid {border}; border-radius: 10px; padding: 6px;}}")
+        self.ui.label_project_summary_warning.setStyleSheet(
+            "color: #d9534f; background-color: transparent; border: none;")
+        self.style_project_summary_tiles()
+        self.style_recent_activity_rows()
+        arrow = getattr(self, "recent_projects_arrow", None)
+        if arrow is not None:
+            try:
+                arrow.setPixmap(qta.icon('mdi6.chevron-down', color=secondary).pixmap(18, 18))
+            except Exception as err:
+                logger.debug(str(err))
+        self.update_side_panel_header()
+        self.fill_recent_projects_list()
+
+    def recent_project_colors(self):
+        """Colours for the recent projects drop-down rows."""
+
+        return getattr(self, "project_panel_colors", {})
+
+    def fill_recent_projects_list(self):
+        """Fill the recent projects drop-down: name, date and path for each project."""
+
+        combo = getattr(self.ui, "comboBox_recent_projects", None)
+        if combo is None:
+            return
+        combo.blockSignals(True)
+        combo.clear()
+        current_index = -1
+        for entry in self.recent_projects:
+            date_text, separator, project_path = entry.partition("|")
+            if not separator:  # Legacy lines only contain the path
+                date_text, project_path = "", entry
+            combo.addItem(Path(project_path).name, entry)
+            index = combo.count() - 1
+            combo.setItemData(index, date_text.replace("_", " ")[:16], DATE_ROLE)
+            combo.setItemData(index, project_path, PATH_ROLE)
+            combo.setItemData(index, project_path, QtCore.Qt.ItemDataRole.ToolTipRole)
+            if project_path == self.app.project_path and self.app.project_path != "":
+                current_index = index
+        combo.setCurrentIndex(current_index)
+        combo.setToolTip(self.app.project_path if current_index >= 0 else
+                         _("Choose a recently opened project to open it"))
+        combo.blockSignals(False)
+        self.request_project_summary_update()
+
+    def open_recent_project_from_combo(self, index: int) -> None:
+        """Open the project chosen in the recent projects drop-down."""
+
+        combo = self.ui.comboBox_recent_projects
+        self.ui.label_recent_projects.setFocus(QtCore.Qt.FocusReason.OtherFocusReason)
+        project_path = combo.itemData(index, PATH_ROLE)
+        if project_path and project_path != self.app.project_path:
+            self.open_project(combo.itemData(index))
+        # Show the project that is really open, also if opening was cancelled
+        self.fill_recent_projects_list()
+        self.focus_project_navigation_destination(self.ui.tabWidget.currentWidget())
+
+    def reset_recent_projects_focus(self) -> None:
+        """Clear the drop-down outline after popup focus restoration, including cancellation."""
+
+        combo = self.ui.comboBox_recent_projects
+        if combo.hasFocus() and not combo.view().isVisible():
+            self.ui.label_recent_projects.setFocus(QtCore.Qt.FocusReason.OtherFocusReason)
+
+    def connect_project_summary_events(self):
+        """Listen to database changes of the current App (new_project replaces the App)."""
+
+        events = getattr(self.app, "project_events", None)
+        if events is None or events is self.project_summary_events:
+            return
+        if self.project_summary_events is not None:
+            try:
+                self.project_summary_events.project_data_changed.disconnect(self.schedule_project_summary_update)
+            except (TypeError, RuntimeError):
+                pass
+        events.project_data_changed.connect(self.schedule_project_summary_update)
+        self.project_summary_events = events
+
+    def schedule_project_summary_update(self, tables=None, source=None):
+        """React to database changes that alter the counts shown in the project contents box."""
+
+        relevant = {"source", "cases", "code_name", "code_cat", "attribute_type", "journal",
+                    "code_text", "code_image", "code_av", "project", "chats", "chat_messages"}
+        if tables is not None and not relevant.intersection(tables):
+            return
+        if tables is not None and "source" in tables:
+            self.project_summary_check_links = True
+        self.request_project_summary_update(check_links=False)
+
+    def request_project_summary_update(self, check_links=True):
+        """Mark the project contents as outdated; refresh soon if the Project tab is showing."""
+
+        if not hasattr(self, "project_summary_timer"):
+            return
+        self.project_summary_dirty = True
+        if check_links:
+            self.project_summary_check_links = True
+        if self.app.conn is None:  # Nothing to query, so clear the box at once
+            self.update_project_summary_panel()
+        elif self.ui.tabWidget.currentWidget() is self.ui.tab_action_log:
+            self.project_summary_timer.start()
+
+    def project_tab_shown(self, index):
+        """Refresh the project contents when the Project tab comes into view; files may have changed on disk."""
+
+        if self.ui.tabWidget.widget(index) is self.ui.tab_action_log:
+            self.request_project_summary_update()
+
+    def application_state_changed(self, state):
+        """Check files on disk again when QualCoder becomes active and the Project tab is showing."""
+
+        if state == QtCore.Qt.ApplicationState.ApplicationActive:
+            self.request_project_summary_update()
+
+    def project_summary_warning_link(self, link: str) -> None:
+        """Open the dialog that fixes the reported file problem."""
+
+        actions = {
+            "bad_links": self.ui.actionManage_bad_links_to_files,
+            "missing_files": self.ui.actionManage_files,
+        }
+        action = actions.get(link)
+        if action is not None:
+            self.activate_project_panel_action(action, self.ui.label_project_summary)
+
+    def count_missing_project_files(self):
+        """Count imported images, audio, video and PDFs missing from the project folder.
+
+        Linked files are covered by App.check_bad_file_links; imported text lives in the database.
+        """
+
+        cur = self.app.conn.cursor()
+        cur.execute("select mediapath from source where mediapath like '/images/%' or mediapath like '/audio/%' "
+                    "or mediapath like '/video/%' or (mediapath like '/docs/%' and mediapath like '%.pdf')")
+        missing = 0
+        for (mediapath,) in cur.fetchall():
+            if mediapath.startswith("/docs/"):  # Imported documents are kept in the documents folder
+                mediapath = "/documents/" + mediapath[6:]
+            if not Path(self.app.project_path + mediapath).exists():
+                missing += 1
+        return missing
+
+    def open_coding_for_file_type(self, file_type: str) -> None:
+        """Open the coding workspace for a file type chosen in the project contents box."""
+
+        actions = {
+            "text": self.ui.actionCodes,
+            "pdf": self.ui.actionCode_pdf,
+            "image": self.ui.actionCode_image,
+            "av": self.ui.actionCode_audio_video,
+        }
+        action = actions.get(file_type)
+        if action is not None:
+            self.activate_project_panel_action(action, self.ui.label_project_summary)
+
+    def activate_project_panel_action(self, action: QtGui.QAction, heading: QtWidgets.QWidget) -> None:
+        """Activate a Project tab action without retaining its focus highlight.
+
+        Args:
+            action: Menu action associated with the panel, tile or text link.
+            heading: Neutral focus target to remember when returning to the Project tab.
+        """
+
+        if not action.isEnabled():
+            return
+        heading.setFocus(QtCore.Qt.FocusReason.OtherFocusReason)
+        action.trigger()
+        destination = self.ui.tabWidget.currentWidget()
+        if action is self.ui.actionManage_journals:
+            destination = self.journal_display
+        self.focus_project_navigation_destination(destination)
+
+    def open_ai_chats_from_summary(self) -> None:
+        """Open saved chats in their current tab or sidebar without retaining a tile outline."""
+
+        if self.app.conn is None:
+            return
+        self.ui.label_project_summary.setFocus(QtCore.Qt.FocusReason.OtherFocusReason)
+        self.ai_go_chat()
+        destination = self.ai_chat_window or self.ui.tabWidget.currentWidget()
+        self.focus_project_navigation_destination(destination)
+
+    def build_project_summary_tiles(self):
+        """Create the count tiles of the project contents box once; refreshes only change the numbers."""
+
+        # Tiles with a menu action open that manager when clicked
+        specs = [
+            ("files", "mdi6.file-multiple-outline", _("Files"), self.ui.actionManage_files, _("Open the file manager")),
+            ("cases", "mdi6.briefcase-outline", _("Cases"), self.ui.actionManage_cases, _("Open the case manager")),
+            ("codes", "mdi6.tag-outline", _("Codes"), None, ""),
+            ("journals", "mdi6.notebook-outline", _("Journals"), self.ui.actionManage_journals,
+             _("Open the journals")),
+            ("ai_chats", "mdi6.message-processing-outline", _("AI agent chats"), None, _("Open the AI Agent")),
+        ]
+        self.project_summary_tiles = {}
+        for position, (key, icon_name, caption, action, tooltip) in enumerate(specs):
+            tile = QtWidgets.QFrame(self.ui.frame_project_summary)
+            tile.setProperty("summary_tile", True)
+            clickable = action is not None or key == "ai_chats"
+            tile.setProperty("clickable", clickable)
+            if clickable:
+                tile.setToolTip(tooltip)
+                tile.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+                tile.setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)
+                tile.installEventFilter(self)
+                # Same click and keyboard handling as the New and Open project cards
+                if key == "ai_chats":
+                    self.project_cards[tile] = self.open_ai_chats_from_summary
+                else:
+                    self.project_cards[tile] = lambda menu_action=action: self.activate_project_panel_action(
+                        menu_action, self.ui.label_project_summary)
+            tile_layout = QtWidgets.QHBoxLayout(tile)
+            tile_layout.setContentsMargins(8, 6, 8, 6)
+            tile_layout.setSpacing(8)
+            icon_label = QtWidgets.QLabel(tile)
+            tile_layout.addWidget(icon_label)
+            text_layout = QtWidgets.QVBoxLayout()
+            text_layout.setSpacing(0)
+            value_label = QtWidgets.QLabel("0", tile)
+            caption_label = QtWidgets.QLabel(caption, tile)
+            text_layout.addWidget(value_label)
+            text_layout.addWidget(caption_label)
+            tile_layout.addLayout(text_layout, 1)
+            for child in (icon_label, value_label, caption_label):
+                child.setAttribute(QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+            self.ui.gridLayout_project_summary.addWidget(tile, position // 2, position % 2)
+            if key == "ai_chats":
+                tile.hide()
+            self.project_summary_tiles[key] = {"tile": tile, "icon": icon_label, "icon_name": icon_name,
+                                               "value": value_label, "caption": caption_label,
+                                               "caption_text": caption}
+
+    def build_recent_activity_rows(self):
+        """Create the recent activity rows once; refreshes only fill, show or hide them."""
+
+        specs = [("coded", "mdi6.tag-text-outline"), ("text_bookmark", "mdi6.bookmark-outline"),
+                 ("av_bookmark", "mdi6.play-circle-outline"), ("journal", "mdi6.notebook-outline"),
+                 ("ai_chat", "mdi6.message-processing-outline")]
+        self.recent_activity_rows = {}
+        self.recent_activity_targets = {}
+        for key, icon_name in specs:
+            row = QtWidgets.QFrame(self.ui.frame_recent_activity)
+            row.setProperty("activity_row", True)
+            row.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+            row.setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)
+            row_layout = QtWidgets.QHBoxLayout(row)
+            row_layout.setContentsMargins(8, 6, 8, 6)
+            row_layout.setSpacing(10)
+            icon_label = QtWidgets.QLabel(row)
+            row_layout.addWidget(icon_label)
+            text_layout = QtWidgets.QVBoxLayout()
+            text_layout.setSpacing(0)
+            title_label = ElidedLabel(row)
+            detail_label = ElidedLabel(row)
+            text_layout.addWidget(title_label)
+            text_layout.addWidget(detail_label)
+            row_layout.addLayout(text_layout, 1)
+            for child in (icon_label, title_label, detail_label):
+                child.setAttribute(QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+            row.installEventFilter(self)
+            # Same click and keyboard handling as the New and Open project cards
+            self.project_cards[row] = lambda key=key: self.open_recent_activity(key)
+            row.hide()
+            self.ui.verticalLayout_recent_activity.addWidget(row)
+            self.recent_activity_rows[key] = {"row": row, "icon": icon_label, "icon_name": icon_name,
+                                              "title": title_label, "detail": detail_label}
+
+    def style_recent_activity_rows(self):
+        """Apply theme colours to the recent activity rows."""
+
+        rows = getattr(self, "recent_activity_rows", None)
+        if not rows:
+            return
+        colors = self.project_panel_colors
+        for row in rows.values():
+            try:
+                row["icon"].setPixmap(qta.icon(row["icon_name"], color=colors.get("highlight")).pixmap(22, 22))
+            except Exception as err:
+                logger.debug(str(err))
+            row["title"].setStyleSheet(f"color: {colors.get('text')};")
+            row["detail"].setStyleSheet(f"color: {colors.get('secondary')};")
+
+    @staticmethod
+    def format_activity_date(date_text: Optional[str]) -> str:
+        """Short date for the recent activity list: today, yesterday or the date."""
+
+        try:
+            moment = datetime.datetime.strptime(str(date_text)[:16], "%Y-%m-%d %H:%M")
+        except ValueError:
+            return str(date_text or "")[:16]
+        days = (datetime.date.today() - moment.date()).days
+        if days == 0:
+            return _("today {0}").format(moment.strftime("%H:%M"))
+        if days == 1:
+            return _("yesterday {0}").format(moment.strftime("%H:%M"))
+        return moment.strftime("%Y-%m-%d %H:%M")
+
+    def collect_recent_activity(self) -> dict[str, tuple[str, str, Any, Optional[str]]]:
+        """Find where the current coder left off: last coding, bookmarks, last journal and AI chat."""
+
+        cur = self.app.conn.cursor()
+        coder = self.app.settings['codername']
+        activity = {}
+
+        def source_name(file_id: int) -> Optional[str]:
+            cur.execute("select name from source where id=?", [file_id])
+            res = cur.fetchone()
+            return res[0] if res else None
+
+        cur.execute("select kind, fid, pos0, pos1, date from ("
+                    "select 'text' as kind, fid, pos0, pos1, date from code_text where owner=? "
+                    "union all select 'image', id, 0, 0, date from code_image where owner=? "
+                    "union all select 'av', id, 0, 0, date from code_av where owner=?) "
+                    "order by date desc limit 1", [coder, coder, coder])
+        res = cur.fetchone()
+        if res and source_name(res[1]):
+            activity["coded"] = (source_name(res[1]),
+                                 _("Last coded, {0}").format(self.format_activity_date(res[4])), res, res[4])
+        cur.execute("select bookmarkfile, bookmarkpos, avbookmarkfile, avbookmarkmsec from project")
+        res = cur.fetchone()
+        if res and res[0] is not None and source_name(res[0]):
+            activity["text_bookmark"] = (source_name(res[0]), _("Text bookmark"), None, None)
+        if res and res[2] is not None and source_name(res[2]):
+            seconds = int(res[3] or 0) // 1000
+            activity["av_bookmark"] = (source_name(res[2]),
+                                       _("Audio/video bookmark at {0}").format(f"{seconds // 60}:{seconds % 60:02d}"),
+                                       None, None)
+        cur.execute("select jid, name, date from journal order by date desc limit 1")
+        res = cur.fetchone()
+        if res:
+            activity["journal"] = (res[1], _("Journal, edited {0}").format(self.format_activity_date(res[2])),
+                                   res[0], res[2])
+        chat = self.last_ai_chat()
+        if chat is not None:
+            detail = _("Last AI chat")
+            if chat[2]:
+                detail = _("AI chat, last changed {0}").format(self.format_activity_date(chat[2]))
+            activity["ai_chat"] = (chat[1], detail, chat[0], chat[2])
+        return activity
+
+    def last_ai_chat(self) -> Optional[tuple[int, str, Optional[str]]]:
+        """Return the latest AI chat, using its creation date for undated messages."""
+
+        if self.app.settings.get('ai_enable', 'False') != 'True':
+            return None
+        history = Path(self.app.project_path) / "ai_data" / "chat_history.sqlite"
+        if not history.exists():
+            return None
+        try:
+            conn = sqlite3.connect(f"{history.as_uri()}?mode=ro", uri=True)
+            try:
+                columns = {row[1] for row in conn.execute("PRAGMA table_info(chat_messages)")}
+                # The Project tab can read history before AI initialization upgrades its schema.
+                date_column = "COALESCE(NULLIF(chat_messages.date, ''), chats.date)" if "date" in columns else "chats.date"
+                res = conn.execute(f"select chats.id, chats.name, chats.analysis_type, {date_column} as activity_date "
+                                   "from chat_messages join chats on chats.id = chat_messages.chat_id "
+                                   "where chat_messages.msg_type in ('user', 'ai', 'info', 'agent_status') "
+                                   "order by activity_date desc, chat_messages.id desc limit 1").fetchone()
+            finally:
+                conn.close()
+        except sqlite3.Error as err:
+            logger.debug(str(err))
+            return None
+        if res is None:
+            return None
+        name = str(res[1] or "").strip()
+        if self.ai_chat_window is not None:
+            name = self.ai_chat_window._display_chat_name(res[1], res[2])
+        return res[0], name or _("AI chat"), res[3]
+
+    def show_recent_activity(self, activity: dict[str, tuple[str, str, Any, Optional[str]]]) -> None:
+        """Fill and sort activity rows by date, placing undated entries last.
+
+        Args:
+            activity: Entries containing a title, detail, target and optional local timestamp.
+        """
+
+        rows = getattr(self, "recent_activity_rows", None)
+        if not rows:
+            return
+        self.recent_activity_targets = {}
+        for key, row in rows.items():
+            entry = activity.get(key)
+            row["row"].setVisible(entry is not None)
+            if entry is None:
+                continue
+            title, detail, target = entry[:3]
+            row["title"].setText(title)
+            row["detail"].setText(detail)
+            row["row"].setToolTip(f"{title}\n{detail}")
+            row["row"].setAccessibleName(f"{title}, {detail}")
+            self.recent_activity_targets[key] = target
+        ordered_keys = sorted(self.recent_activity_targets,
+                              key=lambda activity_key: activity[activity_key][3] or "", reverse=True)
+        previous_row = None
+        for position, key in enumerate(ordered_keys):
+            activity_row = rows[key]["row"]
+            self.ui.verticalLayout_recent_activity.insertWidget(position, activity_row)
+            if previous_row is not None:
+                QtWidgets.QWidget.setTabOrder(previous_row, activity_row)
+            previous_row = activity_row
+        self.ui.label_recent_activity_empty.setVisible(not self.recent_activity_targets)
+
+    def open_recent_activity(self, key: str) -> None:
+        """Open an activity and clear its focus highlight when returning to the Project tab.
+
+        Args:
+            key: Activity identifier from self.recent_activity_targets.
+        """
+
+        if self.app.conn is None or key not in self.recent_activity_targets:
+            return
+        # Qt remembers this neutral heading instead of restoring focus to the activated row.
+        self.ui.label_recent_activity.setFocus(QtCore.Qt.FocusReason.OtherFocusReason)
+        target = self.recent_activity_targets[key]
+        if key == "coded":
+            kind, file_id, pos0, pos1 = target[0], target[1], target[2], target[3]
+            if kind == "text":  # PDFs are redirected to PDF coding
+                self.text_coding(doc_id=file_id, doc_sel_start=pos0, doc_sel_end=pos1)
+            elif kind == "image":
+                self.image_coding()
+            else:
+                self.av_coding()
+        elif key == "text_bookmark":
+            self.text_coding()
+            self.call_on_coding_widget(DialogCodeText, "go_to_bookmark")
+        elif key == "av_bookmark":
+            self.av_coding()
+            self.call_on_coding_widget(DialogCodeAV, "go_to_bookmark")
+        elif key == "journal":
+            self.journals()
+            self.select_journal(target)
+        elif key == "ai_chat":
+            self.open_ai_chat(target)
+
+        destination = self.ui.tabWidget.currentWidget()
+        if key == "journal":
+            destination = self.journal_display
+        elif key == "ai_chat" and self.ai_chat_window is not None:
+            destination = self.ai_chat_window
+        self.focus_project_navigation_destination(destination)
+
+    def focus_project_navigation_destination(self, destination: Optional[QtWidgets.QWidget]) -> None:
+        """Focus opened content, keeping any child that already has focus.
+
+        Args:
+            destination: Opened tab, sidebar or modeless dialog, if available.
+        """
+
+        if destination is None or not destination.isVisible():
+            return
+        focused_widget = QtWidgets.QApplication.focusWidget()
+        if focused_widget is None or not (focused_widget is destination or destination.isAncestorOf(focused_widget)):
+            focus_target = destination.focusWidget() or destination
+            focus_target.setFocus(QtCore.Qt.FocusReason.OtherFocusReason)
+
+    def call_on_coding_widget(self, widget_class, method_name):
+        """Call a method on the coding workspace of the given class, if it is open."""
+
+        layout = self.ui.tab_coding.layout()
+        if layout is None:
+            return
+        for i in range(layout.count()):
+            widget = layout.itemAt(i).widget()
+            if isinstance(widget, widget_class):
+                try:
+                    getattr(widget, method_name)()
+                except Exception as err:  # e.g. media player not available
+                    logger.warning(str(err))
+                return
+
+    def select_journal(self, jid):
+        """Select a journal in the open journals window."""
+
+        dialog = getattr(self, "journal_display", None)
+        if dialog is None:
+            return
+        try:
+            table = dialog.ui.tableWidget
+            for row in range(table.rowCount()):
+                item = table.item(row, JID_COLUMN)
+                if item is not None and item.text() == str(jid):
+                    table.setCurrentCell(row, 0)
+                    return
+        except (RuntimeError, AttributeError) as err:
+            logger.debug(str(err))
+
+    def open_ai_chat(self, chat_id):
+        """Show the AI Agent with the given chat selected."""
+
+        self.ai_go_chat()
+        if self.ai_chat_window is None:
+            return
+        index = self.ai_chat_window.find_chat_idx(chat_id)
+        if index is not None:
+            self.ai_chat_window._set_chat_list_current_row(index)
+
+    def style_project_summary_tiles(self):
+        """Apply theme colours and the font size to the project contents tiles."""
+
+        tiles = getattr(self, "project_summary_tiles", None)
+        if not tiles:
+            return
+        colors = self.project_panel_colors
+        # Font through the stylesheet: the window font stylesheet would override setFont
+        value_size = int(self.app.settings['fontsize']) + 2
+        for tile in tiles.values():
+            try:
+                tile["icon"].setPixmap(qta.icon(tile["icon_name"], color=colors.get("highlight")).pixmap(18, 18))
+            except Exception as err:
+                logger.debug(str(err))
+            tile["value"].setStyleSheet(
+                f"color: {colors.get('text')}; font-size: {value_size}pt; font-weight: bold;")
+            tile["caption"].setStyleSheet(f"color: {colors.get('secondary')};")
+
+    def count_ai_chats(self) -> int:
+        """Count saved AI conversations without loading AI or creating chat storage."""
+
+        history = Path(self.app.project_path) / "ai_data" / "chat_history.sqlite"
+        if not history.exists():
+            return 0
+        try:
+            conn = sqlite3.connect(f"{history.as_uri()}?mode=ro", uri=True)
+            try:
+                return conn.execute("SELECT COUNT(*) FROM chats").fetchone()[0]
+            finally:
+                conn.close()
+        except sqlite3.Error as err:
+            logger.debug(str(err))
+            return 0
+
+    def update_project_summary_panel(self):
+        """Show counts of files, cases, codes and more for the open project in the Project tab."""
+
+        tiles = getattr(self, "project_summary_tiles", None)
+        if not tiles:
+            return
+        if hasattr(self, "project_summary_events"):
+            self.connect_project_summary_events()
+        project_open = self.app.conn is not None
+        counts = {}
+        activity = {}
+        text_files = pdf_files = image_files = av_files = 0
+        if project_open:
+            try:
+                cur = self.app.conn.cursor()
+                for key, sql in (("cases", "select count(caseid) from cases"),
+                                 ("codes", "select count(cid) from code_name"),
+                                 ("journals", "select count(jid) from journal")):
+                    cur.execute(sql)
+                    counts[key] = cur.fetchone()[0]
+                pdf_files = len(self.app.get_pdf_filenames())
+                text_files = len(self.app.get_text_filenames()) - pdf_files  # Text list includes PDFs
+                image_files = len(self.app.get_image_filenames())
+                av_files = len(self.app.get_av_filenames())
+                counts["files"] = text_files + pdf_files + image_files + av_files
+                counts["ai_chats"] = self.count_ai_chats()
+                # Checking links touches the disk, so only after file changes, opening or closing
+                activity = self.collect_recent_activity()
+                if self.project_summary_check_links:
+                    self.project_summary_bad_links = len(self.app.check_bad_file_links())
+                    self.project_summary_missing_files = self.count_missing_project_files()
+                    self.project_summary_check_links = False
+            except Exception as err:  # Database busy or closing: keep the last values
+                logger.debug(str(err))
+                return
+        else:
+            self.project_summary_bad_links = 0
+            self.project_summary_missing_files = 0
+        self.project_summary_dirty = False
+        bad_links = getattr(self, "project_summary_bad_links", 0) if project_open else 0
+        missing_files = getattr(self, "project_summary_missing_files", 0) if project_open else 0
+        self.ui.actionManage_bad_links_to_files.setEnabled(bool(bad_links))
+        self.ui.label_project_summary_empty.setVisible(not project_open)
+        self.ui.label_project_summary_files.setVisible(project_open)
+        self.ui.label_project_summary_warning.setVisible(bool(bad_links or missing_files))
+        self.show_recent_activity(activity if project_open else {})
+        for key, tile in tiles.items():
+            value = counts.get(key, 0)
+            visible = project_open
+            if key == "ai_chats":
+                visible = project_open and (value > 0 or self.app.settings.get("ai_enable", "False") == "True")
+            tile["tile"].setVisible(visible)
+            tile["value"].setText(str(value))
+            tile["tile"].setAccessibleName(f"{tile['caption_text']}: {value}")
+        if not project_open:
+            return
+        # Each file type opens its coding workspace; types without files stay plain text
+        link_color = self.project_panel_colors.get("secondary")
+        parts = []
+        for link, caption, count in (("text", _("Text"), text_files), ("pdf", _("PDF"), pdf_files),
+                                     ("image", _("Images"), image_files), ("av", _("Audio/video"), av_files)):
+            caption = html.escape(caption)
+            if count:
+                parts.append(f'<a href="{link}" style="color: {link_color};">{caption}: {count}</a>')
+            else:
+                parts.append(f"{caption}: {count}")
+        self.ui.label_project_summary_files.setText(", ".join(parts))
+        warnings = []
+        if bad_links:
+            warnings.append(html.escape(_("Linked files not found: {0}.").format(bad_links)) +
+                            f' <a href="bad_links" style="color: #d9534f;">{html.escape(_("Manage links"))}</a>')
+        if missing_files:
+            warnings.append(html.escape(_("Files missing from the project folder: {0}.").format(missing_files)) +
+                            f' <a href="missing_files" style="color: #d9534f;">{html.escape(_("Manage files"))}</a>')
+        if warnings:
+            self.ui.label_project_summary_warning.setText("<br>".join(warnings))
+
+    def eventFilter(self, watched, event):
+        """Make the project cards clickable and keep the recent projects combo from opening projects by accident."""
+
+        if watched is getattr(self.ui, "comboBox_recent_projects", None):
+            event_type = event.type()
+            if event_type == QtCore.QEvent.Type.FocusIn and event.reason() == QtCore.Qt.FocusReason.PopupFocusReason:
+                # Qt restores combo focus while the popup is still closing.
+                QtCore.QTimer.singleShot(0, self.reset_recent_projects_focus)
+            if not watched.view().isVisible():
+                if event_type == QtCore.QEvent.Type.Wheel:
+                    return True
+                if event_type == QtCore.QEvent.Type.KeyPress:
+                    navigation_keys = (QtCore.Qt.Key.Key_Up, QtCore.Qt.Key.Key_Down, QtCore.Qt.Key.Key_PageUp,
+                                       QtCore.Qt.Key.Key_PageDown, QtCore.Qt.Key.Key_Home, QtCore.Qt.Key.Key_End)
+                    if event.key() in navigation_keys:
+                        watched.showPopup()
+                        return True
+                    if event.text().strip():  # Typing would jump to a matching project and open it
+                        return True
+        handler = self.project_cards.get(watched)
+        if handler is not None:
+            event_type = event.type()
+            if event_type == QtCore.QEvent.Type.MouseButtonRelease:
+                if (event.button() == QtCore.Qt.MouseButton.LeftButton
+                        and watched.rect().contains(event.position().toPoint())):
+                    handler()
+                    return True
+            elif event_type == QtCore.QEvent.Type.KeyPress:
+                if event.key() in (QtCore.Qt.Key.Key_Return, QtCore.Qt.Key.Key_Enter, QtCore.Qt.Key.Key_Space):
+                    handler()
+                    return True
+        return super().eventFilter(watched, event)
+
+    def set_action_log_visible(self, visible, persist=True):
+        """Show the action log or the guide in the panel on the right of the Project tab."""
+
+        stack = self.ui.stackedWidget_project
+        stack.setCurrentWidget(self.ui.textEdit if visible else self.ui.textBrowser_project)
+        self.action_log_visible = visible
+        button = self.ui.pushButton_action_log
+        if button.isChecked() != visible:
+            button.blockSignals(True)
+            button.setChecked(visible)
+            button.blockSignals(False)
+        if visible:
+            self.ui.textEdit.verticalScrollBar().setValue(self.ui.textEdit.verticalScrollBar().maximum())
+        if visible and persist and not self.ui.frame_log_panel.isVisibleTo(self):
+            self.set_side_panel_visible(True)  # Menu actions that write to the log bring the panel back
+        self.update_side_panel_header()
+
+    def set_side_panel_visible(self, visible, persist=True):
+        """Show or hide the action log column of the Project tab."""
+
+        self.ui.frame_log_panel.setVisible(visible)
+        self.ui.pushButton_show_side_panel.setVisible(not visible)
+        if persist:
+            self.app.settings['project_side_panel'] = 'True' if visible else 'False'
+            self.app.write_config_ini(self.app.settings, self.app.ai_models)
+
+    def update_side_panel_header(self):
+        """Title and toggle button of the panel on the right, for the page it shows."""
+
+        log_shown = getattr(self, "action_log_visible", True)
+        self.ui.label_log_title.setText(_("Action log") if log_shown else _("Guide"))
+        tooltip = _("Show the guide") if log_shown else _("Show the action log")
+        self.ui.pushButton_action_log.setToolTip(tooltip)
+        self.ui.pushButton_action_log.setAccessibleName(tooltip)
+        try:
+            icon_name = 'mdi6.book-open-page-variant-outline' if log_shown else 'mdi6.text-box-outline'
+            self.ui.pushButton_action_log.setIcon(qta.icon(icon_name))
+        except Exception as err:
+            logger.debug(str(err))
+
+    def project_summary_requested(self):
+        """Project summary from the menu: make sure the log is visible before writing to it."""
+
+        self.set_action_log_visible(True)
+        self.project_summary_report()
+
     def fill_recent_projects_menu_actions(self):
         """ Get the recent projects from the .qualcoder txt file.
         Add up to five recent projects to the menu. """
 
         self.recent_projects = self.app.read_previous_project_paths()
+        self.fill_recent_projects_list()
         if len(self.recent_projects) == 0:
             return
         # Removes the qtdesigner default action. Also clears the section when a project is closed
@@ -782,6 +1941,7 @@ Click "Yes" to start now.')
         self.ui.actionREFI_QDA_Project_import.setEnabled(True)
         self.ui.actionRQDA_Project_import.setEnabled(True)
         self.ui.actionTaguette_import.setEnabled(True)
+        self.ui.actionSonal_import.setEnabled(True)
         self.ui.actionExport_codebook.setEnabled(False)
         self.ui.actionImport_plain_text_codes_list.setEnabled(False)
         # Manage menu
@@ -832,6 +1992,7 @@ Click "Yes" to start now.')
         self.ui.actionREFI_Codebook_import.setEnabled(True)
         self.ui.actionREFI_QDA_Project_import.setEnabled(True)
         self.ui.actionRQDA_Project_import.setEnabled(True)
+        self.ui.actionSonal_import.setEnabled(True)
         self.ui.actionExport_codebook.setEnabled(True)
         self.ui.actionImport_plain_text_codes_list.setEnabled(True)
         # Manage menu
@@ -882,6 +2043,10 @@ Click "Yes" to start now.')
         self.ui.actionAI_Agent_Sidebar.setEnabled(ai_actions_enabled)
         self.ui.actionAI_Search_and_Coding.setEnabled(ai_actions_enabled)
         self.ui.actionAI_assisted_coding.setEnabled(ai_actions_enabled)
+        self.ui.actionAI_topic_exploration.setEnabled(ai_actions_enabled)
+        self.ui.actionAI_text_analysis.setEnabled(ai_actions_enabled)
+        self.ui.actionAI_code_analysis.setEnabled(ai_actions_enabled)
+        self.ui.actionCheck_project_AI_readiness.setEnabled(ai_actions_enabled)
         self.ui.actionAsk_the_AI_Agent.setEnabled(ai_actions_enabled)
 
         if self.ai_chat_tab_sidebar_button is not None:
@@ -907,40 +2072,6 @@ Click "Yes" to start now.')
             self.ui.menuReports.popup(QtGui.QCursor.pos())
         if mods & QtCore.Qt.KeyboardModifier.AltModifier and key == QtCore.Qt.Key.Key_5:
             self.ui.menuHelp.popup(QtGui.QCursor.pos())
-
-    def settings_report(self):
-        """ Display general settings and project summary """
-
-        self.ui.textEdit.append("<h1>" + _("Settings") + "</h1>")
-        msg = "<p>" + _("Coder") + f": {self.app.settings['codername']}<br />"
-        msg += _("Font") + f": {self.app.settings['font']} {self.app.settings['fontsize']} | "
-        msg += _("Tree font size") + f": {self.app.settings['treefontsize']}<br />"
-        msg += _("Working directory") + f": {self.app.settings['directory']}<br />"
-        msg += _("Language") + f": {self.app.settings['language']} | "
-        msg += _("Show IDs") + f": {self.app.settings['showids']}<br />"
-        msg += _("Timestamp format") + f": {self.app.settings['timestampformat']} | "
-        msg += _("Speaker name format") + f": {self.app.settings['speakernameformat']}<br />"
-        msg += _("Report text context characters: ") + f"{self.app.settings['report_text_context_characters']}<br /> "
-        msg += _("Style") + f": {self.app.settings['stylesheet']}<br />"
-        msg += _("Backup on open") + f": {self.app.settings['backup_on_open']} | "
-        msg += _("Backup AV files") + f": {self.app.settings['backup_av_files']}<br />"
-        if self.app.settings['ai_enable'] == 'True':
-            msg += _("AI integration is enabled")
-        else:
-            msg += _("AI integration is disabled")
-        ai_permissions = self.app.settings.get('ai_permissions', 1)
-        ai_permissions_labels = {
-            0: 'Read-only',
-            1: 'Sandboxed',
-            2: 'Full access'
-        }
-        msg += " | " + _("AI permissions") + f": {ai_permissions_labels.get(ai_permissions, ai_permissions)}</p>"
-        self.ui.textEdit.append(msg)
-        if platform.system() == "Windows":
-            self.ui.textEdit.append("<p>" + _("Folder paths / represents \\") + "</p>")
-        self.ui.textEdit.append("<p></p>")
-        self.ui.textEdit.textCursor().movePosition(QtGui.QTextCursor.MoveOperation.End)
-        self.ui.tabWidget.setCurrentWidget(self.ui.tab_action_log)
 
     def text_segments_codes_table(self):
         """ Show table of text segments (rows) by codes (columns). """
@@ -1046,12 +2177,33 @@ Click "Yes" to start now.')
         self.app.help_wiki("")
 
     def display_menu_key_shortcuts(self):
+        self.set_action_log_visible(True)
         self.ui.textEdit.append(menu_shortcuts_display)
         self.ui.textEdit.append(coding_shortcuts_display)
         self.ui.tabWidget.setCurrentWidget(self.ui.tab_action_log)
         
+    def init_action_log(self) -> None:
+        """Set up paragraph spacing and clickable links in the action log."""
+
+        self.ui.textEdit.setOpenLinks(False)
+        self.ui.textEdit.anchorClicked.connect(self.action_log_link_clicked)
+        self.ui.textEdit.document().setDefaultStyleSheet("p {margin-top: 0; margin-bottom: 8px;}")
+        self.ui.textEdit.document().setDocumentMargin(8)
+
+    def action_log_link_clicked(self, url: QtCore.QUrl) -> None:
+        """Open backup folders, websites or QualCoder actions from the log.
+
+        Args:
+            url: Link activated in the action log.
+        """
+
+        if url.isLocalFile():
+            QtGui.QDesktopServices.openUrl(url)
+        else:
+            self.handle_placeholder_link(url)
+
     def action_log_scroll_bottom(self):
-        """Scrolls the action log to the very bottom, malking new entries visible."""
+        """Scroll the action log to the bottom to show new entries."""
         self.ui.textEdit.verticalScrollBar().setValue(self.ui.textEdit.verticalScrollBar().maximum())
 
     def about(self):
@@ -1086,10 +2238,8 @@ Click "Yes" to start now.')
         self.tab_layout_helper(self.ui.tab_manage, ui)
 
     def import_plain_text_codes(self):
-        """ Import a list of plain text codes codebook.
-        The codebook is a plain text file or csv file.
-        In plain text file, Tab separates the codename from the code description.
-        The >> symbol is used to assign code to category:  code>>category
+        """ Import a plain text or csv codebook. Tab separates the code path from its memo.
+        category>>code assigns a code to a category, code>>>subcode nests a code under a code.
         """
 
         ImportPlainTextCodes(self.app, self.ui.textEdit)
@@ -1141,13 +2291,15 @@ Click "Yes" to start now.')
         self.journal_display = ui
         ui.show()
 
-    def text_coding(self, task='documents', doc_id=None, doc_sel_start=0, doc_sel_end=0, doc_ids=None):
-        """ Create edit and delete codes. Apply and remove codes and annotations to the
-        text in imported text files. 
+    def text_coding(self, task: str = 'documents', doc_id: Optional[int] = None,
+                    doc_sel_start: int = 0, doc_sel_end: int = 0,
+                    doc_ids: Optional[list[int]] = None) -> None:
+        """Show text coding, reusing the open dialog to preserve its context.
+
         Args:
             task: "documents": The default, shows the tab with the text documents
                   "ai_search": Shows the tab "AI Search"
-            doc_id: If not None and task = "documents", this doument will be loaded in the coding window
+            doc_id: If not None and task = "documents", this document will be loaded in the coding window
             doc_sel_start: The character-position of the beginning of the selection in the coding window
             doc_sel_end: The end of the selection
             doc_ids: Optional list of file ids; with task = "mark_speakers" they become
@@ -1169,9 +2321,26 @@ Click "Yes" to start now.')
                 return
         if len(files) > 0:
             self.ui.textBrowser_coding.hide()
-            ui = DialogCodeText(self.app, self.ui.textEdit, self.ui.tab_reports)
-            ui.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose)
-            self.tab_layout_helper(self.ui.tab_coding, ui)
+            ui = None
+            contents = self.ui.tab_coding.layout()
+            if contents is not None:
+                for i in range(contents.count()):
+                    widget = contents.itemAt(i).widget()
+                    if not isinstance(widget, DialogCodeText):
+                        continue
+                    try:
+                        widget.objectName()  # Detect a deleted C++ object.
+                    except RuntimeError:
+                        continue
+                    ui = widget
+                    break
+            if ui is None:
+                ui = DialogCodeText(self.app, self.ui.textEdit, self.ui.tab_reports)
+                ui.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose)
+                if not self.tab_layout_helper(self.ui.tab_coding, ui):
+                    return
+            else:
+                self.ui.tabWidget.setCurrentWidget(self.ui.tab_coding)
             if task == 'documents':
                 ui.ui.tabWidget.setCurrentWidget(ui.ui.tab_docs)
                 if doc_id is not None:
@@ -1225,7 +2394,8 @@ Click "Yes" to start now.')
             self.ui.textBrowser_coding.hide()
             ui = DialogCodePdf(self.app, self.ui.textEdit, self.ui.tab_reports)
             ui.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose)
-            self.tab_layout_helper(self.ui.tab_coding, ui)
+            if not self.tab_layout_helper(self.ui.tab_coding, ui):
+                return
             if doc_id is not None:
                 ui.open_doc_selection(doc_id, doc_sel_start, doc_sel_end)
                 if task == 'mark_speakers':
@@ -1284,48 +2454,61 @@ Click "Yes" to start now.')
     def code_organiser(self):
         """ Organise codes structure. """
 
+        # Ask before building: a new organiser resets the shared model
+        if not self.confirm_leave_unsaved([self.ui.tab_reports, self.ui.tab_coding]):
+            return
         ui = CodeOrganiser(self.app, self.ui.textEdit)
         ui.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose)
         self.tab_layout_helper(self.ui.tab_reports, None)
-        self.tab_layout_helper(self.ui.tab_coding, ui)
+        self.tab_layout_helper(self.ui.tab_coding, ui, confirm=False)
 
     def ai_chat(self):
         """Initialize AI chat and place it in tab or sidebar based on settings."""
 
+        from qualcoder.ai_chat import DialogAIChat
+
         self.ai_chat_window = DialogAIChat(self.app, self.ui.textEdit, self)
+        if self.app.project_path != "":
+            # A project may have been restored before the Qt event loop started,
+            # while the AI modules were still loading in the background.
+            self.ai_chat_window.init_ai_chat()
         sidebar_mode = self.app.settings.get('ai_chat_sidebar', 'False') == 'True'
         self.set_ai_chat_sidebar_mode(sidebar_mode, persist=False)
 
-    def _setup_ai_chat_tab_sidebar_button(self):
-        """Add a small button in the AI chat tab to move the chat into sidebar view."""
+    def _setup_ai_chat_tab_sidebar_button(self, rail_mode=False):
+        """Add a small button in the AI chat tab to move the chat into sidebar view.
+
+        In the left icon column the button goes under the icon, otherwise beside the title.
+        """
 
         tab_index = self.ui.tabWidget.indexOf(self.ui.tab_ai_agent)
         if tab_index < 0:
             return
         tab_bar = self.ui.tabWidget.tabBar()
-        tab_label = QtWidgets.QWidget(tab_bar)
-        tab_label.setAttribute(QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents)
-        tab_label.setStyleSheet("QWidget {background-color: transparent; border: none;}")
-        tab_label_layout = QtWidgets.QHBoxLayout(tab_label)
-        tab_label_layout.setContentsMargins(0, 0, 0, 0)
-        tab_label_layout.setSpacing(4)
-        icon_label = QtWidgets.QLabel(tab_label)
-        icon_label.setStyleSheet("background-color: transparent; border: none;")
-        icon = tab_bar.tabIcon(tab_index)
-        if not icon.isNull():
-            icon_label.setPixmap(icon.pixmap(16, 16))
-            tab_label_layout.addWidget(icon_label)
-        text_label = QtWidgets.QLabel(_('AI Agent'), tab_label)
-        text_label.setStyleSheet("background-color: transparent; border: none;")
-        tab_label_layout.addWidget(text_label)
-        tab_label_layout.addStretch()
-        tab_bar.setTabText(tab_index, "")
-        tab_bar.setTabIcon(tab_index, QtGui.QIcon())
-        tab_bar.setTabToolTip(tab_index, _('AI Agent'))
-        tab_bar.setTabButton(
-            tab_index, QtWidgets.QTabBar.ButtonPosition.LeftSide, tab_label
-        )
-        self.ai_chat_tab_label = tab_label
+        if not rail_mode:
+            tab_label = QtWidgets.QWidget(tab_bar)
+            tab_label.setAttribute(QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+            tab_label.setStyleSheet("QWidget {background-color: transparent; border: none;}")
+            tab_label_layout = QtWidgets.QHBoxLayout(tab_label)
+            tab_label_layout.setContentsMargins(0, 0, 0, 0)
+            tab_label_layout.setSpacing(4)
+            icon_label = QtWidgets.QLabel(tab_label)
+            icon_label.setStyleSheet("background-color: transparent; border: none;")
+            icon = tab_bar.tabIcon(tab_index)
+            if not icon.isNull():
+                icon_label.setPixmap(icon.pixmap(16, 16))
+                tab_label_layout.addWidget(icon_label)
+            text_label = QtWidgets.QLabel(_('AI Agent'), tab_label)
+            text_label.setStyleSheet("background-color: transparent; border: none;")
+            tab_label_layout.addWidget(text_label)
+            tab_label_layout.addStretch()
+            tab_bar.setTabText(tab_index, "")
+            tab_bar.setTabIcon(tab_index, QtGui.QIcon())
+            tab_bar.setTabToolTip(tab_index, _('AI Agent'))
+            tab_bar.setTabButton(
+                tab_index, QtWidgets.QTabBar.ButtonPosition.LeftSide, tab_label
+            )
+            self.ai_chat_tab_label = tab_label
         button = QtWidgets.QToolButton(tab_bar)
         button.setAutoRaise(True)
         button.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
@@ -1334,8 +2517,8 @@ Click "Yes" to start now.')
         button.setFixedSize(16, 16)
         button.setStyleSheet(
             "QToolButton {background-color: transparent; border: none; padding: 0px;}"
-            "QToolButton:hover {background-color: transparent; border: 1px solid #8a8a8a;}"
-            "QToolButton:pressed {background-color: transparent; border: 1px solid #707070;}"
+            "QToolButton:hover {background-color: transparent; border: 1px solid #8a8a8a; border-radius: 3px;}"
+            "QToolButton:pressed {background-color: transparent; border: 1px solid #707070; border-radius: 3px;}"
         )
         icon_color = tab_bar.tabTextColor(tab_index)
         if not icon_color.isValid():
@@ -1348,10 +2531,108 @@ Click "Yes" to start now.')
         button.clicked.connect(self.open_ai_chat_sidebar_from_tab_button)
 
         self.ai_chat_tab_sidebar_button = button
-        tab_bar.setTabButton(
-            tab_index, QtWidgets.QTabBar.ButtonPosition.RightSide, button
-        )
+        if rail_mode:
+            self.main_tab_rail.attach_button_below_icon(self.ui.tab_ai_agent, button)
+        else:
+            tab_bar.setTabButton(tab_index, QtWidgets.QTabBar.ButtonPosition.RightSide, button)
         self._sync_ai_chat_tab_widget_visibility()
+
+    def apply_main_tabs_position(self):
+        """Show the main tabs on top or as an icon-only column on the left, as chosen in Settings."""
+
+        left = self.app.settings.get('main_tabs_position', 'top') == 'left'
+        self._remove_ai_chat_tab_widgets()
+        self.main_tab_rail.set_enabled(left)
+        self._setup_ai_chat_tab_sidebar_button(rail_mode=left)
+        self.place_help_settings_buttons(left)
+
+    def build_help_settings_buttons(self):
+        """Help and Settings buttons shown next to the main tabs."""
+
+        self.tab_tools = QtWidgets.QWidget(self.ui.tabWidget)
+        self.tab_tools_layout = QtWidgets.QBoxLayout(QtWidgets.QBoxLayout.Direction.TopToBottom, self.tab_tools)
+        self.tab_tools_layout.setContentsMargins(0, 0, 0, 0)
+        self.tab_tools_layout.setSpacing(4)
+        self.tab_tool_buttons = []
+        self.context_help = ContextHelp(self)
+        for icon_name, tooltip, handler in (("mdi6.help-circle-outline", _("Help for this tab"), self.context_help.open_current),
+                                            ("mdi6.cog-outline", _("Settings"), self.change_settings)):
+            button = QtWidgets.QToolButton(self.tab_tools)
+            button.setAutoRaise(True)
+            button.setToolTip(tooltip)
+            button.setAccessibleName(tooltip)
+            button.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+            button.setProperty("tab_tool_icon", icon_name)
+            button.clicked.connect(lambda _checked=False, h=handler: h())
+            self.tab_tools_layout.addWidget(button)
+            self.tab_tool_buttons.append(button)
+
+    def place_help_settings_buttons(self, rail_mode):
+        """Bottom of the left icon column, or the right corner of the top tabs."""
+
+        if not hasattr(self, "tab_tools"):
+            self.build_help_settings_buttons()
+        size = 40 if rail_mode else 28
+        color = self.ui.textEdit.viewport().palette().color(QtGui.QPalette.ColorRole.Text).name()
+        for button in self.tab_tool_buttons:
+            button.setFixedSize(size, size)
+            button.setIconSize(QtCore.QSize(size - 16, size - 16) if rail_mode else QtCore.QSize(18, 18))
+            try:
+                button.setIcon(qta.icon(button.property("tab_tool_icon"), color=color))
+            except Exception as err:
+                logger.debug(str(err))
+        if rail_mode:
+            self.ui.tabWidget.setCornerWidget(None, QtCore.Qt.Corner.TopRightCorner)
+            self.tab_tools_layout.setDirection(QtWidgets.QBoxLayout.Direction.TopToBottom)
+            self.main_tab_rail.set_footer(self.tab_tools)
+        else:
+            self.main_tab_rail.set_footer(None)
+            self.tab_tools_layout.setDirection(QtWidgets.QBoxLayout.Direction.LeftToRight)
+            self.ui.tabWidget.setCornerWidget(self.tab_tools, QtCore.Qt.Corner.TopRightCorner)
+            self.tab_tools.show()
+
+    def _remove_ai_chat_tab_widgets(self):
+        """Take the custom label and sidebar button off the AI Agent tab."""
+
+        tab_index = self.ui.tabWidget.indexOf(self.ui.tab_ai_agent)
+        if tab_index < 0:
+            return
+        tab_bar = self.ui.tabWidget.tabBar()
+        self.main_tab_rail.detach_button_below_icon(self.ui.tab_ai_agent)
+        tab_bar.setTabButton(tab_index, QtWidgets.QTabBar.ButtonPosition.LeftSide, None)
+        tab_bar.setTabButton(tab_index, QtWidgets.QTabBar.ButtonPosition.RightSide, None)
+        had_label = self.ai_chat_tab_label is not None
+        for widget in (self.ai_chat_tab_label, self.ai_chat_tab_sidebar_button):
+            if widget is not None:
+                widget.deleteLater()
+        self.ai_chat_tab_label = None
+        self.ai_chat_tab_sidebar_button = None
+        if had_label:
+            # The label replaced the tab title and icon, so put them back
+            tab_bar.setTabText(tab_index, _('AI Agent'))
+            tab_bar.setTabIcon(tab_index, self.ai_tab_icon)
+            tab_bar.setTabToolTip(tab_index, "")
+
+    def _setup_main_tab_context_menu(self):
+        """Offer the AI sidebar switch from a right-click on the AI Agent tab."""
+
+        tab_bar = self.ui.tabWidget.tabBar()
+        tab_bar.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
+        tab_bar.customContextMenuRequested.connect(self._main_tab_context_menu)
+
+    def _main_tab_context_menu(self, position):
+        """Show the context menu for the main tab rail."""
+
+        tab_bar = self.ui.tabWidget.tabBar()
+        if self.ui.tabWidget.widget(tab_bar.tabAt(position)) != self.ui.tab_ai_agent:
+            return
+        menu = QtWidgets.QMenu(self)
+        action_sidebar = menu.addAction(_('Move AI Agent to sidebar view'))
+        action_sidebar.setEnabled(self.ui.actionAI_Agent_Sidebar.isEnabled())
+        chosen = menu.exec(tab_bar.mapToGlobal(position))
+        menu.deleteLater()
+        if chosen == action_sidebar:
+            self.open_ai_chat_sidebar_from_tab_button()
 
     def _sync_ai_chat_tab_widget_visibility(self):
         """Keep custom AI tab widgets hidden when the AI tab is hidden."""
@@ -1365,10 +2646,6 @@ Click "Yes" to start now.')
     def open_ai_chat_sidebar_from_tab_button(self):
         """Switch AI chat to sidebar mode from the tab button."""
 
-        if self.app.settings['ai_enable'] != 'True':
-            msg = _('Please enable the AI first and set it up in Settings.')
-            Message(self.app, _('AI Agent'), msg).exec()
-            return
         self.ui.actionAI_Agent_Sidebar.setChecked(True)
 
     def _ensure_widget_layout(self, widget):
@@ -1566,11 +2843,23 @@ Click "Yes" to start now.')
             self._remember_ai_sidebar_width()
             self.ai_sidebar_splitter_save_timer.start(400)
 
-    def tab_layout_helper(self, tab_widget, ui):
+    def tab_layout_helper(self, tab_widget, ui, confirm=True):
         """ Used when loading a coding, report or manage dialog  in to a tab widget.
          Add widget if no layout.
-         If there is a layout, then remove all widgets from it and add the new widget. """
+         If there is a layout, then remove all widgets from it and add the new widget.
+         Returns False if the user chose to keep unsaved work, so ui was discarded. """
 
+        if ui is not None and confirm and not self.confirm_leave_unsaved([tab_widget]):
+            # Closing a dialog that was never shown would store wrong splitter sizes
+            saved_settings = dict(self.app.settings)
+            ui.close()
+            ui.deleteLater()
+            if self.app.settings != saved_settings:
+                self.app.settings.clear()
+                self.app.settings.update(saved_settings)
+                self.app.write_config_ini(self.app.settings, self.app.ai_models)
+            self.ui.tabWidget.setCurrentWidget(tab_widget)
+            return False
         self.ui.tabWidget.setCurrentWidget(tab_widget)
         contents = tab_widget.layout()
         if contents is None:
@@ -1579,6 +2868,50 @@ Click "Yes" to start now.')
         self.clear_tab_widgets(tab_widget, show_placeholder=ui is None)
         if ui is not None:
             contents.addWidget(ui)
+        return True
+
+    def confirm_leave_unsaved(self, tab_widgets=None):
+        """ Ask before discarding an unsaved graph or unapplied code organiser changes.
+        Checks the given tabs, or all tabs if None. Returns True to continue. """
+
+        if tab_widgets is None:
+            tab_widgets = (self.ui.tab_reports, self.ui.tab_coding, self.ui.tab_manage)
+        for tab_widget in tab_widgets:
+            layout = tab_widget.layout()
+            if layout is None:
+                continue
+            for i in range(layout.count()):
+                widget = layout.itemAt(i).widget()
+                if isinstance(widget, ViewGraph):
+                    title = _("Unsaved graph")
+                    msg = _("The graph has unsaved changes.") + "\n"
+                    msg += _("Leave the graph and lose the unsaved changes?")
+                elif isinstance(widget, CodeOrganiser):
+                    title = _("Code organiser")
+                    msg = _("The code organiser has changes that were not applied.") + "\n"
+                    msg += _("Leave the code organiser and lose the changes?")
+                else:
+                    continue
+                try:
+                    if not widget.has_unsaved_changes():
+                        continue
+                except Exception as err:  # Never block closing because the check failed
+                    logger.warning(f"Unsaved changes check failed: {err}")
+                    continue
+                self.ui.tabWidget.setCurrentWidget(tab_widget)
+                reply = QtWidgets.QMessageBox.question(
+                    self, title, msg,
+                    QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+                    QtWidgets.QMessageBox.StandardButton.No)
+                if reply != QtWidgets.QMessageBox.StandardButton.Yes:
+                    return False
+        return True
+
+    def close_project_requested(self):
+        """ Close project from the menu, asking first if there is unsaved work. """
+
+        if self.confirm_leave_unsaved():
+            self.close_project()
 
     def refresh_open_code_display_settings(self):
         """Apply saved code stripe and highlight settings to open code text and PDF dialogs."""
@@ -1633,6 +2966,8 @@ Click "Yes" to start now.')
          NEED TO TEST RELATIVE EXPORTS, TIMESTAMPS AND TRANSCRIPTION
         """
 
+        if not self.confirm_leave_unsaved():
+            return
         self.close_project()
         self.ui.textEdit.append(_("IMPORTING REFI-QDA PROJECT"))
         msg = _(
@@ -1644,13 +2979,15 @@ Click "Yes" to start now.')
             Message(self.app, _("Project creation"), _("REFI-QDA Project not successfully created"), "warning").exec()
             return
         RefiImport(self.app, self.ui.textEdit, "qdpx")
-        if self.app.settings['ai_enable'] == 'True':
+        if self.app.settings['ai_enable'] == 'True' and self.app.ai is not None:
             self.app.ai.init_llm(self, rebuild_vectorstore=True)
         self.project_summary_report()
 
     def taguette_project_import(self):
         """ Import a Taguette project into a new project space. """
 
+        if not self.confirm_leave_unsaved():
+            return
         self.close_project()
         msg = _(
             "Step 1: You will be asked for a new QualCoder project name.\nStep 2: You will be asked for the Taguette.sqlite3 file.")
@@ -1662,10 +2999,30 @@ Click "Yes" to start now.')
             return
         TaguetteImport(self.app, self.ui.textEdit)
         self.project_summary_report()
+    
+    def sonal_project_import(self):
+        """ Import a Sonal (SonalPi) project into a new project space. """
 
+        if not self.confirm_leave_unsaved():
+            return
+        self.close_project()
+        self.ui.textEdit.append(_("IMPORTING SONAL PROJECT"))
+        msg = _(
+            "Step 1: You will be asked for a new QualCoder project name.\nStep 2: You will be asked for the Sonal corpus file (.crp or .zip).")
+        Message(self.app, _('Sonal import steps'), msg).exec()
+        self.new_project()
+        # Check project created successfully
+        if self.app.project_name == "":
+            Message(self.app, _('Project creation'), _("Project not successfully created"), "critical").exec()
+            return
+        SonalImport(self.app, self.ui.textEdit)
+        self.project_summary_report()
+  
     def rqda_project_import(self):
         """ Import an RQDA format project into a new project space. """
 
+        if not self.confirm_leave_unsaved():
+            return
         self.close_project()
         self.ui.textEdit.append(_("IMPORTING RQDA PROJECT"))
         msg = _(
@@ -1694,11 +3051,24 @@ Click "Yes" to start now.')
             if reply != QtWidgets.QMessageBox.StandardButton.Yes:
                 event.ignore()
                 return
+            if not self.confirm_leave_unsaved():
+                event.ignore()
+                return
 
         if self.ai_chat_sidebar_mode:
             self._remember_ai_sidebar_width()
         self.ai_sidebar_splitter_save_timer.stop()
 
+        # Avoid destroying a QThread while Python is in the middle of importing
+        # native AI extensions. This only waits when QualCoder is closed during
+        # the short background-loading window.
+        if self.ai_import_thread is not None and self.ai_import_thread.isRunning():
+            self.ai_import_thread.wait()
+        # Same for the lighter search index import started without the AI runtime
+        if self.vectorstore_import_thread is not None and self.vectorstore_import_thread.isRunning():
+            self.vectorstore_import_thread.wait()
+
+        self.external_mcp.stop()
         self.close_project()
 
         self.app.settings['mainwindow_geometry'] = (
@@ -1742,13 +3112,20 @@ Click "Yes" to start now.')
         v14 has coder_names table added to store codernames and their visibility status
         """
 
+        if not self.confirm_leave_unsaved():
+            return
         self.close_project()
         self.journal_display = None
         previous_app = self.app
         self.app = App()
+        self.app.ai_runtime_state = previous_app.ai_runtime_state
+        self.app.ai_runtime_error = previous_app.ai_runtime_error
         if self.app.settings['directory'] == "":
             self.app.settings['directory'] = get_default_user_directory()
-        self.app.ai = AiLLM(self.app, self.ui.textEdit)
+        if ai_runtime_ready(self.app):
+            from qualcoder.ai_llm import AiLLM
+
+            self.app.ai = AiLLM(self.app, self.ui.textEdit)
         project_path, ok = QtWidgets.QFileDialog.getSaveFileName(self,
                                                              _("Enter project name"), self.app.settings['directory'])
         if project_path == "":
@@ -1777,8 +3154,14 @@ Click "Yes" to start now.')
         except Exception as err:
             logger.critical(_("Project creation error ") + str(err))
             Message(self.app, _("Project"), self.app.project_path + _(" not successfully created"), "critical").exec()
+            failed_app = self.app
             self.app = App()
-            self.app.ai = AiLLM(self.app, self.ui.textEdit)
+            self.app.ai_runtime_state = failed_app.ai_runtime_state
+            self.app.ai_runtime_error = failed_app.ai_runtime_error
+            if ai_runtime_ready(self.app):
+                from qualcoder.ai_llm import AiLLM
+
+                self.app.ai = AiLLM(self.app, self.ui.textEdit)
             return
         self.app.project_name = self.app.project_path.rpartition('/')[2]
         self.app.settings['directory'] = self.app.project_path.rpartition('/')[0]
@@ -1898,35 +3281,51 @@ Click "Yes" to start now.')
         for tab_widget in (self.ui.tab_reports, self.ui.tab_coding, self.ui.tab_manage):
             self.clear_tab_widgets(tab_widget, show_placeholder=True)
 
-    def change_settings(self, section=None, enable_ai=False):
-        """ Change default settings - the coder name, font, font size.
-        Language, Backup options.
-        As this dialog affects all others if the coder name changes, on exit of the dialog,
-        all other opened dialogs are destroyed.
-        
-        section = 'AI' moves to the AI settings at the bottom of the dialog
-        enable_ai = if True, the AI will be enabled in settings
+    def change_settings(self, section: Optional[str] = None, enable_ai: bool = False) -> None:
+        """Change settings, closing other dialogs if coder names change.
+
+        Args:
+            section: 'AI' or 'advanced AI' scrolls to the requested AI settings.
+            enable_ai: Whether to enable AI in the settings dialog.
         """
+        if (enable_ai or self.app.settings['ai_enable'] == 'True') and not ai_runtime_ready(self.app):
+            if not self.load_ai_runtime_modal(_("AI Settings")):
+                return
         current_coder = self.app.settings['codername']
-        ui = DialogSettings(self.app, section=section, enable_ai=enable_ai)
+        ui = DialogSettings(
+            self.app,
+            section=section,
+            enable_ai=enable_ai,
+            ai_runtime_loader=self.load_ai_runtime_modal,
+        )
         ret = ui.exec()
         if ret == QtWidgets.QDialog.DialogCode.Rejected:  # Dialog has been canceled
             return
 
         self.app.settings, self.app.ai_models = self.app.load_settings()
-        self.settings_report()
+        self.external_mcp.sync_with_application_state()
         font = f'font: {self.app.settings["fontsize"]}pt "{self.app.settings["font"]}";'
         self.setStyleSheet(font)
         self.update_placeholder_tab_styles()
-        self.ai_chat_window.init_styles()
+        self.apply_main_tabs_position()
+        if self.ai_chat_window is not None:
+            self.ai_chat_window.init_styles()
         self.refresh_open_code_display_settings()
         
         if self.app.settings['ai_enable'] == 'True':
-            self.app.ai.init_llm(self, rebuild_vectorstore=False)
-        else:  
+            if not ai_runtime_ready(self.app):
+                self.load_ai_runtime_modal(_("AI Settings"))
+            if self.app.ai is not None:
+                self.app.ai.init_llm(self, rebuild_vectorstore=False)
+        elif self.app.ai is not None:
             self.app.ai.close()
+        else:
+            self.app.ai_runtime_state = AI_DISABLED
+        self.start_vectorstore_background_loading()
+        self._show_pending_ai_model_upgrade_offer()
         self.update_ai_menu_options()
-        self.ai_chat_window.refresh_placeholder_if_visible()
+        if self.ai_chat_window is not None:
+            self.ai_chat_window.refresh_placeholder_if_visible()
             
         # Change in coder names: Close all opened dialogs as coder names needs to change everywhere
         if ui.coder_names_changes:
@@ -1955,7 +3354,7 @@ Click "Yes" to start now.')
             self.ui.textEdit.append(_("Project memo entered."))
             self.app.delete_backup = False
 
-    def open_project(self, path_:str="", newproject:str="no"):
+    def open_project(self, path_: str = "", newproject: str = "no") -> None:
         """ Open an existing project.
         if set, also save a backup datetime stamped copy at the same time.
         Do not back up on a newly created project, as it will not contain data.
@@ -1970,7 +3369,6 @@ Click "Yes" to start now.')
             newproject: yes or no  if yes then do not make an initial backup
         """
 
-        self.journal_display = None
         default_directory = self.app.settings['directory']
         if path_ == "" or path_ is False:
             if default_directory == "":
@@ -1979,45 +3377,84 @@ Click "Yes" to start now.')
                                                                _('Open project directory'), default_directory)
         if path_ == "" or path_ is False:
             return
-        msg = ""
         # New path variable from recent_projects.txt contains time | path
         # Older variable only listed the project path
-        path_split = path_.split("|")
-        proj_path = ""
-        if len(path_split) == 1:
-            proj_path = path_split[0]
-        if len(path_split) == 2:
-            proj_path = path_split[1]
-        if len(proj_path) > 3 and proj_path[-4:] == ".qda":
-            # Close the current project first: stale tab dialogs show old data and can
-            # write its ids into the new database (newproject flow already closed it)
-            if newproject == "no" and (self.app.project_name != "" or self.app.conn is not None):
-                self.close_project()
-            try:
-                self.app.create_connection(proj_path)
-            except Exception as err:
-                self.app.conn = None
-                msg += " " + str(err)
-                logger.debug(msg)
-        if self.app.conn is None:
-            msg += f"\n{proj_path}"
-            Message(self.app, _("Cannot open file"), msg, "critical").exec()
-            self.app.project_path = ""
-            self.app.project_name = ""
-            return
-        # Check that the connection is to a valid QualCoder database
-        cur = self.app.conn.cursor()
+        proj_path = path_.split("|", maxsplit=1)[-1]
+        progress = self._show_project_open_progress(Path(proj_path).name)
         try:
-            cur.execute("select databaseversion, date, memo, about from project")
-            res = cur.fetchone()
-            if "QualCoder" not in res[3]:
-                logger.debug("This is not a QualCoder database")
-                self.close_project()
-                return
-        except Exception as err:
-            logger.debug("This in not a QualCoder database " + str(err))
-            self.close_project()
+            self._open_project_steps(proj_path, newproject, progress)
+        finally:
+            progress.close()
+            progress.deleteLater()
+
+    def _show_project_open_progress(self, project_name):
+        """Show a progress dialog so opening a project gives visible feedback."""
+
+        progress = QtWidgets.QProgressDialog(_("Opening project: ") + project_name, "", 0, 5, self)
+        progress.setWindowTitle(_("Open project"))
+        progress.setCancelButton(None)
+        progress.setWindowModality(QtCore.Qt.WindowModality.NonModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.setMinimumWidth(420)
+        progress.setValue(0)
+        progress.show()
+        QtWidgets.QApplication.processEvents()
+        return progress
+
+    @staticmethod
+    def _project_open_step(progress, value, text):
+        """Advance the project opening progress dialog and repaint it."""
+
+        if progress is None:
             return
+        progress.setLabelText(text)
+        progress.setValue(value)
+        QtWidgets.QApplication.processEvents()
+
+    def _open_project_steps(self, proj_path, newproject, progress=None):
+        """Validate, migrate and load the project at proj_path. See open_project."""
+
+        try:
+            proj_path, project_connection = self._open_project_connection(proj_path)
+        except ProjectOpenError as err:
+            messages = {
+                "wrong_suffix": _("The selected folder is not a QualCoder project folder. "
+                                  "Its name must end with .qda."),
+                "folder_unavailable": _("The selected project folder does not exist or cannot be accessed."),
+                "missing_database": _("No data.qda database found in the selected folder."),
+                "database_unavailable": _("The project database could not be opened."),
+                "invalid_database": _("The selected folder does not contain a valid QualCoder project database."),
+            }
+            msg = messages[err.reason]
+            if err.details:
+                msg += f"\n\n{err.details}"
+            msg += f"\n\n{err.project_path}"
+            logger.warning(msg)
+            Message(self.app, _("Cannot open project"), msg, "critical").exec()
+            return
+
+        # Do not alter the active project until the selected project has been validated.
+        if newproject == "no" and (self.app.project_name != "" or self.app.conn is not None) \
+                and not self.confirm_leave_unsaved():
+            project_connection.close()
+            return
+        self.journal_display = None
+        if newproject == "no" and (self.app.project_name != "" or self.app.conn is not None):
+            try:
+                self.close_project()
+            except Exception:
+                project_connection.close()
+                raise
+        elif self.app.conn is not None and self.app.conn is not project_connection:
+            # A newly created project already has a connection at this point.
+            self.app.conn.close()
+        self.app.project_path = proj_path
+        self.app.project_name = Path(proj_path).name
+        self.app.conn = project_connection
+
+        cur = self.app.conn.cursor()
 
         # Potential design flaw to have the current coders name in the config.ini file (early versions of QC).
         # as it would change to this coder when opening different projects
@@ -2051,6 +3488,7 @@ Click "Yes" to start now.')
         self.app.append_recent_project(self.app.project_path)
         self.fill_recent_projects_menu_actions()
         self.setWindowTitle("QualCoder " + self.app.project_name)
+        self._project_open_step(progress, 1, _("Checking the project database"))
 
         # Check avid column in code_text table, Database version v2
         cur = self.app.conn.cursor()
@@ -2445,15 +3883,38 @@ Click "Yes" to start now.')
 
         # Save a date and 24 hour stamped backup
         if self.app.settings['backup_on_open'] == 'True' and newproject == "no":
+            self._project_open_step(progress, 2, _("Saving a backup copy of the project"))
             msg, backup_name = self.app.save_backup()
-            self.ui.textEdit.append(msg)
+            backup_path = Path(backup_name)
+            backup_url = QtCore.QUrl.fromLocalFile(str(backup_path)).toString()
+            backup_link = (f'<a href="{html.escape(backup_url)}" title="{html.escape(str(backup_path))}">'
+                           f'{html.escape(backup_path.name)}</a>')
+            backup_message = html.escape(msg).replace(html.escape(backup_name), '<br />' + backup_link)
+            backup_message = backup_message.replace("\n", "<br />")
+            self.ui.textEdit.append(f'<p>{backup_message}</p>')
+        self._project_open_step(progress, 3, _("Preparing AI and search components"))
         # AI: init llm and update vectorstore after backup to avoid locked sqlite sidecar files.
-        self.app.ai.init_llm(self)
-        self.ai_chat_window.init_ai_chat(self.app)
-        msg = f"{_('Project Opened: ')}{self.app.project_name}"
+        if self.app.ai is not None:
+            self.app.ai.init_llm(self)
+        self.start_vectorstore_background_loading()
+        if self.ai_chat_window is not None:
+            self.ai_chat_window.init_ai_chat(self.app)
+        self._project_open_step(progress, 4, _("Preparing the project summary"))
+        project_url = QtCore.QUrl.fromLocalFile(self.app.project_path).toString()
+        msg = (f"<p><b>{html.escape(_('Project Opened: '))}</b><br />"
+               f'<a href="{html.escape(project_url)}" title="{html.escape(self.app.project_path)}">'
+               f"{html.escape(self.app.project_name)}</a></p>")
         self.ui.textEdit.append(msg)
-        self.project_summary_report()
+        cur.execute("select databaseversion, date, memo from project")
+        result = cur.fetchall()[-1]
+        self.project['databaseversion'] = result[0]
+        self.project['date'] = result[1]
+        self.project['memo'] = result[2]
+        self.request_project_summary_update()
+        self.ui.tabWidget.setCurrentWidget(self.ui.tab_action_log)
         self.show_menu_options()
+        self.external_mcp.sync_with_application_state()
+        self._project_open_step(progress, 5, _("Project opened"))
 
     def project_summary_report(self):
         """ Add a summary of the project to the text edit.
@@ -2468,8 +3929,7 @@ Click "Yes" to start now.')
         self.project['databaseversion'] = result[0]
         self.project['date'] = result[1]
         self.project['memo'] = result[2]
-        self.ui.textEdit.append("<br />")
-        self.ui.textEdit.append("<h1>" + _("Project summary") + "</h1>")
+        self.ui.textEdit.append(f"<p><b>{html.escape(_('Project summary'))}</b></p>")
         msg = f"<p>{self.app.project_name}<br />"
         msg += f'{_("Project path: ")}{self.app.project_path}<br />'
         msg += f"{_('Project date: ')}{self.project['date']}<br />"
@@ -2526,6 +3986,7 @@ Click "Yes" to start now.')
             self.ui.actionManage_bad_links_to_files.setEnabled(False)
         msg += "▔" * 20 + "</p>"
         self.ui.textEdit.append(msg)
+        self.request_project_summary_update()
         self.ui.tabWidget.setCurrentWidget(self.ui.tab_action_log)
         self.ui.textEdit.verticalScrollBar().setValue(self.ui.textEdit.verticalScrollBar().maximum())
 
@@ -2534,6 +3995,7 @@ Click "Yes" to start now.')
         Remove widgets from tabs, clear dialog list. Close app connection.
         Delete old backups. Hide menu options. """
 
+        self.app.ai_mcp_server.reset_project_state()
         self.journal_display = None
         for tab_widget in (self.ui.tab_reports, self.ui.tab_coding, self.ui.tab_manage):
             self.clear_tab_widgets(tab_widget, show_placeholder=True)
@@ -2542,8 +4004,12 @@ Click "Yes" to start now.')
             self.ui.textEdit.append(_("Closing project: ") + self.app.project_name +"\n" + "▔" * 20 + "\n")
             self.app.append_recent_project(self.app.project_path)
         # AI
-        self.ai_chat_window.close()
-        self.app.ai.close()
+        if self.ai_chat_window is not None:
+            self.ai_chat_window.close()
+        if self.app.ai is not None:
+            self.app.ai.close()
+        if getattr(self.app, "vectorstore", None) is not None:
+            self.app.vectorstore.close()
         
         if self.app.conn is not None:
             try:
@@ -2558,23 +4024,26 @@ Click "Yes" to start now.')
         self.app.conn = None
         self.app.project_path = ""
         self.app.project_name = ""
+        self.app.coding_tree_collapsed.clear()
         self.app.delete_backup_path_name = ""
         self.app.delete_backup = True
         self.project = {"databaseversion": "", "date": "", "memo": "", "about": ""}
+        self.fill_recent_projects_list()  # No open project left to highlight
         self.hide_menu_options()
         self.setWindowTitle("QualCoder")
         self.app.write_config_ini(self.app.settings, self.app.ai_models)
         self.ui.tabWidget.setCurrentWidget(self.ui.tab_action_log)
         self.ui.textEdit.verticalScrollBar().setValue(self.ui.textEdit.verticalScrollBar().maximum())
 
-    def delete_backup_folders(self):
+    def delete_backup_folders(self) -> None:
         """ Delete the most current backup created on opening a project,
         providing the project was not changed in any way.
         Delete the oldest backups if more than BACKUP_NUM are created.
         Backup name format: directories/projectname_BKUP_yyyymmdd_hh.qda
         Requires: self.settings['backup_num'] """
 
-        if self.app.project_path == "" or not Path(self.app.project_path).exists():
+        project_path = Path(self.app.project_path)
+        if self.app.project_path == "" or not project_path.exists():
             return
         if self.app.delete_backup_path_name != "" and self.app.delete_backup:
             try:
@@ -2582,29 +4051,33 @@ Click "Yes" to start now.')
             except Exception as err:
                 print(str(err))
                 logger.warning(str(err))
-        # Get a list of backup folders for current project
-        parts = self.app.project_path.split('/')
-        project_name_and_suffix = parts[-1]
-        directory = self.app.project_path[0:-len(project_name_and_suffix)]
-        project_name = project_name_and_suffix[:-4]
-        project_name_and_bkup = project_name + "_BKUP_"
-        lenname = len(project_name_and_bkup)
-        files_folders = os.listdir(directory)
-        backups = []
-        for f_ in files_folders:
-            if f_[0:lenname] == project_name_and_bkup and f_[-4:] == ".qda":
-                backups.append(f_)
+        # Get a list of backup folders for the current project. Path handles both
+        # slash styles and also relative project paths without producing an empty
+        # parent directory.
+        directory = project_path.parent
+        project_name_and_bkup = project_path.stem + "_BKUP_"
+        try:
+            backups = [
+                path for path in directory.iterdir()
+                if path.is_dir()
+                and path.name.startswith(project_name_and_bkup)
+                and path.suffix.lower() == ".qda"
+            ]
+        except OSError as err:
+            logger.warning(str(err))
+            return
         # Sort newest to oldest, and remove any that are more than BACKUP_NUM position in the list
-        backups.sort(reverse=True)
+        backups.sort(key=lambda path: path.name, reverse=True)
         to_remove = []
         if len(backups) > self.app.settings['backup_num']:
             to_remove = backups[self.app.settings['backup_num']:]
         if not to_remove:
             return
-        for f_ in to_remove:
+        for backup_path in to_remove:
             try:
-                shutil.rmtree(directory + f_)
-                self.ui.textEdit.append(_("Deleting: ") + directory + f_)
+                if backup_path != '':
+                    shutil.rmtree(backup_path)
+                    self.ui.textEdit.append(_("Deleting: ") + str(backup_path))
             except Exception as err:
                 print(str(err))
                 logger.warning(str(err))
@@ -2612,6 +4085,8 @@ Click "Yes" to start now.')
     # AI Menu Actions
     def ai_setup_wizard(self):
         """Action triggered by AI Setup Wizard menu item or at the first start of QualCoder."""
+        if not ai_runtime_ready(self.app) and not self.load_ai_runtime_modal(_("AI Setup Wizard")):
+            return
         if self.app.settings['ai_enable'] == 'True':
             msg = _('The AI is setup and enabled, so there is nothing to do here. '
                     'Go to AI > settings to change the current model or other settings.')
@@ -2620,11 +4095,12 @@ Click "Yes" to start now.')
         self.ui.textEdit.append(_('AI: Setup Wizard'))
         QtWidgets.QApplication.processEvents()  # update ui
         self.app.ai.init_llm(self, rebuild_vectorstore=False, enable_ai=True)
+        self._show_pending_ai_model_upgrade_offer()
         self.update_ai_menu_options()
         self.ai_chat_window.refresh_placeholder_if_visible()
         self.ui.textEdit.append(_('AI: Setup Wizard finished'))
         if self.app.settings['ai_enable'] == 'True':
-            ai_status = self.app.ai.get_status()
+            ai_status = self.app.get_ai_status()
             if ai_status == 'reading data':
                 msg = _('The AI setup is complete. The AI is now reading your project data in the background.')
             elif ai_status == 'ready':
@@ -2639,14 +4115,8 @@ Click "Yes" to start now.')
 
     def ai_rebuild_memory(self):
         """ Action triggered by AI Rebuild Internal Memory menu item."""
-        if self.app.settings['ai_enable'] != 'True':
-            msg = _('Please enable the AI first and set it in Settings.')
-            Message(self.app, _('Rebuild AI Memory'), msg).exec() 
+        if not ensure_ai_ready(self.app, _("Rebuild AI Memory")):
             return
-        if not self.app.ai.is_ready():
-            msg = _('The AI is busy or not set up correctly.')
-            Message(self.app, _('Rebuild AI Memory'), msg).exec()
-            return 
         
         msg = _('This will re-read all of your empirical documents, which may take some time. Do you want to continue?')
         mb = QtWidgets.QMessageBox(self)
@@ -2661,6 +4131,8 @@ Click "Yes" to start now.')
     
     def ai_prompts(self, initial_prompt_name: str = "", initial_prompt_scope: str = ""):
         """ Action triggered by AI Prompts menu item."""
+        from qualcoder.ai_prompt_library import DialogAiEditPrompts
+
         DialogAiEditPrompts(
             self.app,
             initial_prompt_name=initial_prompt_name,
@@ -2669,19 +4141,50 @@ Click "Yes" to start now.')
 
     def ai_go_chat(self):
         """Action triggered by AI Agent menu item."""
-        if self.app.settings['ai_enable'] != 'True':
-            msg = _('Please enable the AI first and set it up in Settings.')
-            Message(self.app, _('AI Agent'), msg).exec()
-            return
         if self.ai_chat_sidebar_mode:
             self.set_ai_chat_sidebar_mode(True, persist=False)
         else:
             self.set_ai_chat_sidebar_mode(False, persist=False)
             self.ui.tabWidget.setCurrentWidget(self.ui.tab_ai_agent)
 
+    def ai_go_analysis(self) -> None:
+        """Start the AI analysis selected in the Analysis menu."""
+
+        if not ensure_ai_ready(self.app, _("AI Analysis")):
+            return
+        if self.ai_chat_window is None:
+            return
+        handlers = {
+            self.ui.actionAI_topic_exploration: (self.ai_chat_window.new_topic_exploration, True),
+            self.ui.actionAI_text_analysis: (self.ai_chat_window.new_text_analysis, False),
+            self.ui.actionAI_code_analysis: (self.ai_chat_window.new_code_analysis, True),
+        }
+        selected_handler = handlers.get(self.sender())
+        if selected_handler is None:
+            logger.warning("Unknown AI analysis menu action")
+            return
+        handler, show_ai_agent = selected_handler
+        if show_ai_agent:
+            self.set_ai_chat_sidebar_mode(False, persist=False)
+            self.ui.tabWidget.setCurrentWidget(self.ui.tab_ai_agent)
+        handler()
+
+    def ai_check_project_readiness(self) -> None:
+        """Start an AI Agent chat that assesses the current project."""
+
+        if not ensure_ai_ready(self.app, _("AI Agent")):
+            return
+        if self.ai_chat_window is None:
+            return
+        self.set_ai_chat_sidebar_mode(False, persist=False)
+        self.ui.tabWidget.setCurrentWidget(self.ui.tab_ai_agent)
+        self.ai_chat_window.new_project_ai_readiness_chat()
+
     def ai_go_help_support(self):
         """Action triggered by Help > Ask the AI Agent."""
 
+        if not ensure_ai_ready(self.app, _("AI Agent")):
+            return
         if self.app.settings['ai_enable'] != 'True':
             msg = _('Please enable the AI first and set it up in Settings.')
             Message(self.app, _('AI Agent'), msg).exec()
@@ -2695,18 +4198,21 @@ Click "Yes" to start now.')
 
     def ai_go_search(self):
         """ Action triggered by AI Search and Coding menu item."""
+        if not ensure_ai_loaded(self.app, _("AI Search")):
+            return
         if self.app.settings['ai_enable'] != 'True':
             msg = _('Please enable the AI first and set it up in Settings.')
             Message(self.app, _('Rebuild AI Memory'), msg).exec() 
             return
         self.text_coding(task='ai_search')
 
-    def get_latest_github_release(self):
-        """ Get latest github release. Some issues on some platforms, so in try except. """
+    '''def get_latest_github_release(self):
+        """Show a compact version header."""
 
-        self.ui.textEdit.append(_("This version: ") + self.app.version)
+        self.ui.textEdit.append(
+            f'<p><b>{html.escape(self.app.version)}</b> &middot; '
+            f'<a href="qualcoder://action/about">{html.escape(_("About"))}</a></p>')
         if "beta" in self.app.version.lower():
-            self.ui.textEdit.append(self.app.citation.split('Retrieved')[0])
             return
         try:
             _json = json.loads(urllib.request.urlopen(urllib.request.Request(
@@ -2719,20 +4225,18 @@ Click "Yes" to start now.')
             temp_this_version = self.app.version.replace("QualCoder", "")
             tmp_this_version_num = temp_this_version.split('.', 1)
             this_version_num = float(tmp_this_version_num[0] + '.' + tmp_this_version_num[1].replace('.', ''))
+            release_link = (f'<a href="{html.escape(_json["html_url"])}">'
+                            f'{html.escape(_json["name"])}</a>')
             if release_num > this_version_num:
-                html = '<span style="color:red">' + _("Newer release available: ") + _json['name'] + '</span>'
-                self.ui.textEdit.append(html)
-                html = f'<span style="color:red">{_json["html_url"]}</span><br />'
-                self.ui.textEdit.append(html)
+                html_string = '<span style="color:red">' + html.escape(_("Newer release available: "))
+                self.ui.textEdit.append(html_string + release_link + '</span>')
             elif str(release_num) == str(this_version_num):
-                self.ui.textEdit.append(_("Latest Release: ") + _json['name'])
-                self.ui.textEdit.append(_json['html_url'] + "\n")
+                self.ui.textEdit.append(html.escape(_("Latest Release: ")) + release_link)
             else:
                 self.ui.textEdit.append(_("This version may be a pre-release version."))
         except Exception as err:
             print(err)
-            logger.warning(str(err))
-        self.ui.textEdit.append(self.app.citation)
+            logger.warning(str(err))'''
 
 def gui():
     # print("Qt version: " + str(QtCore.qVersion()))
@@ -2740,21 +4244,27 @@ def gui():
     settings = qual_app.settings
     ai_models = qual_app.ai_models
     project_path = qual_app.get_most_recent_projectpath()
-    if platform.system() == "Windows" and settings.get('stylesheet') == "native":
-        # Avoid early native Windows style initialization crashes in Qt before our later Fusion fallback runs.
-        os.environ.setdefault("QT_STYLE_OVERRIDE", "Fusion")
+    
+    if sys.platform in ["linux", "bsd"]: 
+        QtWidgets.QApplication.setDesktopFileName("QualCoder")
+        
+    # Prefer Fusion during initialization, then enforce it before applying colors.
+    os.environ.setdefault("QT_STYLE_OVERRIDE", "Fusion")
     # Native video frame must not force sibling widgets native
     QtWidgets.QApplication.setAttribute(
         QtCore.Qt.ApplicationAttribute.AA_DontCreateNativeWidgetSiblings)
     app = QtWidgets.QApplication(sys.argv)
+    app.setStyle("Fusion")
     app._qc_installed_translators = []
+    # Mouse wheel must not change closed comboboxes by accident, in any dialog
+    app._qc_combo_wheel_guard = ComboWheelGuard(app)
+    app.installEventFilter(app._qc_combo_wheel_guard)
     # Noto Sans - for general application
     install_noto_sans()
     QtGui.QFontDatabase.addApplicationFont(str(qc_config_folder / "NotoSans-Regular.ttf"))
     # DroidSandMono - for wordcloud
     install_droid_sans_mono()
-    stylesheet = qual_app.merge_settings_with_default_stylesheet(settings)
-    app.setStyleSheet(stylesheet)
+    qual_app.apply_theme(settings)
     qta.reset_cache()
     qta.set_defaults(
         color=qual_app.qtawesome_icon_color,
@@ -2844,7 +4354,11 @@ def gui():
         # log the exception and show error msg
         qt_exception_hook.exception_hook(type_e, value, tb_obj)
 
-    sys.exit(app.exec())
+    exit_code = app.exec()
+    app.processEvents()
+    QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.Type.DeferredDelete)
+    app.processEvents()
+    return exit_code
 
 
 def install_droid_sans_mono():
@@ -2866,6 +4380,4 @@ def install_noto_sans():
 
 
 if __name__ == "__main__":
-    # Pyinstaller fix
-    multiprocessing.freeze_support()
-    gui()
+    sys.exit(gui())

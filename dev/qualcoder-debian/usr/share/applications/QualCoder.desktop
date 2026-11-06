@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=QualCoder
+GenericName=QualCoder
+Icon=/usr/share/icons/qualcoder.png
+Comment=Qualitative data analysis for text, images, audio, video.
+Exec=/usr/bin/qualcoder
+Terminal=false
+Type=Application
+Categories=Science;Education;
+StartupWMClass=QualCoder

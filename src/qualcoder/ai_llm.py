@@ -20,8 +20,11 @@ https://qualcoder.wordpress.com/
 https://qualcoder.org/
 """
 
+from __future__ import annotations
+
 import asyncio
 import configparser
+import json
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -33,40 +36,112 @@ import time
 import traceback
 import uuid
 
-from Bio.Align import PairwiseAligner
-import httpx
-from langchain_core.callbacks.base import BaseCallbackHandler
-from langchain_community.cache import InMemoryCache  # Unused
-from langchain_core.documents.base import Document  # Unused
-from langchain_core.globals import set_llm_cache  # Unused
-from langchain_core.messages.ai import AIMessage  # Unused
-from langchain_core.messages.human import HumanMessage
-from langchain_core.messages.system import SystemMessage
-from langchain_core.runnables.config import RunnableConfig
-from langchain_openai import ChatOpenAI, AzureChatOpenAI
-from langchain_openai.chat_models.codex import _ChatOpenAICodex
-from langchain_openai.chatgpt_oauth import (
-    _ChatGPTOAuthRefreshError,
-    _FileChatGPTOAuthTokenProvider,
-    login_chatgpt,
-)
-import json_repair
-from openai import OpenAI, BadRequestError
-from pydantic import ValidationError
 from PyQt6 import QtCore
 from PyQt6 import QtGui
 from PyQt6 import QtWidgets
-import qtawesome as qta
 
 from .ai_agent_prompts import AiAgentPromptsCatalog, AgentPromptRecord
 from .ai_async_worker import Worker
 from .ai_memo import extract_ai_memo as extract_public_ai_memo
-from .ai_vectorstore import AiVectorstore
+from .ai_ui import (
+    code_analysis_icon,
+    general_chat_icon,
+    prompt_icon,
+    prompt_scope_icon,
+    search_icon,
+    text_analysis_icon,
+    topic_exploration_icon,
+)
 from .confirm_delete import DialogConfirmDelete
 from .error_dlg import qt_exception_hook
 from .helpers import Message
 from .html_parser import html_to_text
 from .select_items import DialogSelectItems
+
+# Expensive third-party packages are loaded automatically by the background
+# AI loader after the main window is usable.  Keeping these names at module
+# scope lets the rest of this module remain unchanged while importing the
+# lightweight profile helpers above during application startup.
+PairwiseAligner = None
+httpx = None
+AIMessage = None
+HumanMessage = None
+SystemMessage = None
+RunnableConfig = None
+ChatOpenAI = None
+AzureChatOpenAI = None
+_ChatOpenAICodex = None
+_ChatGPTOAuthRefreshError = None
+_FileChatGPTOAuthTokenProvider = None
+login_chatgpt = None
+json_repair = None
+OpenAI = None
+BadRequestError = None
+ValidationError = None
+AiVectorstore = None
+
+_AI_DEPENDENCIES_LOADED = False
+_AI_DEPENDENCIES_LOCK = threading.Lock()
+
+
+def load_ai_runtime_dependencies() -> None:
+    """Import expensive AI runtime packages once.
+
+    This function is called by the background loader. It is also safe to call
+    defensively from runtime-only helpers after loading has completed.
+    """
+
+    global _AI_DEPENDENCIES_LOADED
+    global AIMessage, AiVectorstore, AzureChatOpenAI, BadRequestError
+    global ChatOpenAI, HumanMessage, OpenAI, PairwiseAligner, RunnableConfig
+    global SystemMessage, ValidationError, _ChatGPTOAuthRefreshError
+    global _ChatOpenAICodex, _FileChatGPTOAuthTokenProvider, httpx
+    global json_repair, login_chatgpt
+
+    if _AI_DEPENDENCIES_LOADED:
+        return
+    with _AI_DEPENDENCIES_LOCK:
+        if _AI_DEPENDENCIES_LOADED:
+            return
+
+        from Bio.Align import PairwiseAligner as pairwise_aligner
+        import httpx as httpx_module
+        from langchain_core.messages.ai import AIMessage as ai_message
+        from langchain_core.messages.human import HumanMessage as human_message
+        from langchain_core.messages.system import SystemMessage as system_message
+        from langchain_core.runnables.config import RunnableConfig as runnable_config
+        from langchain_openai import AzureChatOpenAI as azure_chat_open_ai
+        from langchain_openai import ChatOpenAI as chat_open_ai
+        from langchain_openai.chat_models.codex import _ChatOpenAICodex as chat_open_ai_codex
+        from langchain_openai.chatgpt_oauth import (
+            _ChatGPTOAuthRefreshError as chatgpt_oauth_refresh_error,
+            _FileChatGPTOAuthTokenProvider as file_chatgpt_oauth_token_provider,
+            login_chatgpt as login_chatgpt_function,
+        )
+        import json_repair as json_repair_module
+        from openai import BadRequestError as bad_request_error
+        from openai import OpenAI as open_ai
+        from pydantic import ValidationError as validation_error
+        from .ai_vectorstore import AiVectorstore as ai_vectorstore
+
+        PairwiseAligner = pairwise_aligner
+        httpx = httpx_module
+        AIMessage = ai_message
+        HumanMessage = human_message
+        SystemMessage = system_message
+        RunnableConfig = runnable_config
+        ChatOpenAI = chat_open_ai
+        AzureChatOpenAI = azure_chat_open_ai
+        _ChatOpenAICodex = chat_open_ai_codex
+        _ChatGPTOAuthRefreshError = chatgpt_oauth_refresh_error
+        _FileChatGPTOAuthTokenProvider = file_chatgpt_oauth_token_provider
+        login_chatgpt = login_chatgpt_function
+        json_repair = json_repair_module
+        OpenAI = open_ai
+        BadRequestError = bad_request_error
+        ValidationError = validation_error
+        AiVectorstore = ai_vectorstore
+        _AI_DEPENDENCIES_LOADED = True
 
 max_memo_length = 1500  # Maximum length of the memo send to the AI
 
@@ -111,12 +186,16 @@ class AiRunContext:
     provider: str = ''
         
 
-class MyCustomSyncHandler(BaseCallbackHandler):
-    def __init__(self, ai_llm):
-        self.ai_llm = ai_llm
-        
-    def on_llm_new_token(self, token: str, **kwargs) -> None:
-        self.ai_llm.run_progress_count += 1
+def make_custom_sync_handler(ai_llm):
+    """Create the LangChain callback after its base class is available."""
+
+    from langchain_core.callbacks.base import BaseCallbackHandler
+
+    class MyCustomSyncHandler(BaseCallbackHandler):
+        def on_llm_new_token(self, token: str, **kwargs) -> None:
+            ai_llm.run_progress_count += 1
+
+    return MyCustomSyncHandler()
     
 
 def extract_ai_memo(memo: str) -> str:
@@ -157,6 +236,7 @@ def ensure_chatgpt_oauth_profile_defaults(model: dict | None) -> None:
 def _chatgpt_oauth_provider(timeout: float = 5.0) -> _FileChatGPTOAuthTokenProvider:
     """Return the default ChatGPT OAuth token provider."""
 
+    load_ai_runtime_dependencies()
     return _FileChatGPTOAuthTokenProvider(timeout=timeout)
 
 
@@ -196,6 +276,7 @@ def get_chatgpt_oauth_status(timeout: float = 5.0) -> tuple[bool, str]:
 def renew_chatgpt_oauth(timeout: float = 300.0) -> tuple[bool, str]:
     """Start or renew ChatGPT OAuth authentication."""
 
+    load_ai_runtime_dependencies()
     try:
         login_chatgpt(timeout=timeout)
     except Exception as err:
@@ -214,6 +295,7 @@ def _chatgpt_oauth_reauth_message() -> str:
     
 def get_available_models(app, api_base: str, api_key: str) -> list:
     """Queries the API and returns a list of all AI models available from this provider."""
+    load_ai_runtime_dependencies()
     if is_chatgpt_oauth_api_base(api_base):
         return []
     msg = None
@@ -234,42 +316,76 @@ def get_available_models(app, api_base: str, api_key: str) -> list:
             msg.deleteLater()
     return model_list
 
-def get_default_ai_models():
+def _parse_ai_models_ini(ini_string: str) -> list[dict[str, str]]:
+    """Parse AI profiles while preserving sections with duplicate names.
+
+    Args:
+        ini_string: AI profile definitions using ``ai_model_`` sections.
+    """
+
+    ai_models = []
+    section_pattern = re.compile(r'^\[ai_model_[^\]\r\n]+\][ \t]*$', re.MULTILINE)
+    section_starts = [match.start() for match in section_pattern.finditer(ini_string)]
+    for section_index, section_start in enumerate(section_starts):
+        if section_index + 1 < len(section_starts):
+            section_end = section_starts[section_index + 1]
+        else:
+            section_end = len(ini_string)
+        config = configparser.ConfigParser()
+        config.read_string(ini_string[section_start:section_end])
+        section = config.sections()[0]
+        model = {
+            'name': section[9:],
+            'desc': config[section].get('desc', ''),
+            'access_info_url': config[section].get('access_info_url', ''),
+            'large_model': config[section].get('large_model', ''),
+            'large_model_context_window': config[section].get('large_model_context_window', '32768'),
+            'fast_model': config[section].get('fast_model', ''),
+            'fast_model_context_window': config[section].get('fast_model_context_window', '32768'),
+            'reasoning_effort': config[section].get('reasoning_effort', ''),
+            'api_base': config[section].get('api_base', ''),
+            'api_key': config[section].get('api_key', '')
+        }
+        ai_models.append(model)
+    return ai_models
+
+
+def get_default_ai_models() -> list[dict[str, str]]:
     ini_string = """
-[ai_model_OpenAI GPT5.5 reasoning]
+[ai_model_OpenAI GPT5.6 reasoning]
 desc = Powerful model from OpenAI, with internal reasoning, for complex tasks.
 	You need an API-key from OpenAI and have paid for credits in your account.
 	OpenAI will charge a small amount for every use.
 access_info_url = https://platform.openai.com/api-keys
-large_model = gpt-5.5
+large_model = gpt-5.6-sol
 large_model_context_window = 272000
-fast_model = gpt-5.4-mini
-fast_model_context_window = 400000
+fast_model = gpt-5.6-terra
+fast_model_context_window = 272000
 reasoning_effort = medium
 api_base = 
 api_key = 
 
-[ai_model_OpenAI GPT5.5 no reasoning]
+[ai_model_OpenAI GPT5.6 no reasoning]
 desc = Powerful model from OpenAI, no reasoning, faster and cheaper.
 	You need an API-key from OpenAI and have paid for credits in your account.
 	OpenAI will charge a small amount for every use.
 access_info_url = https://platform.openai.com/api-keys
-large_model = gpt-5.5
+large_model = gpt-5.6-sol
 large_model_context_window = 272000
-fast_model = gpt-5.4-mini
-fast_model_context_window = 400000
+fast_model = gpt-5.6-terra
+fast_model_context_window = 272000
 reasoning_effort = low
 api_base = 
 api_key = 
 
-[ai_model_OpenAI_ChatGPT_Login GPT5.5]
+[ai_model_OpenAI_ChatGPT_Login GPT5.6]
 desc = Lets you use your ChatGPT Plus, Pro, or Team account with QualCoder.
 	No API key, no extra cost. Use the "Renew" button to authenticate your account.
     Note that this is experimental, availability may vary. 
 access_info_url = https://chatgpt.com/
-large_model = gpt-5.5
+large_model = gpt-5.6-sol
 large_model_context_window = 272000
-fast_model = gpt-5.5
+fast_model = gpt-5.6-terra
 fast_model_context_window = 272000
 reasoning_effort = medium
 api_base = ChatGPT_OAuth
@@ -288,33 +404,17 @@ fast_model = alias-fast
 fast_model_context_window = 32000
 reasoning_effort = default
 api_base = https://api.helmholtz-blablador.fz-juelich.de/v1/
-api_key = 
+api_key =  
 
-[ai_model_Blablador Huge]
-desc = The largest and most powerful model currently running on Blablador. 
-    Availability might change.
-	Blablador is free to use and runs on a server of the Helmholtz Society,
-	a large non-profit research organization in Germany. To gain
-	access and get an API-key, you have to identify yourself once with your
-	university, ORCID, GitHub, or Google account.
-access_info_url = https://sdlaml.pages.jsc.fz-juelich.de/ai/guides/blablador_api_access/
-large_model = alias-huge
-large_model_context_window = 128000
-fast_model = alias-fast
-fast_model_context_window = 128000
-reasoning_effort = default
-api_base = https://api.helmholtz-blablador.fz-juelich.de/v1/
-api_key = 
-
-[ai_model_Anthropic Claude Opus 4.8]
+[ai_model_Anthropic Claude Opus 5]
 desc = Claude is a family of high quality models from Anthropic.
 	You need an API-key from Anthropic and credits in your account.
 	Anthropic will charge a small amount for every use.
 access_info_url = https://console.anthropic.com/settings/keys
-large_model = claude-opus-4-8
+large_model = claude-opus-5
 large_model_context_window = 1000000
-fast_model = claude-sonnet-5
-fast_model_context_window = 1000000
+fast_model = claude-haiku-4-5-20251001
+fast_model_context_window = 200000
 reasoning_effort = medium
 api_base = https://api.anthropic.com/v1/
 api_key = 
@@ -326,18 +426,18 @@ desc = Claude is a family of high quality models from Anthropic.
 access_info_url = https://console.anthropic.com/settings/keys
 large_model = claude-sonnet-5
 large_model_context_window = 1000000
-fast_model = claude-sonnet-5
-fast_model_context_window = 1000000
+fast_model = claude-haiku-4-5-20251001
+fast_model_context_window = 200000
 reasoning_effort = medium
 api_base = https://api.anthropic.com/v1/
 api_key = 
 
-[ai_model_Google Gemini 3.5 Flash]
+[ai_model_Google Gemini 3.6 Flash]
 desc = Google offers several free and paid models on their servers.
 	Select one in the Advanced AI options below.
 	You need an API-key from Google.
 access_info_url = https://ai.google.dev/gemini-api/docs
-large_model = gemini-3.5-flash
+large_model = gemini-3.6-flash
 large_model_context_window = 1000000
 fast_model = gemini-3.1-flash-lite
 fast_model_context_window = 1000000
@@ -345,14 +445,14 @@ reasoning_effort = default
 api_base = https://generativelanguage.googleapis.com/v1beta/openai/
 api_key = 
 
-[ai_model_Deepseek Chat V3]
+[ai_model_Deepseek Chat V4]
 desc = Deepseek is a high quality Chinese chat model.
 	You will need an an API-key from Deepseek and have payed credits in your account.
 	Deepseek will charge a small amount for every use.
 access_info_url = https://platform.deepseek.com/api_keys
-large_model = deepseek-chat
+large_model = deepseek-v4-pro
 large_model_context_window = 64000
-fast_model = deepseek-chat
+fast_model = deepseek-v4-flash
 fast_model_context_window = 64000
 reasoning_effort = default
 api_base = https://api.deepseek.com
@@ -383,6 +483,20 @@ reasoning_effort = default
 api_base = https://openrouter.ai/api/v1
 api_key = 
 
+[ai_model_Ragarenn]
+desc = France only: The University of Rennes is testing generative AI ("RAGaRenn")
+	since March 2024 to co-create usage guidelines with its staff. Using a 
+	local infrastructure on Eskemm Data, it aims to assess resource needs,
+	carbon impact, and professional use cases. 
+access_info_url = https://ragarenn.eskemm-numerique.fr/sso/ch@t/app
+large_model = ilaas/gemma-4-31b
+large_model_context_window = 32000
+fast_model = ilaas/mistral-small-4-119b
+fast_model_context_window = 32000
+reasoning_effort = default
+api_base = https://ragarenn.eskemm-numerique.fr/sso/ch@t/api
+api_key = 
+
 [ai_model_Ollama local AI]
 desc = Ollama is an open source server that lets you run LLMs locally on
 	your computer. To use it in QualCoder, you must have Ollama set up and
@@ -398,26 +512,608 @@ api_base = http://localhost:11434/v1/
 api_key = <no API key needed>
 
     """
-    
-    config = configparser.ConfigParser()
-    config.read_string(ini_string)
-    ai_models = []
-    for section in config.sections():
-        if section.startswith('ai_model_'):
-            model = {
-                'name': section[9:],
-                'desc': config[section].get('desc', ''),
-                'access_info_url': config[section].get('access_info_url', ''),
-                'large_model': config[section].get('large_model', ''),
-                'large_model_context_window': config[section].get('large_model_context_window', '32768'),
-                'fast_model': config[section].get('fast_model', ''),
-                'fast_model_context_window': config[section].get('fast_model_context_window', '32768'),
-                'reasoning_effort': config[section].get('reasoning_effort', ''),
-                'api_base': config[section].get('api_base', ''),
-                'api_key': config[section].get('api_key', '')
-            }
-            ai_models.append(model)
-    return ai_models
+
+    return _parse_ai_models_ini(ini_string)
+
+
+def get_obsolete_ai_models() -> list[dict[str, str]]:
+    """Return historical default profiles that may be removed safely when unchanged."""
+
+    ini_string = """
+[ai_model_OpenAI GPT5.5 reasoning]
+desc = Powerful model from OpenAI, with internal reasoning, for complex tasks.
+	You need an API-key from OpenAI and have paid for credits in your account.
+	OpenAI will charge a small amount for every use.
+access_info_url = https://platform.openai.com/api-keys
+large_model = gpt-5.5
+large_model_context_window = 272000
+fast_model = gpt-5.4-mini
+fast_model_context_window = 400000
+reasoning_effort = medium
+api_base =
+api_key =
+
+[ai_model_OpenAI GPT5.5 no reasoning]
+desc = Powerful model from OpenAI, no reasoning, faster and cheaper.
+	You need an API-key from OpenAI and have paid for credits in your account.
+	OpenAI will charge a small amount for every use.
+access_info_url = https://platform.openai.com/api-keys
+large_model = gpt-5.5
+large_model_context_window = 272000
+fast_model = gpt-5.4-mini
+fast_model_context_window = 400000
+reasoning_effort = low
+api_base =
+api_key =
+
+[ai_model_OpenAI_ChatGPT_Login GPT5.5]
+desc = Lets you use your ChatGPT Plus, Pro, or Team account with QualCoder.
+	No API key, no extra cost. Use the "Renew" button to authenticate your account.
+    Note that this is experimental, availability may vary.
+access_info_url = https://chatgpt.com/
+large_model = gpt-5.5
+large_model_context_window = 272000
+fast_model = gpt-5.5
+fast_model_context_window = 272000
+reasoning_effort = medium
+api_base = ChatGPT_OAuth
+api_key = <no API key needed>
+
+[ai_model_Blablador Huge]
+desc = The largest and most powerful model currently running on Blablador.
+    Availability might change.
+	Blablador is free to use and runs on a server of the Helmholtz Society,
+	a large non-profit research organization in Germany. To gain
+	access and get an API-key, you have to identify yourself once with your
+	university, ORCID, GitHub, or Google account.
+access_info_url = https://sdlaml.pages.jsc.fz-juelich.de/ai/guides/blablador_api_access/
+large_model = alias-huge
+large_model_context_window = 128000
+fast_model = alias-fast
+fast_model_context_window = 128000
+reasoning_effort = default
+api_base = https://api.helmholtz-blablador.fz-juelich.de/v1/
+api_key =
+
+[ai_model_Anthropic Claude Opus 4.8]
+desc = Claude is a family of high quality models from Anthropic.
+	You need an API-key from Anthropic and credits in your account.
+	Anthropic will charge a small amount for every use.
+access_info_url = https://console.anthropic.com/settings/keys
+large_model = claude-opus-4-8
+large_model_context_window = 1000000
+fast_model = claude-sonnet-5
+fast_model_context_window = 1000000
+reasoning_effort = medium
+api_base = https://api.anthropic.com/v1/
+api_key =
+
+[ai_model_Anthropic Claude Sonnet 5]
+desc = Claude is a family of high quality models from Anthropic.
+	You need an API-key from Anthropic and credits in your account.
+	Anthropic will charge a small amount for every use.
+access_info_url = https://console.anthropic.com/settings/keys
+large_model = claude-sonnet-5
+large_model_context_window = 1000000
+fast_model = claude-sonnet-5
+fast_model_context_window = 1000000
+reasoning_effort = medium
+api_base = https://api.anthropic.com/v1/
+api_key =
+
+[ai_model_Google Gemini 3.5 Flash]
+desc = Google offers several free and paid models on their servers.
+	Select one in the Advanced AI options below.
+	You need an API-key from Google.
+access_info_url = https://ai.google.dev/gemini-api/docs
+large_model = gemini-3.5-flash
+large_model_context_window = 1000000
+fast_model = gemini-3.1-flash-lite
+fast_model_context_window = 1000000
+reasoning_effort = default
+api_base = https://generativelanguage.googleapis.com/v1beta/openai/
+api_key =
+
+[ai_model_Deepseek Chat V3]
+desc = Deepseek is a high quality Chinese chat model.
+	You will need an an API-key from Deepseek and have payed credits in your account.
+	Deepseek will charge a small amount for every use.
+access_info_url = https://platform.deepseek.com/api_keys
+large_model = deepseek-chat
+large_model_context_window = 64000
+fast_model = deepseek-chat
+fast_model_context_window = 64000
+reasoning_effort = default
+api_base = https://api.deepseek.com
+api_key =
+
+[ai_model_Ragarenn]
+desc = The University of Rennes is testing generative AI ("RAGaRenn")
+	since March 2024 to co-create usage guidelines with its staff. Using a
+	local infrastructure on Eskemm Data, it aims to assess resource needs,
+	carbon impact, and professional use cases.
+access_info_url = https://ragarenn.eskemm-numerique.fr/sso/ch@t/app
+large_model = ilaas/gemma-4-31b
+large_model_context_window = 32000
+fast_model = ilaas/mistral-small-4-119b
+fast_model_context_window = 32000
+reasoning_effort = default
+api_base = https://ragarenn.eskemm-numerique.fr/sso/ch@t/api
+api_key =
+
+[ai_model_Anthropic Claude]
+desc = Claude is a family of high quality models from Anthropic.
+	You need an API-key from Anthropic and credits in your account.
+	Anthropic will charge a small amount for every use.
+access_info_url = https://console.anthropic.com/settings/keys
+large_model = claude-opus-4-20250514
+large_model_context_window = 200000
+fast_model = claude-sonnet-4-20250514
+fast_model_context_window = 200000
+reasoning_effort =
+api_base = https://api.anthropic.com/v1/
+api_key =
+
+[ai_model_Anthropic Claude Opus 4.1]
+desc = Claude is a family of high quality models from Anthropic.
+	You need an API-key from Anthropic and credits in your account.
+	Anthropic will charge a small amount for every use.
+access_info_url = https://console.anthropic.com/settings/keys
+large_model = claude-opus-4-1
+large_model_context_window = 200000
+fast_model = claude-sonnet-4
+fast_model_context_window = 200000
+reasoning_effort =
+api_base = https://api.anthropic.com/v1/
+api_key =
+
+[ai_model_Anthropic Claude Sonnet 4.5]
+desc = Claude is a family of high quality models from Anthropic.
+	You need an API-key from Anthropic and credits in your account.
+	Anthropic will charge a small amount for every use.
+access_info_url = https://console.anthropic.com/settings/keys
+large_model = claude-sonnet-4-5
+large_model_context_window = 200000
+fast_model = claude-sonnet-4-5
+fast_model_context_window = 200000
+reasoning_effort = medium
+api_base = https://api.anthropic.com/v1/
+api_key =
+
+[ai_model_Blablador]
+desc = Free and open source models, excellent privacy, but not as powerful
+	as the commercial offerings. Blablador runs on a server of the Helmholtz
+	Society, a large non-profit research organization in Germany. To gain
+	access and get an API-key, you have to identify yourself once with your
+	university, ORCID, GitHub, or Google account.
+access_info_url = https://sdlaml.pages.jsc.fz-juelich.de/ai/guides/blablador_api_access/
+large_model = alias-large
+large_model_context_window = 128000
+fast_model = alias-fast
+fast_model_context_window = 32000
+reasoning_effort =
+api_base = https://api.helmholtz-blablador.fz-juelich.de/v1/
+api_key =
+
+[ai_model_Blablador Huge]
+desc = The largest and most powerful model currently running on Blablador.
+	Availability might change.
+	Blablador is free to use and runs on a server of the Helmholtz Society,
+	a large non-profit research organization in Germany. To gain
+	access and get an API-key, you have to identify yourself once with your
+	university, ORCID, GitHub, or Google account.
+access_info_url = https://sdlaml.pages.jsc.fz-juelich.de/ai/guides/blablador_api_access/
+large_model = alias-huge
+large_model_context_window = 128000
+fast_model = alias-fast
+fast_model_context_window = 128000
+reasoning_effort =
+api_base = https://api.helmholtz-blablador.fz-juelich.de/v1/
+api_key =
+
+[ai_model_Deepseek Chat V3]
+desc = Deepseek is a high quality Chinese chat model.
+	You will need an an API-key from Deepseek and have payed credits in your account.
+	Deepseek will charge a small amount for every use.
+access_info_url = https://platform.deepseek.com/api_keys
+large_model = deepseek-chat
+large_model_context_window = 64000
+fast_model = deepseek-chat
+fast_model_context_window = 64000
+reasoning_effort =
+api_base = https://api.deepseek.com
+api_key =
+
+[ai_model_Google Gemini]
+desc = Google offers several free and paid models on their servers.
+	Select one in the Advanced AI options below.
+	You need an API-key from Google.
+access_info_url = https://ai.google.dev/gemini-api/docs
+large_model = gemini-2.5-flash
+large_model_context_window = 1000000
+fast_model = gemini-2.5-flash
+fast_model_context_window = 1000000
+reasoning_effort = default
+api_base = https://generativelanguage.googleapis.com/v1beta/openai/
+api_key =
+
+[ai_model_Mistral]
+desc = Mistral AI offers high-performance, open-source and proprietary language models, prioritizing transparency, privacy, and ethical AI for researchers and developers.
+access_info_url = https://mistral.ai
+large_model = mistral-large-latest
+large_model_context_window = 128000
+fast_model = mistral-small-latest
+fast_model_context_window = 128000
+reasoning_effort =
+api_base = https://api.mistral.ai/v1
+api_key =
+
+[ai_model_Ollama local AI]
+desc = Ollama is an open source server that lets you run LLMs locally on
+	your computer. To use it in QualCoder, you must have Ollama set up and
+	running first. Use the Advanced AI Options below to select between your
+	locally installed models.
+access_info_url = https://ollama.com
+large_model =
+large_model_context_window = 32000
+fast_model =
+fast_model_context_window = 32000
+reasoning_effort =
+api_base = http://localhost:11434/v1/
+api_key = <no API key needed>
+
+[ai_model_OpenAI ChatGPT Login]
+desc = Lets you use your ChatGPT Plus, Pro, or Team account with QualCoder.
+	No API key is needed, so no extra cost. Use the authentication controls
+	in the settings dialog. Note that this is experimental, availability
+	may vary.
+access_info_url = https://chatgpt.com/
+large_model = gpt-5.5
+large_model_context_window = 272000
+fast_model = gpt-5.5
+fast_model_context_window = 272000
+reasoning_effort = medium
+api_base = ChatGPT_OAuth
+api_key = <no API key needed>
+
+[ai_model_OpenAI GPT4.1]
+desc = Powerful and large model from OpenAI, for complex tasks.
+	You need an API-key from OpenAI and have paid for credits in your account.
+	OpenAI will charge a small amount for every use.
+access_info_url = https://platform.openai.com/api-keys
+large_model = gpt-4.1
+large_model_context_window = 1000000
+fast_model = gpt-4.1-mini
+fast_model_context_window = 128000
+reasoning_effort =
+api_base =
+api_key =
+
+[ai_model_OpenAI GPT5.1 no reasoning]
+desc = Powerful model from OpenAI, no reasoning, faster and cheaper.
+	You need an API-key from OpenAI and have paid for credits in your account.
+	OpenAI will charge a small amount for every use.
+access_info_url = https://platform.openai.com/api-keys
+large_model = gpt-5.1
+large_model_context_window = 1000000
+fast_model = gpt-5-mini
+fast_model_context_window = 128000
+reasoning_effort = low
+api_base =
+api_key =
+
+[ai_model_OpenAI GPT5.1 reasoning]
+desc = Powerful model from OpenAI, with internal reasoning, for complex tasks.
+	You need an API-key from OpenAI and have paid for credits in your account.
+	OpenAI will charge a small amount for every use.
+access_info_url = https://platform.openai.com/api-keys
+large_model = gpt-5.1
+large_model_context_window = 1000000
+fast_model = gpt-5-mini
+fast_model_context_window = 128000
+reasoning_effort = medium
+api_base =
+api_key =
+
+[ai_model_OpenAI GPT5.2 no reasoning]
+desc = Powerful model from OpenAI, no reasoning, faster and cheaper.
+	You need an API-key from OpenAI and have paid for credits in your account.
+	OpenAI will charge a small amount for every use.
+access_info_url = https://platform.openai.com/api-keys
+large_model = gpt-5.2
+large_model_context_window = 1000000
+fast_model = gpt-5-mini
+fast_model_context_window = 128000
+reasoning_effort = low
+api_base =
+api_key =
+
+[ai_model_OpenAI GPT5.2 reasoning]
+desc = Powerful model from OpenAI, with internal reasoning, for complex tasks.
+	You need an API-key from OpenAI and have paid for credits in your account.
+	OpenAI will charge a small amount for every use.
+access_info_url = https://platform.openai.com/api-keys
+large_model = gpt-5.2
+large_model_context_window = 1000000
+fast_model = gpt-5-mini
+fast_model_context_window = 128000
+reasoning_effort = medium
+api_base =
+api_key =
+
+[ai_model_OpenAI_GPT4o]
+desc = General use model from OpenAI, faster and cheaper than other options.
+	You need an API-key from OpenAI and have paid for credits in your account.
+	OpenAI will charge a small amount for every use.
+access_info_url = https://platform.openai.com/api-keys
+large_model = gpt-4o
+large_model_context_window = 1000000
+fast_model = gpt-4o-mini
+fast_model_context_window = 128000
+reasoning_effort =
+api_base =
+api_key =
+
+[ai_model_OpenRouter]
+desc = OpenRouter is a unified interface to access many different AI language
+	models, both free and paid. You need an API-key from OpenRouter.
+	Select a model in the Advanced AI Options below.
+access_info_url = https://openrouter.ai/
+large_model = deepseek/deepseek-chat:free
+large_model_context_window = 64000
+fast_model = deepseek/deepseek-chat:free
+fast_model_context_window = 64000
+reasoning_effort =
+api_base = https://openrouter.ai/api/v1
+api_key =
+
+[ai_model_Blablador]
+desc = Free and open source models, excellent privacy, but not as powerful
+	as the commercial offerings. Blablador runs on a server of the Helmholtz
+	Society, a large non-profit research organization in Germany. To gain
+	access and get an API-key, you have to identify yourself once with your
+	university, ORCID, GitHub, or Google account.
+access_info_url = https://sdlaml.pages.jsc.fz-juelich.de/ai/guides/blablador_api_access/
+large_model = alias-large
+large_model_context_window = 128000
+fast_model = alias-fast
+fast_model_context_window = 32000
+reasoning_effort =
+api_base = https://helmholtz-blablador.fz-juelich.de:8000/v1
+api_key =
+
+[ai_model_Blablador Huge]
+desc = Llama 3.1 405b, very large and powerful. Availability might change.
+	Blablador is free to use and runs on a server of the Helmholtz Society,
+	a large non-profit research organization in Germany. To gain
+	access and get an API-key, you have to identify yourself once with your
+	university, ORCID, GitHub, or Google account.
+access_info_url = https://sdlaml.pages.jsc.fz-juelich.de/ai/guides/blablador_api_access/
+large_model = alias-llama3-huge
+large_model_context_window = 128000
+fast_model = alias-fast
+fast_model_context_window = 128000
+reasoning_effort =
+api_base = https://helmholtz-blablador.fz-juelich.de:8000/v1
+api_key =
+
+[ai_model_Google Gemini]
+desc = Google offers several free and paid models on their servers.
+	Select one in the Advanced AI options below.
+	You need an API-key from Google.
+access_info_url = https://ai.google.dev/gemini-api/docs
+large_model = gemini-2.5-flash
+large_model_context_window = 1000000
+fast_model = gemini-2.5-flash
+fast_model_context_window = 1000000
+reasoning_effort =
+api_base = https://generativelanguage.googleapis.com/v1beta/openai/
+api_key =
+
+[ai_model_Ollama local AI]
+desc = Ollama is an open source server that lets you run LLMs locally on
+	your computer. To use it in QualCoder, you must have Ollama set up and
+	running first. Use the Advanced AI Options below to select between your
+	locally installed models.
+access_info_url = https://ollama.com
+large_model = test
+large_model_context_window = 1
+fast_model = test
+fast_model_context_window = 1
+reasoning_effort =
+api_base = http://localhost:11434/v1/
+api_key = <no API key needed>
+
+# Default profiles introduced in May 2024.
+[ai_model_OpenAI_GPT4]
+desc =
+access_info_url =
+large_model = gpt-4-turbo
+large_model_context_window = 32768
+fast_model = gpt-3.5-turbo
+fast_model_context_window = 32768
+reasoning_effort =
+api_base =
+api_key =
+
+[ai_model_Blablador]
+desc =
+access_info_url =
+large_model = alias-large
+large_model_context_window = 32768
+fast_model = alias-fast
+fast_model_context_window = 32768
+reasoning_effort =
+api_base = https://helmholtz-blablador.fz-juelich.de:8000/v1
+api_key =
+
+# Context-window update from July 2024.
+[ai_model_OpenAI_GPT4]
+desc =
+access_info_url =
+large_model = gpt-4-turbo
+large_model_context_window = 131072
+fast_model = gpt-3.5-turbo
+fast_model_context_window = 32768
+reasoning_effort =
+api_base =
+api_key =
+
+# Expanded OpenAI defaults from July 2024.
+[ai_model_OpenAI_GPT4-turbo]
+desc =
+access_info_url =
+large_model = gpt-4-turbo
+large_model_context_window = 131072
+fast_model = gpt-3.5-turbo
+fast_model_context_window = 32768
+reasoning_effort =
+api_base =
+api_key =
+
+[ai_model_OpenAI_GPT4o]
+desc =
+access_info_url =
+large_model = gpt-4o
+large_model_context_window = 131072
+fast_model = gpt-3.5-turbo
+fast_model_context_window = 32768
+reasoning_effort =
+api_base =
+api_key =
+
+# Profile descriptions and GPT-4o Mini update from July 2024.
+[ai_model_GPT-4-turbo]
+desc = The best model from OpenAI as of now for our purpose.
+	You will need an an API-key from OpenAI and have payed credits in your account.
+	OpenAI will charge a small amount for every use.
+access_info_url = https://platform.openai.com/api-keys
+large_model = gpt-4-turbo
+large_model_context_window = 128000
+fast_model = gpt-4o-mini
+fast_model_context_window = 128000
+reasoning_effort =
+api_base =
+api_key =
+
+[ai_model_OpenAI_GPT4o]
+desc = Faster, cheaper, but slightly less powerful than GPT-4-turbo.
+	You will need an an API-key from OpenAI and have payed credits in your account.
+	OpenAI will charge a small amount for every use.
+access_info_url = https://platform.openai.com/api-keys
+large_model = gpt-4o
+large_model_context_window = 128000
+fast_model = gpt-4o-mini
+fast_model_context_window = 128000
+reasoning_effort =
+api_base =
+api_key =
+
+[ai_model_Blablador]
+desc = A free and open source model (Mixtral 8x7B), excellent privacy,
+	albeit not as powerful as GPT-4.
+	Blablador is free to use and runs on a server of the Helmholtz Society,
+	a large non-profit research organization in Germany. In order to gain
+	access and get an API-key, you have to identify yourself once with your
+	university, ORCID, GitHub, or Google account.
+access_info_url = https://sdlaml.pages.jsc.fz-juelich.de/ai/guides/blablador_api_access/
+large_model = alias-large
+large_model_context_window = 32768
+fast_model = alias-fast
+fast_model_context_window = 32768
+reasoning_effort =
+api_base = https://helmholtz-blablador.fz-juelich.de:8000/v1
+api_key =
+
+# Wording updates from December 2024.
+[ai_model_GPT-4-turbo]
+desc = The best model from OpenAI for now.
+	                You need an API-key from OpenAI and have paid for credits in your account.
+	                OpenAI will charge a small amount for every use.
+access_info_url = https://platform.openai.com/api-keys
+large_model = gpt-4-turbo
+large_model_context_window = 128000
+fast_model = gpt-4o-mini
+fast_model_context_window = 128000
+reasoning_effort =
+api_base =
+api_key =
+
+[ai_model_OpenAI_GPT4o]
+desc = Faster, cheaper, but slightly less powerful than GPT-4-turbo.
+	                You need an API-key from OpenAI and have paid for credits in your account.
+	                OpenAI will charge a small amount for every use.
+access_info_url = https://platform.openai.com/api-keys
+large_model = gpt-4o
+large_model_context_window = 128000
+fast_model = gpt-4o-mini
+fast_model_context_window = 128000
+reasoning_effort =
+api_base =
+api_key =
+
+[ai_model_Blablador]
+desc = A free and open source model (Mixtral 8x7B), excellent privacy,
+	but not as powerful as GPT-4.
+	Blablador is free to use and runs on a server of the Helmholtz Society,
+	a large non-profit research organization in Germany. To gain
+	access and get an API-key, you have to identify yourself once with your
+	university, ORCID, GitHub, or Google account.
+access_info_url = https://sdlaml.pages.jsc.fz-juelich.de/ai/guides/blablador_api_access/
+large_model = alias-large
+large_model_context_window = 32768
+fast_model = alias-fast
+fast_model_context_window = 32768
+reasoning_effort =
+api_base = https://helmholtz-blablador.fz-juelich.de:8000/v1
+api_key =
+
+# GPT-4o became the default in February 2025.
+[ai_model_OpenAI_GPT4o]
+desc = Current default model from OpenAI, faster and cheaper than GPT4-turbo.
+	                You need an API-key from OpenAI and have paid for credits in your account.
+	                OpenAI will charge a small amount for every use.
+access_info_url = https://platform.openai.com/api-keys
+large_model = gpt-4o
+large_model_context_window = 128000
+fast_model = gpt-4o-mini
+fast_model_context_window = 128000
+reasoning_effort =
+api_base =
+api_key =
+
+[ai_model_GPT-4-turbo]
+desc = Classic model from OpenAI, still very capable.
+	                You need an API-key from OpenAI and have paid for credits in your account.
+	                OpenAI will charge a small amount for every use.
+access_info_url = https://platform.openai.com/api-keys
+large_model = gpt-4-turbo
+large_model_context_window = 128000
+fast_model = gpt-4o-mini
+fast_model_context_window = 128000
+reasoning_effort =
+api_base =
+api_key =
+
+[ai_model_Blablador]
+desc = A free and open source model, excellent privacy,
+	but not as powerful as GPT-4.
+	Blablador is free to use and runs on a server of the Helmholtz Society,
+	a large non-profit research organization in Germany. To gain
+	access and get an API-key, you have to identify yourself once with your
+	university, ORCID, GitHub, or Google account.
+access_info_url = https://sdlaml.pages.jsc.fz-juelich.de/ai/guides/blablador_api_access/
+large_model = alias-large
+large_model_context_window = 32768
+fast_model = alias-fast
+fast_model_context_window = 32768
+reasoning_effort =
+api_base = https://helmholtz-blablador.fz-juelich.de:8000/v1
+api_key =
+    """
+
+    return _parse_ai_models_ini(ini_string)
+
 
 def add_new_ai_model(current_models: list, new_name: str) -> tuple[list, int]:
     """Adds a new AI profile to the list, sets some default values,
@@ -495,6 +1191,28 @@ def _find_ai_model_index_by_name(models: list, model_name: str) -> int:
     return -1
 
 
+def _remove_obsolete_ai_models(current_models: list[dict[str, str]],
+                               current_model_index: int) -> tuple[list[dict[str, str]], int]:
+    """Remove unchanged obsolete profiles except for the selected profile.
+
+    Args:
+        current_models: AI profiles loaded from config.ini.
+        current_model_index: Index of the currently selected profile.
+    """
+
+    obsolete_models = get_obsolete_ai_models()
+    retained_models = []
+    adjusted_current_index = 0
+    for model_index, model in enumerate(current_models):
+        if model_index == current_model_index:
+            adjusted_current_index = len(retained_models)
+            retained_models.append(model)
+        elif model not in obsolete_models:
+            retained_models.append(model)
+    current_models[:] = retained_models
+    return current_models, adjusted_current_index
+
+
 def _parse_seen_ai_model_upgrade_offers(settings: dict | None) -> set[str]:
     """Return the set of one-time model-upgrade prompts that were already shown."""
 
@@ -512,6 +1230,38 @@ def _store_seen_ai_model_upgrade_offers(settings: dict | None, seen_offers: set[
     if settings is None:
         return
     settings['ai_model_upgrade_offers_seen'] = '||'.join(sorted(seen_offers))
+
+
+def _parse_pending_ai_model_upgrade_offer(settings: dict | None) -> dict | None:
+    """Return the persisted model-upgrade offer, if it is valid."""
+
+    if settings is None:
+        return None
+    raw_value = str(settings.get('ai_model_upgrade_offer_pending', '')).strip()
+    if raw_value == '':
+        return None
+    try:
+        offer = json.loads(raw_value)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(offer, dict):
+        return None
+    current_model_name = str(offer.get('current_model_name', '')).strip()
+    suggested_model_name = str(offer.get('suggested_model_name', '')).strip()
+    if current_model_name == '' or suggested_model_name == '':
+        return None
+    return {
+        'current_model_name': current_model_name,
+        'suggested_model_name': suggested_model_name,
+    }
+
+
+def _store_pending_ai_model_upgrade_offer(settings: dict | None, offer: dict | None) -> None:
+    """Persist or clear a deferred model-upgrade offer."""
+
+    if settings is None:
+        return
+    settings['ai_model_upgrade_offer_pending'] = '' if offer is None else json.dumps(offer)
 
 
 def _queue_ai_profile_upgrade_offer(current_models: list, current_model_name: str,
@@ -550,6 +1300,9 @@ def update_ai_models(current_models: list, current_model_index: int,
     if current_model_index < 0 or current_model_index > (len(current_models) - 1):
         current_model_index = 0
 
+    current_models, current_model_index = _remove_obsolete_ai_models(
+        current_models, current_model_index
+    )
     current_model_name = str(current_models[current_model_index].get('name', '')).strip()
     current_group_key = get_ai_profile_group_key(current_models[current_model_index])
 
@@ -635,6 +1388,16 @@ def update_ai_models(current_models: list, current_model_index: int,
         pending_upgrade_offer = _queue_ai_profile_upgrade_offer(
             current_models, current_model_name, suggested_model_name, settings
         )
+    elif current_model_name != '':
+        stored_offer = _parse_pending_ai_model_upgrade_offer(settings)
+        if stored_offer is not None and stored_offer['current_model_name'] == current_model_name:
+            pending_upgrade_offer = _queue_ai_profile_upgrade_offer(
+                current_models,
+                stored_offer['current_model_name'],
+                stored_offer['suggested_model_name'],
+                settings,
+            )
+    _store_pending_ai_model_upgrade_offer(settings, pending_upgrade_offer)
     
     return current_models, current_model_index, pending_upgrade_offer
 
@@ -692,6 +1455,8 @@ def ai_quote_search(quote: str, original: str) -> tuple[int, int]:
     Returns -1, -1 if no match is found.
     """
     
+    load_ai_runtime_dependencies()
+
     # try finding an exact match first
     start_idx = original.find(quote)
     if start_idx > -1:
@@ -753,11 +1518,16 @@ class AiLLM():
     ai_change_history = None
     
     def __init__(self, app, parent_text_edit):
+        load_ai_runtime_dependencies()
         self.app = app
         self.parent_text_edit = parent_text_edit
         self.threadpool = QtCore.QThreadPool()
         self.threadpool.setMaxThreadCount(2)
-        self.sources_vectorstore = AiVectorstore(self.app, self.parent_text_edit, self.sources_collection)
+        if getattr(self.app, "vectorstore", None) is None:
+            self.app.vectorstore = AiVectorstore(
+                self.app, self.parent_text_edit, self.sources_collection
+            )
+        self.sources_vectorstore = self.app.vectorstore
         self.ai_change_history = []  # Session-scoped AI write operations for undo
         self._runs_lock = threading.RLock()
         self._runs_by_id = {}
@@ -811,7 +1581,7 @@ class AiLLM():
         self.ai_log_handler = None
         self.ai_log_path = ''
 
-    def _ensure_ai_log_logger(self):
+    def _ensure_ai_log_logger(self) -> bool:
         """Set up or refresh the dedicated rotating AI logger."""
 
         if not self._is_ai_extended_logging_enabled():
@@ -836,7 +1606,7 @@ class AiLLM():
 
         desired_path = self._ai_log_target_path()
         if self.ai_log_handler is not None and self.ai_log_path == desired_path:
-            return
+            return True
 
         if self.ai_log_handler is not None:
             try:
@@ -965,14 +1735,14 @@ class AiLLM():
 
     def _unsupported_param_from_error(self, err: BaseException) -> str:
         for item in self._exception_chain(err):
-            param_name = str(getattr(item, 'param', '')).strip()
+            param_name = str(getattr(item, 'param', None) or '').strip()
             if param_name != '':
                 return param_name
             body = getattr(item, 'body', None)
             if isinstance(body, dict):
                 error_payload = body.get('error', body)
                 if isinstance(error_payload, dict):
-                    param_name = str(error_payload.get('param', '')).strip()
+                    param_name = str(error_payload.get('param') or '').strip()
                     if param_name != '':
                         return param_name
                     for key in ('message', 'detail'):
@@ -1047,6 +1817,26 @@ class AiLLM():
                     return _chatgpt_oauth_reauth_message()
         return ''
 
+    def _exception_summary(self, err: BaseException) -> str:
+        """Include nested causes in an error message without traceback frames.
+
+        Args:
+            err: The exception reported by the model provider.
+        """
+        lines = []
+        seen = set()
+        current = err
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            detail = f'{type(current).__name__}: {self._safe_to_text(current)}'
+            if not lines or detail != lines[-1]:
+                lines.append(detail)
+            cause = current.__cause__
+            current = cause if cause is not None else (
+                None if current.__suppress_context__ else current.__context__
+            )
+        return '\n'.join(lines)
+
     def _write_ai_log(self, text: str):
         if not self._ensure_ai_log_logger():
             return
@@ -1097,11 +1887,11 @@ class AiLLM():
         """Log one LLM error for traceability."""
 
         model_name = self._llm_name_for_log(llm)
-        error_text = self._safe_to_text(err)
+        error_text = self._exception_summary(err)
         line = f'[#{req_id}] ERROR model="{model_name}"'
         if context.strip() != '':
             line += f' context="{context.strip()}"'
-        line += f' {err.__class__.__name__}: {error_text}'
+        line += f' {error_text}'
         self._write_ai_log(line)
 
     def _exception_chain(self, err: BaseException):
@@ -1799,6 +2589,12 @@ class AiLLM():
                 label = _("Text coding")
             return _("Created text coding: ") + label
 
+        if op_type == "create_annotation":
+            source_name = self._short_change_label(op.get("source_name", ""))
+            if allow_db_lookup and source_name == "":
+                source_name = self._short_change_label(self._lookup_source_name(int(op.get("fid", -1))))
+            return (_("Created annotation: ") + source_name) if source_name != "" else _("Created annotation")
+
         if op_type == "create_case":
             name = self._short_change_label(op.get("name", ""))
             return (_("Created case: ") + name) if name != "" else ""
@@ -1891,6 +2687,9 @@ class AiLLM():
 
         if op_type == "update_coding_text":
             return _("Updated text coding")
+
+        if op_type == "update_annotation":
+            return _("Updated annotation")
 
         if op_type == "rename_category":
             old_name = self._short_change_label(op.get("old_name", ""))
@@ -2029,6 +2828,19 @@ class AiLLM():
                     return _("Removed case link: ") + label
             return _("Removed case link")
 
+        if op_type == "delete_annotation":
+            snapshot = self._snapshot_tables(op)
+            annotation_rows = snapshot.get("annotation", [])
+            if isinstance(annotation_rows, list) and len(annotation_rows) > 0 and isinstance(annotation_rows[0], dict):
+                source_name = ""
+                if allow_db_lookup:
+                    source_name = self._short_change_label(
+                        self._lookup_source_name(int(annotation_rows[0].get("fid", -1)))
+                    )
+                if source_name != "":
+                    return _("Deleted annotation: ") + source_name
+            return _("Deleted annotation")
+
         return ""
 
     def _format_ai_change_age(self, created_at: str) -> str:
@@ -2117,6 +2929,7 @@ class AiLLM():
         coding_count = 0
         document_count = 0
         case_link_count = 0
+        annotation_count = 0
         attribute_count = 0
         operation_summaries = []
         seen_operation_summaries = set()
@@ -2137,6 +2950,8 @@ class AiLLM():
                 document_count += 1
             elif op_type in ("create_case_text", "delete_case_text"):
                 case_link_count += 1
+            elif op_type in ("create_annotation", "update_annotation", "delete_annotation"):
+                annotation_count += 1
             elif op_type in (
                     "create_case_attribute",
                     "create_document_attribute",
@@ -2161,6 +2976,8 @@ class AiLLM():
             parts.append(str(document_count) + " " + _("document(s)"))
         if case_link_count > 0:
             parts.append(str(case_link_count) + " " + _("case link(s)"))
+        if annotation_count > 0:
+            parts.append(str(annotation_count) + " " + _("annotation(s)"))
         if attribute_count > 0:
             parts.append(str(attribute_count) + " " + _("attribute action(s)"))
         if len(parts) == 0:
@@ -2181,7 +2998,13 @@ class AiLLM():
                 title += time_label
             else:
                 title += "[" + time_label + "]"
-        first_line = title if title != "" else ", ".join(parts)
+        actor_source = str(change_set.get("actor_source", "ai_agent")).strip()
+        actor_owner = str(change_set.get("actor_owner", "")).strip()
+        if actor_source == "external_mcp":
+            actor_label = actor_owner if actor_owner != "" else "External MCP"
+            first_line = actor_label + (" - " + title if title != "" else "")
+        else:
+            first_line = title if title != "" else ", ".join(parts)
         lines = [first_line]
         shown_summaries = operation_summaries[:4]
         for summary in shown_summaries:
@@ -2223,13 +3046,45 @@ class AiLLM():
             return
         history = self._ensure_ai_change_history()
         normalized_set_id = str(change_set_id).strip()
+        actor_source = str(operation.get("actor_source", "ai_agent")).strip() or "ai_agent"
         if normalized_set_id == "":
-            normalized_set_id = "ai-run-" + datetime.now().astimezone().strftime("%Y%m%d%H%M%S%f")
+            prefix = "mcp-run-" if actor_source == "external_mcp" else "ai-run-"
+            normalized_set_id = prefix + datetime.now().astimezone().strftime("%Y%m%d%H%M%S%f")
         change_set = self._ensure_ai_change_set(history, normalized_set_id)
         op_copy = dict(operation)
         op_copy["change_set_id"] = normalized_set_id
         change_set["operations"].append(op_copy)
+        if "actor_source" not in change_set:
+            change_set["actor_source"] = actor_source
+        actor_owner = str(op_copy.get("actor_owner", "")).strip()
+        if actor_owner != "" and "actor_owner" not in change_set:
+            change_set["actor_owner"] = actor_owner
+        actor_client_name = str(op_copy.get("actor_client_name", "")).strip()
+        if actor_client_name != "" and "actor_client_name" not in change_set:
+            change_set["actor_client_name"] = actor_client_name
         self._refresh_ai_change_set_name(change_set)
+
+    @staticmethod
+    def _operation_actor_owner(operation: dict) -> str:
+        """Return the owner that performed a recorded operation."""
+
+        owner = str(operation.get("owner", "")).strip()
+        if owner == "":
+            owner = str(operation.get("actor_owner", "AI Agent")).strip()
+        return owner if owner != "" else "AI Agent"
+
+    def _change_set_actor_owner(self, change_set: dict) -> str:
+        """Return the owner responsible for a recorded change set."""
+
+        owner = str(change_set.get("actor_owner", "")).strip()
+        if owner != "":
+            return owner
+        operations = change_set.get("operations", [])
+        if isinstance(operations, list):
+            for operation in operations:
+                if isinstance(operation, dict):
+                    return self._operation_actor_owner(operation)
+        return "AI Agent"
 
     def _table_exists(self, table_name: str) -> bool:
         cur = self.app.conn.cursor()
@@ -2247,7 +3102,7 @@ class AiLLM():
         expected_name = str(op.get("name", "")).strip()
         if expected_name != "" and row[1] != expected_name:
             return False, "changed", row
-        if str(row[2]) != "AI Agent":
+        if str(row[2]) != self._operation_actor_owner(op):
             return False, "changed", row
         return True, "ok", row
 
@@ -2262,7 +3117,7 @@ class AiLLM():
         expected_name = str(op.get("name", "")).strip()
         if expected_name != "" and row[1] != expected_name:
             return False, "changed", row
-        if str(row[2]) != "AI Agent":
+        if str(row[2]) != self._operation_actor_owner(op):
             return False, "changed", row
         expected_catid = op.get("catid", None)
         expected_supercid = op.get("supercid", None)
@@ -2306,6 +3161,40 @@ class AiLLM():
             return False, "changed", row
         return True, "ok", row
 
+    def _can_undo_create_annotation(self, cur, op):
+        anid = int(op.get("anid", -1))
+        if anid <= 0:
+            return False, "invalid", None
+        cur.execute(
+            "SELECT anid, fid, pos0, pos1, owner, ifnull(memo,''), ifnull(date,'') "
+            "FROM annotation WHERE anid=?",
+            (anid,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return False, "missing", None
+        expected = {
+            "fid": int(op.get("fid", -1)),
+            "pos0": int(op.get("pos0", -1)),
+            "pos1": int(op.get("pos1", -1)),
+            "owner": str(op.get("owner", "AI Agent")),
+            "memo": str(op.get("memo", "")),
+        }
+        if expected["fid"] > 0 and row[1] != expected["fid"]:
+            return False, "changed", row
+        if expected["pos0"] >= 0 and row[2] != expected["pos0"]:
+            return False, "changed", row
+        if expected["pos1"] >= 0 and row[3] != expected["pos1"]:
+            return False, "changed", row
+        if expected["owner"] != "" and str(row[4]) != expected["owner"]:
+            return False, "changed", row
+        if str(row[5]) != expected["memo"]:
+            return False, "changed", row
+        expected_date = str(op.get("created_at", ""))
+        if expected_date != "" and str(row[6]) != expected_date:
+            return False, "changed", row
+        return True, "ok", row
+
     def _can_undo_create_case(self, cur, op):
         caseid = int(op.get("caseid", -1))
         if caseid <= 0:
@@ -2317,7 +3206,7 @@ class AiLLM():
         expected_name = str(op.get("name", "")).strip()
         if expected_name != "" and str(row[1]) != expected_name:
             return False, "changed", row
-        if str(row[2]) != "AI Agent":
+        if str(row[2]) != self._operation_actor_owner(op):
             return False, "changed", row
         return True, "ok", row
 
@@ -2433,6 +3322,22 @@ class AiLLM():
             return False, "changed", row
         return True, "ok", row
 
+    def _can_undo_update_annotation(self, cur, op):
+        anid = int(op.get("anid", -1))
+        if anid <= 0:
+            return False, "invalid", None
+        cur.execute("SELECT anid, ifnull(memo,''), ifnull(date,'') FROM annotation WHERE anid=?", (anid,))
+        row = cur.fetchone()
+        if row is None:
+            return False, "missing", None
+        after = op.get("after", {}) if isinstance(op.get("after", {}), dict) else {}
+        if str(row[1]) != str(after.get("memo", "")):
+            return False, "changed", row
+        expected_date = str(after.get("date", ""))
+        if expected_date != "" and str(row[2]) != expected_date:
+            return False, "changed", row
+        return True, "ok", row
+
     def _fetch_attribute_row_by_key(self, cur, name: str, attr_type: str, target_id: int):
         cur.execute(
             "SELECT attrid, name, attr_type, ifnull(value,''), id, ifnull(owner,''), ifnull(date,'') "
@@ -2468,7 +3373,8 @@ class AiLLM():
         row = cur.fetchone()
         if row is None:
             return False, "missing", None
-        if str(row[1]) != "AI Agent":
+        expected_owner = self._operation_actor_owner(op)
+        if str(row[1]) != expected_owner:
             return False, "changed", row
         if str(row[2]) != target_type:
             return False, "changed", row
@@ -2478,9 +3384,9 @@ class AiLLM():
         cur.execute(
             "SELECT count(*), "
             "sum(case when length(ifnull(value,'')) > 0 then 1 else 0 end), "
-            "sum(case when ifnull(owner,'') != 'AI Agent' then 1 else 0 end) "
+            "sum(case when ifnull(owner,'') != ? then 1 else 0 end) "
             "FROM attribute WHERE name=? AND attr_type=?",
-            (attr_name, target_type),
+            (expected_owner, attr_name, target_type),
         )
         attr_row = cur.fetchone() or (0, 0, 0)
         if int(attr_row[1] or 0) > 0 or int(attr_row[2] or 0) > 0:
@@ -2597,6 +3503,7 @@ class AiLLM():
             "code_av": "avid",
             "code_image": "imid",
             "case_text": "id",
+            "annotation": "anid",
         }
         for table_name, pk_name in primary_keys.items():
             rows = tables.get(table_name, [])
@@ -2615,11 +3522,24 @@ class AiLLM():
                 cur.execute(f"SELECT 1 FROM {table_name} WHERE {pk_name}=?", (pk_value,))
                 if cur.fetchone() is not None:
                     return False, "changed"
+        annotation_rows = tables.get("annotation", [])
+        if isinstance(annotation_rows, list):
+            for row in annotation_rows:
+                if not isinstance(row, dict):
+                    return False, "invalid"
+                cur.execute(
+                    "SELECT 1 FROM annotation WHERE fid=? AND pos0=? AND pos1=? AND owner=?",
+                    (row.get("fid"), row.get("pos0"), row.get("pos1"), row.get("owner")),
+                )
+                if cur.fetchone() is not None:
+                    return False, "changed"
         return True, "ok"
 
     def _restore_snapshot(self, cur, op):
         tables = self._snapshot_tables(op)
-        restore_order = ("code_cat", "code_name", "cases", "code_text", "case_text", "code_av", "code_image")
+        restore_order = (
+            "code_cat", "code_name", "cases", "code_text", "case_text", "annotation", "code_av", "code_image"
+        )
         for table_name in restore_order:
             rows = tables.get(table_name, [])
             if not isinstance(rows, list) or len(rows) == 0:
@@ -2641,6 +3561,7 @@ class AiLLM():
             "text_codings": len(tables.get("code_text", [])) if isinstance(tables.get("code_text", []), list) else 0,
             "av_codings": len(tables.get("code_av", [])) if isinstance(tables.get("code_av", []), list) else 0,
             "image_codings": len(tables.get("code_image", [])) if isinstance(tables.get("code_image", []), list) else 0,
+            "annotations": len(tables.get("annotation", [])) if isinstance(tables.get("annotation", []), list) else 0,
         }
 
     def _emit_project_table_changes(self, tables: list[str], source="ai_agent_undo") -> None:
@@ -2671,15 +3592,15 @@ class AiLLM():
             changed_tables.append(name)
         return changed_tables
 
-    def _count_code_codings(self, cur, cid: int) -> tuple[int, int]:
+    def _count_code_codings(self, cur, cid: int, actor_owner: str = "AI Agent") -> tuple[int, int]:
         total = 0
         non_ai = 0
         for table in ("code_text", "code_av", "code_image"):
             if not self._table_exists(table):
                 continue
             cur.execute(
-                f"SELECT count(*), sum(case when owner != 'AI Agent' then 1 else 0 end) FROM {table} WHERE cid=?",
-                (cid,),
+                f"SELECT count(*), sum(case when owner != ? then 1 else 0 end) FROM {table} WHERE cid=?",
+                (actor_owner, cid),
             )
             row = cur.fetchone()
             if row is None:
@@ -2730,18 +3651,21 @@ class AiLLM():
         if not isinstance(operations, list) or len(operations) == 0:
             return ""
         cur = self.app.conn.cursor()
+        actor_owner = self._change_set_actor_owner(change_set)
 
         code_ids = set()
         category_ids = set()
         case_ids = set()
         coding_ctids = set()
         case_link_ids = set()
+        annotation_ids = set()
         skipped_changed = 0
         skipped_missing = 0
         restore_categories = 0
         restore_codes = 0
         restore_codings = 0
         restore_case_links = 0
+        restore_annotations = 0
         revert_updated_categories = 0
         revert_updated_codes = 0
         revert_moved_categories = 0
@@ -2750,6 +3674,7 @@ class AiLLM():
         revert_updated_cases = 0
         revert_updated_documents = 0
         revert_updated_codings = 0
+        revert_updated_annotations = 0
         remove_attributes = 0
         revert_updated_attributes = 0
 
@@ -2780,6 +3705,14 @@ class AiLLM():
                     cid = int(op.get("cid", -1))
                     if ctid > 0 and cid not in code_ids:
                         coding_ctids.add(ctid)
+                elif reason == "changed":
+                    skipped_changed += 1
+                elif reason == "missing":
+                    skipped_missing += 1
+            elif op_type == "create_annotation":
+                ok, reason, row_data = self._can_undo_create_annotation(cur, op)
+                if ok:
+                    annotation_ids.add(int(op.get("anid", -1)))
                 elif reason == "changed":
                     skipped_changed += 1
                 elif reason == "missing":
@@ -2858,6 +3791,14 @@ class AiLLM():
                     skipped_changed += 1
                 elif reason == "missing":
                     skipped_missing += 1
+            elif op_type == "update_annotation":
+                ok, reason, row_data = self._can_undo_update_annotation(cur, op)
+                if ok:
+                    revert_updated_annotations += 1
+                elif reason == "changed":
+                    skipped_changed += 1
+                elif reason == "missing":
+                    skipped_missing += 1
             elif op_type == "rename_category":
                 ok, reason, row_data = self._can_undo_rename_category(cur, op)
                 if ok:
@@ -2921,11 +3862,19 @@ class AiLLM():
                     skipped_changed += 1
                 elif reason == "missing":
                     skipped_missing += 1
+            elif op_type == "delete_annotation":
+                ok, reason = self._can_restore_snapshot(cur, op)
+                if ok:
+                    restore_annotations += len(self._snapshot_tables(op).get("annotation", []))
+                elif reason == "changed":
+                    skipped_changed += 1
+                elif reason == "missing":
+                    skipped_missing += 1
 
         code_codings_total = 0
         code_codings_non_ai = 0
         for cid in code_ids:
-            ct_total, ct_non_ai = self._count_code_codings(cur, cid)
+            ct_total, ct_non_ai = self._count_code_codings(cur, cid, actor_owner)
             code_codings_total += ct_total
             code_codings_non_ai += ct_non_ai
 
@@ -2945,7 +3894,7 @@ class AiLLM():
             if row is None:
                 continue
             standalone_codings_total += 1
-            if str(row[0]) != "AI Agent":
+            if str(row[0]) != actor_owner:
                 standalone_codings_non_ai += 1
 
         lines = []
@@ -2957,7 +3906,7 @@ class AiLLM():
             if code_codings_non_ai > 0:
                 lines.append(
                     _("Warning: ") + str(code_codings_non_ai) +
-                    _(" of these codings are not owned by 'AI Agent'.")
+                    _(" of these codings belong to another user or agent and will also be deleted.")
                 )
         if len(category_ids) > 0:
             lines.append(
@@ -2972,12 +3921,14 @@ class AiLLM():
             if standalone_codings_non_ai > 0:
                 lines.append(
                     _("Warning: ") + str(standalone_codings_non_ai) +
-                    _(" standalone coding(s) are not owned by 'AI Agent'.")
+                    _(" standalone coding(s) belong to another user or agent and will also be deleted.")
                 )
         if len(case_ids) > 0:
             lines.append(_("Undo will remove ") + str(len(case_ids)) + _(" case(s)."))
         if len(case_link_ids) > 0:
             lines.append(_("Undo will remove ") + str(len(case_link_ids)) + _(" case link(s)."))
+        if len(annotation_ids) > 0:
+            lines.append(_("Undo will remove ") + str(len(annotation_ids)) + _(" annotation(s)."))
         if remove_attributes > 0:
             lines.append(_("Undo will remove ") + str(remove_attributes) + _(" attribute definition(s)."))
         if restore_categories > 0 or restore_codes > 0 or restore_codings > 0:
@@ -2991,6 +3942,8 @@ class AiLLM():
             lines.append(_("Undo will restore ") + ", ".join(parts) + ".")
         if restore_case_links > 0:
             lines.append(_("Undo will restore ") + str(restore_case_links) + _(" case link(s)."))
+        if restore_annotations > 0:
+            lines.append(_("Undo will restore ") + str(restore_annotations) + _(" annotation(s)."))
         if revert_updated_categories > 0:
             lines.append(str(revert_updated_categories) + _(" updated category(ies) would be restored to their previous values."))
         if revert_updated_codes > 0:
@@ -3001,6 +3954,8 @@ class AiLLM():
             lines.append(str(revert_updated_documents) + _(" updated document(s) would be restored to their previous values."))
         if revert_updated_codings > 0:
             lines.append(str(revert_updated_codings) + _(" updated text coding(s) would be restored to their previous values."))
+        if revert_updated_annotations > 0:
+            lines.append(str(revert_updated_annotations) + _(" updated annotation(s) would be restored to their previous values."))
         if revert_updated_attributes > 0:
             lines.append(str(revert_updated_attributes) + _(" attribute update(s) would be restored to their previous values."))
         if revert_moved_categories > 0:
@@ -3049,6 +4004,7 @@ class AiLLM():
         remaining_operations = []
         project_table_changes = set()
         cur = self.app.conn.cursor()
+        actor_owner = self._change_set_actor_owner(change_set)
         try:
             for op in reversed(operations):
                 if not isinstance(op, dict):
@@ -3078,6 +4034,29 @@ class AiLLM():
                     if cur.rowcount > 0:
                         stats["undone"] += 1
                         self._add_project_table_changes(project_table_changes, "code_text")
+                    continue
+
+                if op_type == "create_annotation":
+                    ok, reason, row = self._can_undo_create_annotation(cur, op)
+                    if not ok:
+                        if reason == "changed":
+                            stats["skipped_changed"] += 1
+                        elif reason == "missing":
+                            stats["skipped_missing"] += 1
+                        else:
+                            stats["skipped_invalid"] += 1
+                        keep_for_retry = self._should_keep_skipped_undo_operation(reason)
+                        stats["skip_details"].append(self._format_undo_skip_detail(op, reason, keep_for_retry))
+                        if keep_for_retry:
+                            stats["blocked_retry"] += 1
+                            remaining_operations.append(op)
+                        else:
+                            stats["removed_skipped"] += 1
+                        continue
+                    cur.execute("DELETE FROM annotation WHERE anid=?", (int(row[0]),))
+                    if cur.rowcount > 0:
+                        stats["undone"] += 1
+                        self._add_project_table_changes(project_table_changes, "annotation")
                     continue
 
                 if op_type == "create_case_text":
@@ -3121,7 +4100,7 @@ class AiLLM():
                             stats["removed_skipped"] += 1
                         continue
                     cid = int(row[0])
-                    coding_total, coding_non_ai = self._count_code_codings(cur, cid)
+                    coding_total, coding_non_ai = self._count_code_codings(cur, cid, actor_owner)
                     stats["deleted_code_codings"] += coding_total
                     stats["deleted_code_codings_non_ai"] += coding_non_ai
                     changed_tables = []
@@ -3434,6 +4413,38 @@ class AiLLM():
                         self._add_project_table_changes(project_table_changes, "code_text")
                     continue
 
+                if op_type == "update_annotation":
+                    ok, reason, row = self._can_undo_update_annotation(cur, op)
+                    if not ok:
+                        if reason == "changed":
+                            stats["skipped_changed"] += 1
+                        elif reason == "missing":
+                            stats["skipped_missing"] += 1
+                        else:
+                            stats["skipped_invalid"] += 1
+                        keep_for_retry = self._should_keep_skipped_undo_operation(reason)
+                        stats["skip_details"].append(self._format_undo_skip_detail(op, reason, keep_for_retry))
+                        if keep_for_retry:
+                            stats["blocked_retry"] += 1
+                            remaining_operations.append(op)
+                        else:
+                            stats["removed_skipped"] += 1
+                        continue
+                    before = op.get("before", {}) if isinstance(op.get("before", {}), dict) else {}
+                    cur.execute(
+                        "UPDATE annotation SET memo=?, owner=?, date=? WHERE anid=?",
+                        (
+                            str(before.get("memo", "")),
+                            str(before.get("owner", "")),
+                            str(before.get("date", "")),
+                            int(row[0]),
+                        ),
+                    )
+                    if cur.rowcount > 0:
+                        stats["undone"] += 1
+                        self._add_project_table_changes(project_table_changes, "annotation")
+                    continue
+
                 if op_type in ("update_case_attributes", "update_document_attributes"):
                     ok, reason, rows = self._can_undo_update_attributes(cur, op)
                     if not ok:
@@ -3560,7 +4571,9 @@ class AiLLM():
                         self._add_project_table_changes(project_table_changes, "code_text")
                     continue
 
-                if op_type in ("delete_category_tree", "delete_code", "delete_coding_text", "delete_case_text"):
+                if op_type in (
+                        "delete_category_tree", "delete_code", "delete_coding_text", "delete_case_text",
+                        "delete_annotation"):
                     ok, reason = self._can_restore_snapshot(cur, op)
                     if not ok:
                         if reason == "changed":
@@ -3587,7 +4600,12 @@ class AiLLM():
             self.app.conn.commit()
             self.app.delete_backup = False
             if len(project_table_changes) > 0:
-                self._emit_project_table_changes(sorted(project_table_changes), source="ai_agent_undo")
+                undo_source = (
+                    "external_mcp_undo"
+                    if str(change_set.get("actor_source", "")).strip() == "external_mcp"
+                    else "ai_agent_undo"
+                )
+                self._emit_project_table_changes(sorted(project_table_changes), source=undo_source)
         except Exception:
             self.app.conn.rollback()
             raise
@@ -3596,7 +4614,7 @@ class AiLLM():
         return stats
 
     def undo_ai_agent_changes(self):
-        """Undo one or more selected AI-agent change sets from the current app session."""
+        """Undo selected internal-agent or external-MCP changes from this app session."""
 
         history = self._ensure_ai_change_history()
         options = []
@@ -3688,7 +4706,7 @@ class AiLLM():
             msg += _("Skipped operations removed from the list: ") + str(removed_skipped) + "\n"
         non_ai_loss = int(stats.get("deleted_code_codings_non_ai", 0))
         if non_ai_loss > 0:
-            msg += _("Warning: removed codings not owned by 'AI Agent': ") + str(non_ai_loss) + "\n"
+            msg += _("Warning: codings belonging to another user or agent were also deleted: ") + str(non_ai_loss) + "\n"
         if len(skip_details) > 0:
             msg += "\n" + _("Undo details:") + "\n\n" + "\n\n".join(skip_details)
         if self.parent_text_edit is not None:
@@ -3700,28 +4718,28 @@ class AiLLM():
 
     # Icons (https://pictogrammers.com/library/mdi/)
     def code_analysis_icon(self):
-        return qta.icon('mdi6.tag-text-outline', color=self.app.highlight_color())
+        return code_analysis_icon(self.app)
 
     def topic_analysis_icon(self):
         return self.topic_exploration_icon()
 
     def topic_exploration_icon(self):
-        return qta.icon('mdi6.star-outline', color=self.app.highlight_color())
+        return topic_exploration_icon(self.app)
 
     def search_icon(self):
-        return qta.icon('mdi6.magnify', color=self.app.highlight_color())
+        return search_icon(self.app)
     
     def text_analysis_icon(self):
-        return qta.icon('mdi6.text-box-outline', color=self.app.highlight_color())
+        return text_analysis_icon(self.app)
 
     def general_chat_icon(self):
-        return qta.icon('mdi6.chat-question-outline', color=self.app.highlight_color())
+        return general_chat_icon(self.app)
 
     def prompt_scope_icon(self):
-        return qta.icon('mdi6.folder-open-outline', color=self.app.highlight_color())
+        return prompt_scope_icon(self.app)
 
     def prompt_icon(self):
-        return qta.icon('mdi6.script-text-outline', color=self.app.highlight_color())
+        return prompt_icon(self.app)
 
     def _migrate_legacy_prompts_for_current_scope(self) -> None:
         """One-time import of legacy user/project prompts into Markdown files."""
@@ -3789,7 +4807,7 @@ class AiLLM():
                 fast_model = curr_model['fast_model']
                 self.fast_llm_context_window = int(curr_model['fast_model_context_window'])
                 ensure_chatgpt_oauth_profile_defaults(curr_model)
-                api_base = curr_model['api_base']
+                api_base = str(curr_model.get('api_base') or '').strip()
                 api_key = curr_model['api_key']
                 is_chatgpt_oauth = is_chatgpt_oauth_api_base(api_base)
                 if api_key == '' and not is_chatgpt_oauth:
@@ -3823,8 +4841,11 @@ class AiLLM():
                         # Success, models were selected. But since the "change_settings" function will start 
                         # a new "init_llm" anyways, we are going to quit here
                         return
-                temp = float(self.app.settings.get('ai_temperature', '1.0'))
-                top_p = float(self.app.settings.get('ai_top_p', '1.0'))
+                sampling_params = {}
+                for setting_name, param_name in (('ai_temperature', 'temperature'), ('ai_top_p', 'top_p')):
+                    setting_value = str(self.app.settings.get(setting_name, '1.0')).strip()
+                    if setting_value != '' and (param_name != 'top_p' or not is_chatgpt_oauth):
+                        sampling_params[param_name] = float(setting_value)
                 timeout = float(self.app.settings.get('ai_timeout', '30.0'))
                 self.app.settings['ai_timeout'] = str(timeout)
                 if api_base.find('azure.com') != -1:  # using Microsoft Azure
@@ -3834,8 +4855,7 @@ class AiLLM():
                         'azure_deployment': large_model,    
                         'api_version': '2024-12-01-preview',
                         'api_key': api_key,
-                        'temperature': temp,
-                        'top_p': top_p,
+                        **sampling_params,
                         'max_tokens': None,
                         'timeout': timeout,
                         'max_retries': 2,
@@ -3849,7 +4869,7 @@ class AiLLM():
                     large_llm_params = {
                         'model': large_model,
                         'cache': False,
-                        'temperature': temp,
+                        **sampling_params,
                         'timeout': timeout,
                     }
                     fast_llm_params = large_llm_params.copy()
@@ -3859,18 +4879,19 @@ class AiLLM():
                     large_llm_params = {
                         'model': large_model, 
                         'openai_api_key': api_key, 
-                        'openai_api_base': api_base, 
+                        # None preserves the client's default URL for blank profiles.
+                        'openai_api_base': api_base or None,
                         'cache': False,
-                        'temperature': temp,
-                        'top_p': top_p,
+                        **sampling_params,
                         'streaming': True,
                         'timeout': timeout,
                     }   
                     fast_llm_params = large_llm_params.copy()
                     fast_llm_params['model'] = fast_model
                     
-                if 'reasoning_effort' in curr_model and curr_model['reasoning_effort'] in ['low', 'medium', 'high']:
-                    large_llm_params['reasoning_effort'] = curr_model['reasoning_effort']
+                reasoning_effort = str(curr_model.get('reasoning_effort') or '').strip()
+                if reasoning_effort not in ('', 'default'):
+                    large_llm_params['reasoning_effort'] = reasoning_effort
                 
                 if large_model.lower().find('claude') != -1:  # Anthropic
                     # omitting top_p, since Antrhopic does not accept temperature and top_p at the same time
@@ -3897,10 +4918,10 @@ class AiLLM():
                 self.app.settings['ai_enable'] = 'True'
                 
                 # init vectorstore
-                if not self.sources_vectorstore.is_open():
+                if not self.sources_vectorstore.is_open() and not self.sources_vectorstore.ai_worker_running():
                     self.sources_vectorstore.init_vectorstore(rebuild_vectorstore)
-                else:
-                    self._status = ''
+                self._status = ''
+                if self.sources_vectorstore.is_open() and not self.sources_vectorstore.ai_worker_running():
                     self.parent_text_edit.append(_('AI: Ready'))
             else:
                 self.close()
@@ -3918,7 +4939,8 @@ class AiLLM():
     def close(self):
         self._status = 'closing'
         self.cancel_all_runs(wait_ms=5000)
-        self.sources_vectorstore.close()
+        if not self.threadpool.waitForDone(5000):
+            logger.warning("AI LLM worker still running after 5s, cancellation left in place")
         self._large_llm_params = None
         self._fast_llm_params = None
         self._large_llm_factory = None
@@ -4001,11 +5023,16 @@ class AiLLM():
                 auth_message = self._chatgpt_oauth_user_error(value)
             if auth_message != '':
                 msg = _('AI Error:\n') + auth_message
+            elif isinstance(value, BaseException):
+                msg = _('AI Error:\n') + html_to_text(self._exception_summary(value))
             else:
                 value_text = html_to_text(self._safe_to_text(value))
                 msg = _('AI Error:\n')
                 msg += exception_type.__name__ + ': ' + str(value_text)
-            tb = '\n'.join(traceback.format_tb(tb_obj))
+            if isinstance(value, BaseException):
+                tb = ''.join(traceback.format_exception(exception_type, value, tb_obj))
+            else:
+                tb = '\n'.join(traceback.format_tb(tb_obj))
             logger.error(_("Uncaught exception: ") + msg + '\n' + tb)
             # Trigger message box show
             qt_exception_hook._exception_caught.emit(msg, tb)
@@ -4139,6 +5166,7 @@ class AiLLM():
         return res
 
     def start_query(self, func, result_callback, *args, progress_callback=None,
+                    confirmation_callback=None,
                     model_kind: str = 'large', scope_type: str = '', scope_id=None,
                     group_id: str = '', parent_run_id: str = '', cancel_result=None, **kwargs):
         """Calls an AI related function in a background thread
@@ -4147,6 +5175,7 @@ class AiLLM():
             func: the function to be called.  *args, **kwargs are handed over to this function. 
             result_callback: callback function
             progress_callback: callback function for progress/status updates
+            confirmation_callback: callback for questions that must be shown by the GUI thread
         """
         self.run_progress_msg = ''
         self.run_progress_count = -1
@@ -4181,6 +5210,8 @@ class AiLLM():
             worker.signals.progress.connect(progress_callback)
         else:
             worker.signals.progress.connect(self._handle_run_progress)
+        if confirmation_callback is not None:
+            worker.signals.confirmation.connect(confirmation_callback)
         worker.signals.error.connect(self._handle_run_error)
         self.threadpool.start(worker)
         return run_context.run_id
@@ -4320,7 +5351,7 @@ class AiLLM():
         
         # callback to show percentage done    
         config = RunnableConfig()
-        config['callbacks'] = [MyCustomSyncHandler(self)]
+        config['callbacks'] = [make_custom_sync_handler(self)]
         self.run_progress_max = round(1000 / 4)  # estimated token count of the result (1000 chars)
 
         response_format = self._get_response_format_json_schema("code_descriptions", response_schema)
@@ -4381,73 +5412,13 @@ class AiLLM():
     
     def _retrieve_from_vectorstore(self, search_strings, doc_ids=None, progress_callback=None, signals=None,
                                    score_threshold=0.5, k=50) -> list:
-        # Use the list of search_strings to retrieve related data from the vectorstore
-        try:
-            threshold = float(score_threshold)
-        except (TypeError, ValueError):
-            threshold = 0.5
-        threshold = max(0.0, min(threshold, 1.0))
-
-        try:
-            top_k = int(k)
-        except (TypeError, ValueError):
-            top_k = 50
-        top_k = max(1, min(top_k, 500))
-
-        search_kwargs = {'score_threshold': threshold, 'k': top_k}
-        chunks_meta_list = []
-        for _str in search_strings:
-            self._raise_if_run_canceled()
-            res = self.sources_vectorstore.faiss_db.similarity_search_with_relevance_scores(_str, **search_kwargs)
-            if doc_ids is not None and len(doc_ids) > 0:
-                # filter results by document ids
-                res_filtered = []
-                for chunk in res:
-                    if chunk[0].metadata['id'] in doc_ids:
-                        res_filtered.append(chunk)
-                chunks_meta_list.append(res_filtered)
-            else: 
-                chunks_meta_list.append(res)
-
-        # Consolidate and rank results:
-        # Flatten the lists of chunks in chunks_lists and collect all the chunks in a master list.
-        # Duplicate chunks are collected only once. The list is sorted by the frequency 
-        # of a chunk counted over all lists + the similarity score that faiss returns.
-        # This way, frequent and relevant chunks should be sorted to the top
-        # (see: "Reciprocal Rank Fusion" (https://plg.uwaterloo.ca/~gvcormac/cormacksigir09-rrf.pdf))
-
-        def chunk_unique_str(chunk_item):
-            # helper
-            chunk_key = str(chunk_item.metadata['id']) + ", "
-            chunk_key += str(chunk_item.metadata['start_index']) + ", "
-            return chunk_key
-            
-        # Flatten the lists and count the frequency of each chunk
-        chunk_count_list = {}  # contains the chunk count
-        chunk_master_list = []  # contains all chunks from all lists but no doubles
-        for lst in chunks_meta_list:
-            self._raise_if_run_canceled()
-            for chunk in lst:            
-                chunk_doc = chunk[0]
-                chunk_score = chunk[1]
-                chunk_str = chunk_unique_str(chunk_doc)
-                chunk_in_count_list = chunk_count_list.get(chunk_str, None)
-                if chunk_in_count_list: 
-                    chunk_count_list[chunk_str] += 1 + chunk_score
-                else:
-                    chunk_count_list[chunk_str] = 1 + chunk_score
-                    chunk_master_list.append(chunk_doc)
-                    
-        # add scores
-        for chunk_doc in chunk_master_list:
-            chunk_doc.metadata['score'] = chunk_count_list[chunk_unique_str(chunk_doc)]
-        
-        # Sort the common items by their score in descending order
-        chunk_master_list.sort(key=lambda chunk: chunk.metadata['score'], reverse=True)
-                                
-        logger.debug('First 10 chunks of retrieved data:\n' + str(chunk_master_list[:10]))
-        
-        return chunk_master_list
+        return self.sources_vectorstore.retrieve_similar_documents(
+            search_strings,
+            doc_ids=doc_ids,
+            score_threshold=score_threshold,
+            k=k,
+            cancel_check=self._raise_if_run_canceled,
+        )
     
     def search_analyze_chunk(self, result_callback, chunk, code_name, code_memo, search_prompt: AgentPromptRecord,
                              scope_type: str = '', scope_id=None, group_id: str = '',
@@ -4531,7 +5502,7 @@ class AiLLM():
 
         # callback to show percentage done    
         config = RunnableConfig()
-        config['callbacks'] = [MyCustomSyncHandler(self)]
+        config['callbacks'] = [make_custom_sync_handler(self)]
         self.run_progress_max = 130  # estimated average token count of the result
         
         # send the query to the llm 

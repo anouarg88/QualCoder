@@ -1,24 +1,67 @@
+import asyncio
 import datetime
+import importlib.metadata
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import sqlite3
 import tempfile
+import threading
+import time
+from types import SimpleNamespace
 from unittest import TestCase
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
-from qualcoder.__main__ import App
+from mcp import ClientSession, types
+from mcp.client.streamable_http import streamable_http_client
+from mcp.server import ServerRequestContext
+from mcp.server.lowlevel import Server
+from PyQt6 import QtCore, QtWidgets
+
+from qualcoder.__main__ import App, MainWindow
 from qualcoder.ai_agent_prompts import AgentPromptRecord
 from qualcoder.ai_chat import DialogAIChat
-from qualcoder.ai_mcp_server import AiMcpServer
+from qualcoder.ai_llm import AiLLM
+from qualcoder.ai_mcp_server import AiMcpExecutionContext, AiMcpServer, ProjectDatabaseLockedError
 from qualcoder.ai_memo import extract_ai_memo, merge_public_memo
+from qualcoder.code_av import DialogCodeAV
+from qualcoder.code_text import DialogCodeText
+from qualcoder.external_mcp import ExternalMcpController
+from qualcoder.settings import DialogSettings
 
 """ Useful insights from:
 https: // stackoverflow.com / questions / 32527861 / python - unit - test - that - uses - an - external - data - file / 32528173
 https: // www.blog.pythonlibrary.org / 2016 / 07 / 07 / python - 3 - testing - an - intro - to - unittest /
 https: // simpleit.rocks / python / test - files - creating - a - temporal - directory - in -python - unittests /
 """
+
+
+class TestExternalMcpSettingsDefaults(TestCase):
+    """External MCP settings migration defaults."""
+
+    def test_external_mcp_defaults_to_disabled_and_unacknowledged(self):
+        fake_app = SimpleNamespace(write_config_ini=MagicMock())
+        settings, _models = App.check_and_add_additional_settings(
+            fake_app, {}, [{"name": "test"}]
+        )
+        self.assertEqual("False", settings["mcp_external_enabled"])
+        self.assertEqual("False", settings["external_mcp_notice_acknowledged"])
+        self.assertEqual(47363, settings["mcp_external_port"])
+
+    def test_enabled_without_notice_acknowledgement_is_normalized_off(self):
+        fake_app = SimpleNamespace(write_config_ini=MagicMock())
+        settings, _models = App.check_and_add_additional_settings(
+            fake_app,
+            {
+                "mcp_external_enabled": "True",
+                "external_mcp_notice_acknowledged": "False",
+                "mcp_external_port": 47363,
+            },
+            [{"name": "test"}],
+        )
+        self.assertEqual("False", settings["mcp_external_enabled"])
 
 
 class TestApp(TestCase):
@@ -358,6 +401,219 @@ class TestMainWindow(TestCase):
         pass
 
 
+class TestMainWindowAiActions(TestCase):
+    """Regression tests for AI menu dispatching."""
+
+    def test_ai_model_upgrade_offer_waits_until_ai_is_enabled(self):
+        """A pending model offer is retained while AI is disabled and shown later."""
+
+        offer = {
+            'current_model_name': 'Current profile',
+            'suggested_model_name': 'New profile',
+        }
+        app = SimpleNamespace(
+            settings={
+                'ai_enable': 'False',
+                'ai_model_index': '0',
+                'ai_model_upgrade_offers_seen': '',
+                'ai_model_upgrade_offer_pending': 'persisted offer',
+            },
+            ai_models=[
+                {'name': 'Current profile', 'api_key': 'secret'},
+                {'name': 'New profile', 'api_key': ''},
+            ],
+            pending_ai_model_upgrade_offer=offer,
+            write_config_ini=MagicMock(),
+        )
+        window = SimpleNamespace(
+            app=app,
+            _find_ai_model_index_by_name=MainWindow._find_ai_model_index_by_name,
+        )
+
+        with patch('qualcoder.__main__.Message') as message_class:
+            MainWindow._show_pending_ai_model_upgrade_offer(window)
+            message_class.assert_not_called()
+            self.assertIs(app.pending_ai_model_upgrade_offer, offer)
+
+            app.settings['ai_enable'] = 'True'
+            message_box = message_class.return_value
+            switch_button = object()
+            keep_button = object()
+            message_box.addButton.side_effect = [switch_button, keep_button]
+            message_box.clickedButton.return_value = keep_button
+
+            MainWindow._show_pending_ai_model_upgrade_offer(window)
+
+        message_class.assert_called_once()
+        self.assertIsNone(app.pending_ai_model_upgrade_offer)
+        self.assertEqual('New profile', app.settings['ai_model_upgrade_offers_seen'])
+        self.assertEqual('', app.settings['ai_model_upgrade_offer_pending'])
+        app.write_config_ini.assert_called_once_with(app.settings, app.ai_models)
+
+    def test_ai_analysis_actions_share_handler(self):
+        topic_action = object()
+        text_action = object()
+        code_action = object()
+        expected_handlers = {
+            topic_action: ("new_topic_exploration", True),
+            text_action: ("new_text_analysis", False),
+            code_action: ("new_code_analysis", True),
+        }
+
+        for action, (expected_handler, shows_ai_agent) in expected_handlers.items():
+            with self.subTest(handler=expected_handler):
+                ai_chat_window = SimpleNamespace(
+                    new_topic_exploration=MagicMock(),
+                    new_text_analysis=MagicMock(),
+                    new_code_analysis=MagicMock(),
+                )
+                tab_widget = SimpleNamespace(setCurrentWidget=MagicMock())
+                ui = SimpleNamespace(
+                    actionAI_topic_exploration=topic_action,
+                    actionAI_text_analysis=text_action,
+                    actionAI_code_analysis=code_action,
+                    tabWidget=tab_widget,
+                    tab_ai_agent=object(),
+                )
+                window = SimpleNamespace(
+                    ai_chat_window=ai_chat_window,
+                    ui=ui,
+                    sender=MagicMock(return_value=action),
+                    set_ai_chat_sidebar_mode=MagicMock(),
+                    require_ai_runtime=MagicMock(return_value=True),
+                )
+
+                MainWindow.ai_go_analysis(window)
+
+                getattr(ai_chat_window, expected_handler).assert_called_once_with()
+                if shows_ai_agent:
+                    window.set_ai_chat_sidebar_mode.assert_called_once_with(False, persist=False)
+                    tab_widget.setCurrentWidget.assert_called_once_with(ui.tab_ai_agent)
+                else:
+                    window.set_ai_chat_sidebar_mode.assert_not_called()
+                    tab_widget.setCurrentWidget.assert_not_called()
+
+    def test_ai_action_asks_user_to_retry_while_runtime_loads(self):
+        app = SimpleNamespace(ai_runtime_state="loading")
+        window = SimpleNamespace(app=app)
+
+        with patch("qualcoder.__main__.show_ai_runtime_not_ready") as show_message:
+            ready = MainWindow.require_ai_runtime(window, "AI Agent")
+
+        self.assertFalse(ready)
+        show_message.assert_called_once_with(app, "AI Agent")
+
+    def test_deferred_ai_chat_initializes_restored_project_history(self):
+        chat_window = MagicMock()
+        app = SimpleNamespace(
+            project_path="C:/projects/example.qda",
+            settings={'ai_chat_sidebar': 'False'},
+        )
+        window = SimpleNamespace(
+            app=app,
+            ui=SimpleNamespace(textEdit=object()),
+            set_ai_chat_sidebar_mode=MagicMock(),
+        )
+
+        with patch("qualcoder.ai_chat.DialogAIChat", return_value=chat_window):
+            MainWindow.ai_chat(window)
+
+        chat_window.init_ai_chat.assert_called_once_with()
+        window.set_ai_chat_sidebar_mode.assert_called_once_with(False, persist=False)
+
+    def test_ai_startup_status_only_clears_its_own_message(self):
+        status_bar = MagicMock()
+        status_bar.currentMessage.return_value = "AI: Starting up..."
+        window = SimpleNamespace(statusBar=MagicMock(return_value=status_bar))
+
+        MainWindow._clear_ai_startup_status_message(window)
+
+        status_bar.clearMessage.assert_called_once_with()
+        status_bar.reset_mock()
+        status_bar.currentMessage.return_value = "AI: reading data"
+        MainWindow._clear_ai_startup_status_message(window)
+        status_bar.clearMessage.assert_not_called()
+
+    def test_ai_dialog_restores_startup_status_while_runtime_loads(self):
+        status_bar = MagicMock()
+        dialog = SimpleNamespace(
+            app=SimpleNamespace(
+                ai=None,
+                ai_runtime_state="loading",
+                highlight_color=MagicMock(return_value="#123456"),
+            ),
+            ui=SimpleNamespace(
+                pushButton_question=MagicMock(),
+                progressBar_ai=MagicMock(),
+            ),
+            main_window=SimpleNamespace(statusBar=MagicMock(return_value=status_bar)),
+            _chat_scope_active=MagicMock(return_value=False),
+        )
+
+        with patch("qualcoder.ai_chat.qta.icon", return_value=MagicMock()):
+            DialogAIChat.update_ai_busy(dialog)
+
+        status_bar.showMessage.assert_called_once_with("AI: Starting up...")
+
+    def test_ai_dialog_rejects_new_chat_while_runtime_loads(self):
+        app = SimpleNamespace(ai_runtime_state="loading")
+        dialog = SimpleNamespace(app=app)
+
+        with patch("qualcoder.ai_chat.show_ai_runtime_not_ready") as show_message:
+            allowed = DialogAIChat._can_start_general_chat(dialog)
+
+        self.assertFalse(allowed)
+        show_message.assert_called_once_with(app, "AI Agent")
+
+    def test_text_coding_reuses_open_dialog(self):
+        class FakeDialogCodeText:
+            instances = 0
+
+            def __init__(self, app=None, parent_text_edit=None, tab_reports=None):
+                del app, parent_text_edit, tab_reports
+                type(self).instances += 1
+                self.current_context = object()
+                self.ui = SimpleNamespace(
+                    tabWidget=SimpleNamespace(setCurrentWidget=MagicMock()),
+                    tab_docs=object(),
+                    tab_ai=object(),
+                )
+
+            @staticmethod
+            def objectName():
+                return "open_text_coding"
+
+        existing = FakeDialogCodeText()
+        original_context = existing.current_context
+        layout = SimpleNamespace(
+            count=MagicMock(return_value=1),
+            itemAt=MagicMock(return_value=SimpleNamespace(widget=MagicMock(return_value=existing))),
+        )
+        tab_coding = SimpleNamespace(layout=MagicMock(return_value=layout))
+        tab_widget = SimpleNamespace(setCurrentWidget=MagicMock())
+        ui = SimpleNamespace(
+            tab_coding=tab_coding,
+            tab_reports=object(),
+            tabWidget=tab_widget,
+            textBrowser_coding=SimpleNamespace(hide=MagicMock()),
+            textEdit=object(),
+        )
+        window = SimpleNamespace(
+            app=SimpleNamespace(get_text_filenames=MagicMock(return_value=[{"id": 1}])),
+            ui=ui,
+            tab_layout_helper=MagicMock(),
+        )
+
+        with patch("qualcoder.__main__.DialogCodeText", FakeDialogCodeText):
+            MainWindow.text_coding(window, task="documents")
+
+        self.assertEqual(1, FakeDialogCodeText.instances)
+        self.assertIs(original_context, existing.current_context)
+        window.tab_layout_helper.assert_not_called()
+        tab_widget.setCurrentWidget.assert_called_once_with(tab_coding)
+        existing.ui.tabWidget.setCurrentWidget.assert_called_once_with(existing.ui.tab_docs)
+
+
 class TestAiMemoPolicy(TestCase):
 
     class FakeApp:
@@ -435,6 +691,58 @@ class TestAiMemoPolicy(TestCase):
         )
         self.assertEqual("Updated only", merge_public_memo("Visible only", "Updated only#####ignore this"))
 
+    def test_mcp_search_uses_application_vectorstore_without_ai(self):
+        vectorstore = SimpleNamespace(
+            is_open=lambda: True,
+            is_ready=lambda: True,
+        )
+        self.server.app.ai = None
+        self.server.app.vectorstore = vectorstore
+        self.server.app.vectorstore_runtime_state = "ready"
+
+        self.assertIs(vectorstore, self.server._require_ready_vectorstore())
+
+    def test_mcp_search_reports_vectorstore_loading(self):
+        self.server.app.ai = None
+        self.server.app.vectorstore = None
+        self.server.app.vectorstore_runtime_state = "loading"
+
+        with self.assertRaisesRegex(RuntimeError, "currently being prepared"):
+            self.server._require_ready_vectorstore()
+
+    def test_mcp_missing_project_instructs_agent_to_ask_user(self):
+        self.server.app.conn = None
+        self.server.app.project_path = ""
+
+        with self.assertRaisesRegex(RuntimeError, "Instruct the user to open or create a project"):
+            self.server._require_open_project()
+
+    def test_external_mcp_listener_is_enabled_without_project(self):
+        self.server.app.ai_mcp_server = self.server
+        self.server.app.conn = None
+        self.server.app.project_path = ""
+        self.server.app.settings["mcp_external_enabled"] = "True"
+        controller = ExternalMcpController(self.server.app)
+
+        with patch.object(controller, "start") as start, patch.object(controller, "stop") as stop:
+            controller.sync_with_application_state()
+
+        start.assert_called_once_with()
+        stop.assert_not_called()
+
+    def test_external_mcp_executor_allows_non_project_operations(self):
+        self.server.app.ai_mcp_server = self.server
+        self.server.app.conn = None
+        self.server.app.project_path = ""
+        controller = ExternalMcpController(self.server.app)
+        controller._active = True
+        context = AiMcpExecutionContext(
+            source="external_mcp",
+            owner="External MCP",
+        )
+
+        self.assertEqual("available", controller._execute(lambda: "available", context))
+
     def test_mcp_memo_reads_and_updates_preserve_private_suffix(self):
         documents_payload = self.server._sanitize_memo_payload(self.server._read_resource_payload("qualcoder://documents", {}))
         self.assertEqual("Document memo\n", documents_payload["documents"][0]["memo"])
@@ -460,25 +768,25 @@ class TestAiMemoPolicy(TestCase):
         self.assertEqual("Coding memo\n", code_segments_payload["segments"][0]["memo"])
 
         document_result = self.server._call_tool_payload(
-            "documents/update_document", {"fid": 1, "memo": "Updated document"}, "cs-doc"
+            "documents_update_document", {"fid": 1, "memo": "Updated document"}, "cs-doc"
         )
         self.assertTrue(document_result["structuredContent"]["updated"])
         self.assertEqual("Updated document\n", document_result["structuredContent"]["document"]["memo"])
 
         category_result = self.server._call_tool_payload(
-            "codes/update_category", {"catid": 1, "memo": "Updated category"}, "cs-cat"
+            "codes_update_category", {"catid": 1, "memo": "Updated category"}, "cs-cat"
         )
         self.assertTrue(category_result["structuredContent"]["updated"])
         self.assertEqual("Updated category\n", category_result["structuredContent"]["category"]["memo"])
 
         code_result = self.server._call_tool_payload(
-            "codes/update_code", {"cid": 1, "name": "code one updated", "memo": "Updated code"}, "cs-code"
+            "codes_update_code", {"cid": 1, "name": "code one updated", "memo": "Updated code"}, "cs-code"
         )
         self.assertTrue(code_result["structuredContent"]["updated"])
         self.assertEqual("Updated code\n", code_result["structuredContent"]["code"]["memo"])
 
         coding_result = self.server._call_tool_payload(
-            "codes/update_text_coding", {"ctid": 1, "memo": "Updated coding"}, "cs-coding"
+            "codes_update_text_coding", {"ctid": 1, "memo": "Updated coding"}, "cs-coding"
         )
         self.assertTrue(coding_result["structuredContent"]["updated"])
         self.assertEqual("Updated coding\n", coding_result["structuredContent"]["coding"]["memo"])
@@ -496,6 +804,977 @@ class TestAiMemoPolicy(TestCase):
         cur.execute("select memo from code_text where ctid=1")
         self.assertEqual("Updated coding\n#####\nPrivate coding", cur.fetchone()[0])
         conn.close()
+
+
+class TestAiAnnotations(TestCase):
+    """Internal MCP annotation reads, writes, permissions, and undo."""
+
+    class FakeEvents:
+        def __init__(self):
+            self.calls = []
+
+        def emit_table_changes(self, tables, source=""):
+            self.calls.append((list(tables), source))
+
+    class FakeAi:
+        def __init__(self):
+            self.operations = []
+
+        def record_ai_change(self, change_set_id, operation):
+            self.operations.append((change_set_id, dict(operation)))
+
+    class FakeApp:
+        def __init__(self, project_path):
+            self.project_path = project_path
+            self.project_name = "MCP test.qda"
+            self.version = "3.7-test"
+            self.settings = {
+                "ai_permissions": AiMcpServer.AI_PERMISSION_FULL_ACCESS,
+                "codername": "Kai",
+            }
+            self.delete_backup = True
+            self.project_events = TestAiAnnotations.FakeEvents()
+            self.ai = TestAiAnnotations.FakeAi()
+            self.conn = sqlite3.connect(os.path.join(project_path, "data.qda"))
+
+    def setUp(self):
+        self.project_path = tempfile.mkdtemp()
+        self.db_path = os.path.join(self.project_path, "data.qda")
+        conn = sqlite3.connect(self.db_path)
+        cur = conn.cursor()
+        cur.execute(
+            "CREATE TABLE source (id integer primary key, name text, fulltext text, memo text, owner text, date text)"
+        )
+        cur.execute(
+            "CREATE TABLE project (databaseversion text, memo text)"
+        )
+        cur.execute(
+            "INSERT INTO project (databaseversion, memo) VALUES (?, ?)",
+            ("v17", "Project public\n#####\nProject private"),
+        )
+        cur.execute(
+            "CREATE TABLE annotation (anid integer primary key, fid integer, pos0 integer, pos1 integer, memo text, "
+            "owner text, date text, unique(fid,pos0,pos1,owner))"
+        )
+        cur.execute(
+            "CREATE TABLE coder_names (name text unique not null, visibility integer not null default 1)"
+        )
+        cur.execute(
+            "CREATE TABLE cases (caseid integer primary key, name text, memo text, owner text, date text)"
+        )
+        cur.execute(
+            "CREATE TABLE case_text (id integer primary key, caseid integer, fid integer, pos0 integer, pos1 integer, "
+            "owner text, date text, memo text)"
+        )
+        cur.execute(
+            "CREATE TABLE attribute (attrid integer primary key, name text, attr_type text, value text, id integer, "
+            "date text, owner text)"
+        )
+        cur.execute(
+            "CREATE TABLE code_cat (catid integer primary key, name text, owner text, date text, memo text, "
+            "supercatid integer)"
+        )
+        cur.execute(
+            "CREATE TABLE code_name (cid integer primary key, name text, memo text, catid integer, owner text, "
+            "date text, color text, supercid integer)"
+        )
+        cur.execute(
+            "CREATE TABLE code_text (ctid integer primary key, cid integer, fid integer, seltext text, pos0 integer, "
+            "pos1 integer, owner text, date text, memo text, avid integer, important integer)"
+        )
+        cur.execute(
+            "CREATE VIEW annotation_visible AS SELECT a.* FROM annotation AS a WHERE NOT EXISTS "
+            "(SELECT 1 FROM coder_names AS c WHERE c.name=a.owner AND c.visibility=0)"
+        )
+        cur.execute(
+            "CREATE VIEW code_text_visible AS SELECT ct.* FROM code_text AS ct WHERE NOT EXISTS "
+            "(SELECT 1 FROM coder_names AS c WHERE c.name=ct.owner AND c.visibility=0)"
+        )
+        fulltext = "Alpha beta Alpha gamma unique phrase."
+        cur.execute(
+            "INSERT INTO source (id,name,fulltext,memo,owner,date) VALUES (1,?,?,?,?,?)",
+            ("doc one", fulltext, "", "default", "2026-01-01 10:00:00"),
+        )
+        cur.execute("INSERT INTO coder_names (name,visibility) VALUES ('Visible Coder',1)")
+        cur.execute("INSERT INTO coder_names (name,visibility) VALUES ('Hidden Coder',0)")
+        cur.execute(
+            "INSERT INTO annotation (anid,fid,pos0,pos1,memo,owner,date) VALUES (1,1,6,10,'visible','Visible Coder','d')"
+        )
+        cur.execute(
+            "INSERT INTO annotation (anid,fid,pos0,pos1,memo,owner,date) VALUES (2,1,17,22,'hidden','Hidden Coder','d')"
+        )
+        cur.execute(
+            "INSERT INTO code_name (cid,name,memo,catid,owner,date,color,supercid) "
+            "VALUES (1,'seed code','code public\n#####\ncode private',NULL,'default','d','#F5A9A9',NULL)"
+        )
+        cur.execute(
+            "INSERT INTO code_text (ctid,cid,fid,seltext,pos0,pos1,owner,date,memo,avid,important) "
+            "VALUES (1,1,1,'gamma',17,22,'Hidden Coder','d','coding public\n#####\ncoding private',NULL,NULL)"
+        )
+        conn.commit()
+        conn.close()
+        self.app = self.FakeApp(self.project_path)
+        self.server = AiMcpServer(self.app)
+
+    def tearDown(self):
+        self.app.conn.close()
+        shutil.rmtree(self.project_path)
+
+    def test_annotation_reads_follow_visibility_and_explicit_owner(self):
+        tool_names = [tool["name"] for tool in self.server._list_tools_payload()["tools"]]
+        self.assertIn("annotations_create", tool_names)
+        self.assertIn("annotations_update", tool_names)
+        self.assertIn("annotations_delete", tool_names)
+        resource_uris = [str(resource.uri) for resource in self.server._base_resources()]
+        self.assertIn("qualcoder://annotations", resource_uris)
+        templates_response = self.server.handle_request(
+            {"jsonrpc": "2.0", "id": 1, "method": "resources/templates/list", "params": {}}
+        )
+        self.assertNotIn("error", templates_response)
+        template_uris = [
+            str(template["uriTemplate"])
+            for template in templates_response["result"]["resourceTemplates"]
+        ]
+        self.assertIn("qualcoder://annotations/{anid}{?owner}", template_uris)
+
+        visible = self.server._read_resource_payload("qualcoder://annotations", {})
+        self.assertEqual([1], [item["anid"] for item in visible["annotations"]])
+        self.assertEqual("beta", visible["annotations"][0]["quote"])
+
+        hidden = self.server._read_resource_payload(
+            "qualcoder://annotations?owner=Hidden+Coder", {}
+        )
+        self.assertEqual([2], [item["anid"] for item in hidden["annotations"]])
+        hidden_one = self.server._read_resource_payload(
+            "qualcoder://annotations/2?owner=Hidden+Coder", {}
+        )
+        self.assertEqual("Hidden Coder", hidden_one["annotation"]["owner"])
+        with self.assertRaisesRegex(ValueError, "not found or is not visible"):
+            self.server._read_resource_payload("qualcoder://annotations/2", {})
+
+    def test_mcp_v2_server_construction_and_discovery(self):
+        self.assertEqual("2", importlib.metadata.version("mcp").split(".", 1)[0])
+        self.assertIsInstance(self.server._sdk_server, Server)
+        for method in (
+                "resources/list",
+                "resources/templates/list",
+                "resources/read",
+                "tools/list",
+                "tools/call",
+                "prompts/list",
+                "prompts/get",
+        ):
+            with self.subTest(method=method):
+                self.assertIsNotNone(self.server._sdk_server.get_request_handler(method))
+
+        initialize = self.server.handle_request(
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}
+        )["result"]
+        self.assertEqual("2025-06-18", initialize["protocolVersion"])
+        self.assertEqual(
+            {"prompts", "resources", "tools"},
+            set(initialize["capabilities"]),
+        )
+        self.assertEqual("qualcoder-mcp", initialize["serverInfo"]["name"])
+        self.assertEqual("QualCoder MCP", initialize["serverInfo"]["title"])
+        self.assertNotIn("description", initialize["serverInfo"])
+        self.assertEqual(self.server._server_instructions(), initialize["instructions"])
+        self.assertNotIn("resources/list", initialize["instructions"])
+
+        resources = self.server.handle_request(
+            {"jsonrpc": "2.0", "id": 2, "method": "resources/list", "params": {}}
+        )["result"]
+        self.assertNotIn("resultType", resources)
+        self.assertIn("qualcoder://annotations", [item["uri"] for item in resources["resources"]])
+
+        templates = self.server.handle_request(
+            {"jsonrpc": "2.0", "id": 3, "method": "resources/templates/list", "params": {}}
+        )["result"]
+        self.assertIn(
+            "qualcoder://annotations/{anid}{?owner}",
+            [item["uriTemplate"] for item in templates["resourceTemplates"]],
+        )
+        self.assertIn(
+            "qualcoder://codes/segments/{cid}"
+            "{?strategy,max_segments,max_chars,cursor,file_ids,case_ids,owner}",
+            [item["uriTemplate"] for item in templates["resourceTemplates"]],
+        )
+
+        tools = self.server.handle_request(
+            {"jsonrpc": "2.0", "id": 4, "method": "tools/list", "params": {}}
+        )["result"]["tools"]
+        create_annotation = next(item for item in tools if item["name"] == "annotations_create")
+        self.assertEqual(["fid", "memo"], create_annotation["inputSchema"]["required"])
+        self.assertFalse(create_annotation["inputSchema"]["additionalProperties"])
+        self.assertIn("codes_get_tree", [item["name"] for item in tools])
+        self.assertNotIn("project_get_status", [item["name"] for item in tools])
+
+        prompt_handler = self.server._sdk_server.get_request_handler("prompts/list")
+        prompt_result = asyncio.run(prompt_handler.handler(None, None))
+        self.assertEqual([], prompt_result.prompts)
+
+    def test_external_project_status_and_shared_enriched_code_tree(self):
+        external_context = AiMcpExecutionContext(
+            source="external_mcp", owner="MCP: Codex", client_name="Codex"
+        )
+        internal_tool_names = [
+            item["name"] for item in self.server._list_tools_payload()["tools"]
+        ]
+        external_tool_names = self.server.run_with_execution_context(
+            external_context,
+            lambda: [
+                item["name"] for item in self.server._list_tools_payload()["tools"]
+            ],
+        )
+        self.assertNotIn("project_get_status", internal_tool_names)
+        self.assertIn("project_get_status", external_tool_names)
+        self.assertIn("codes_get_tree", internal_tool_names)
+        self.assertIn("codes_get_tree", external_tool_names)
+
+        with self.assertRaisesRegex(ValueError, "Unknown tool name"):
+            self.server._call_tool_payload("project_get_status", {}, "")
+        status_result = self.server.run_with_execution_context(
+            external_context,
+            lambda: self.server._call_tool_payload("project_get_status", {}, ""),
+        )
+        status = status_result["structuredContent"]
+        self.assertEqual("MCP test", status["project_name"])
+        self.assertEqual("Project public\n", status["project_memo"])
+        self.assertNotIn("Project private", json.dumps(status))
+        self.assertEqual("Kai", status["active_coder"])
+        self.assertEqual("full_access", status["ai_permission_level"])
+        self.assertEqual("v17", status["database_version"])
+        self.assertEqual("3.7-test", status["qualcoder_version"])
+        self.assertEqual("0.1.0", status["mcp_server_version"])
+
+        self.app.conn.executemany(
+            "INSERT INTO code_cat (catid,name,owner,date,memo,supercatid) VALUES (?,?,?,?,?,?)",
+            [
+                (10, "Research", "Kai", "d", "", None),
+                (11, "Work", "Kai", "d", "", 10),
+            ],
+        )
+        self.app.conn.execute("UPDATE code_name SET catid=11 WHERE cid=1")
+        self.app.conn.execute(
+            "INSERT INTO code_name (cid,name,memo,catid,owner,date,color,supercid) "
+            "VALUES (2,'child code','',NULL,'Kai','d','#F5A9A9',1)"
+        )
+        self.app.conn.execute(
+            "INSERT INTO code_text (ctid,cid,fid,seltext,pos0,pos1,owner,date,memo,avid,important) "
+            "VALUES (2,1,1,'beta',6,10,'Visible Coder','d','',NULL,NULL)"
+        )
+        self.app.conn.commit()
+
+        resource_response = self.server.handle_request({
+            "jsonrpc": "2.0",
+            "id": 41,
+            "method": "resources/read",
+            "params": {"uri": "qualcoder://codes/tree"},
+        })
+        resource_tree = json.loads(resource_response["result"]["contents"][0]["text"])
+        tool_tree = self.server._call_tool_payload(
+            "codes_get_tree", {}, ""
+        )["structuredContent"]
+        self.assertEqual(resource_tree["categories"], tool_tree["categories"])
+        self.assertEqual(resource_tree["codes"], tool_tree["codes"])
+        seed_code = next(item for item in tool_tree["codes"] if item["cid"] == 1)
+        child_code = next(item for item in tool_tree["codes"] if item["cid"] == 2)
+        self.assertEqual(1, seed_code["text_coding_count"])
+        self.assertEqual(1, seed_code["child_count"])
+        self.assertEqual(
+            [
+                {"type": "category", "id": 10, "name": "Research"},
+                {"type": "category", "id": 11, "name": "Work"},
+            ],
+            seed_code["path_nodes"],
+        )
+        self.assertEqual(0, child_code["text_coding_count"])
+        self.assertEqual(0, child_code["child_count"])
+        self.assertEqual(
+            [
+                {"type": "category", "id": 10, "name": "Research"},
+                {"type": "category", "id": 11, "name": "Work"},
+                {"type": "code", "id": 1, "name": "seed code"},
+            ],
+            child_code["path_nodes"],
+        )
+
+    def test_internal_bridge_resource_read_preserves_visibility_privacy_and_search(self):
+        cur = self.app.conn.cursor()
+        cur.execute("UPDATE annotation SET memo='public memo\n#####\nprivate memo' WHERE anid=1")
+        self.app.conn.commit()
+
+        response = self.server.handle_request(
+            {
+                "jsonrpc": "2.0",
+                "id": 5,
+                "method": "resources/read",
+                "params": {"uri": "qualcoder://annotations"},
+            }
+        )
+        self.assertNotIn("error", response)
+        content = response["result"]["contents"][0]
+        self.assertEqual("qualcoder://annotations", content["uri"])
+        self.assertEqual("application/json", content["mimeType"])
+        payload = json.loads(content["text"])
+        self.assertEqual([1], [item["anid"] for item in payload["annotations"]])
+        self.assertEqual("public memo\n", payload["annotations"][0]["memo"])
+        self.assertNotIn("private memo", content["text"])
+
+        search_response = self.server.handle_request(
+            {
+                "jsonrpc": "2.0",
+                "id": 6,
+                "method": "resources/read",
+                "params": {"uri": "qualcoder://search/regex?pattern=gamma"},
+            }
+        )
+        search_payload = json.loads(search_response["result"]["contents"][0]["text"])
+        self.assertEqual(1, search_payload["selection"]["total_hits"])
+
+    def test_internal_bridge_tool_permissions_owner_events_and_errors(self):
+        request = {
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "tools/call",
+            "params": {
+                "name": "annotations_create",
+                "arguments": {"fid": 1, "quote": "unique phrase", "memo": "agent note"},
+                "_ai_change_set_id": "bridge-change-set",
+            },
+        }
+        self.app.settings["ai_permissions"] = AiMcpServer.AI_PERMISSION_READ_ONLY
+        readable = self.server.handle_request(
+            {"jsonrpc": "2.0", "id": 70, "method": "resources/read",
+             "params": {"uri": "qualcoder://annotations"}}
+        )
+        self.assertNotIn("error", readable)
+        denied = self.server.handle_request(request)
+        self.assertTrue(denied["result"]["isError"])
+        self.assertEqual(
+            "ai_permissions_denied",
+            denied["result"]["structuredContent"]["error"]["code"],
+        )
+
+        self.app.settings["ai_permissions"] = AiMcpServer.AI_PERMISSION_SANDBOXED
+        validation_failure = self.server.handle_request(
+            {
+                "jsonrpc": "2.0",
+                "id": 71,
+                "method": "tools/call",
+                "params": {
+                    "name": "annotations_create",
+                    "arguments": {"fid": 1, "quote": "Alpha", "memo": "ambiguous"},
+                },
+            }
+        )
+        self.assertEqual(-32602, validation_failure["error"]["code"])
+        self.assertEqual(2, self.app.conn.execute("SELECT count(*) FROM annotation").fetchone()[0])
+
+        created = self.server.handle_request(request)
+        created_payload = created["result"]["structuredContent"]
+        self.assertTrue(created_payload["created"])
+        self.assertEqual("AI Agent", created_payload["annotation"]["owner"])
+        self.assertEqual("bridge-change-set", self.app.ai.operations[-1][0])
+        self.assertIn((["annotation"], "ai_agent"), self.app.project_events.calls)
+
+        update_request = {
+            "jsonrpc": "2.0",
+            "id": 8,
+            "method": "tools/call",
+            "params": {
+                "name": "annotations_update",
+                "arguments": {"anid": created_payload["annotation"]["anid"], "memo": "updated"},
+            },
+        }
+        denied_update = self.server.handle_request(update_request)
+        self.assertTrue(denied_update["result"]["isError"])
+        self.app.settings["ai_permissions"] = AiMcpServer.AI_PERMISSION_FULL_ACCESS
+        self.assertTrue(
+            self.server.handle_request(update_request)["result"]["structuredContent"]["updated"]
+        )
+
+        invalid_arguments = self.server.handle_request({
+            "jsonrpc": "2.0",
+            "id": 9,
+            "method": "tools/call",
+            "params": {"name": "annotations_create", "arguments": []},
+        })
+        self.assertEqual(-32602, invalid_arguments["error"]["code"])
+        unknown_tool = self.server.handle_request(
+            {"jsonrpc": "2.0", "id": 10, "method": "tools/call", "params": {"name": "missing/tool"}}
+        )
+        self.assertEqual(-32602, unknown_tool["error"]["code"])
+        unknown_resource = self.server.handle_request(
+            {"jsonrpc": "2.0", "id": 11, "method": "resources/read",
+             "params": {"uri": "qualcoder://missing"}}
+        )
+        self.assertEqual(-32602, unknown_resource["error"]["code"])
+
+    def test_external_context_owner_source_permissions_and_isolation(self):
+        external_context = AiMcpExecutionContext(
+            source="external_mcp", owner="MCP: Codex", client_name="Codex"
+        )
+        self.app.settings["ai_permissions"] = AiMcpServer.AI_PERMISSION_READ_ONLY
+        denied = self.server.run_with_execution_context(
+            external_context,
+            lambda: self.server._call_tool_payload(
+                "codes_create_code", {"name": "external denied"}, ""
+            ),
+        )
+        self.assertTrue(denied["isError"])
+
+        self.app.settings["ai_permissions"] = AiMcpServer.AI_PERMISSION_SANDBOXED
+        external = self.server.run_with_execution_context(
+            external_context,
+            lambda: self.server._call_tool_payload(
+                "codes_create_code", {"name": "external code"}, ""
+            ),
+        )
+        external_operation = self.app.ai.operations[-1][1]
+        internal = self.server._call_tool_payload(
+            "codes_create_code", {"name": "internal code"}, ""
+        )
+        self.assertEqual("MCP: Codex", external["structuredContent"]["code"]["owner"])
+        self.assertEqual("AI Agent", internal["structuredContent"]["code"]["owner"])
+        self.assertEqual("external_mcp", external_operation["actor_source"])
+        self.assertEqual("MCP: Codex", external_operation["actor_owner"])
+        self.assertEqual("Codex", external_operation["actor_client_name"])
+        self.assertIn((["code_name"], "external_mcp"), self.app.project_events.calls)
+        self.assertIn((["code_name"], "ai_agent"), self.app.project_events.calls)
+
+        self.app.settings["ai_permissions"] = AiMcpServer.AI_PERMISSION_FULL_ACCESS
+        updated = self.server.run_with_execution_context(
+            external_context,
+            lambda: self.server._call_tool_payload(
+                "codes_update_code", {"cid": 1, "memo": "changed externally"}, ""
+            ),
+        )
+        self.assertTrue(updated["structuredContent"]["updated"])
+        owner = self.app.conn.execute("SELECT owner FROM code_name WHERE cid=1").fetchone()[0]
+        self.assertEqual("default", owner)
+
+        barrier = threading.Barrier(2)
+        observed_owners = []
+
+        def observe_external_owner():
+            observed_owners.append(self.server.run_with_execution_context(
+                external_context,
+                lambda: (barrier.wait(), self.server.request_owner)[1],
+            ))
+
+        external_thread = threading.Thread(target=observe_external_owner)
+        external_thread.start()
+        barrier.wait()
+        observed_owners.append(self.server.request_owner)
+        external_thread.join()
+        self.assertCountEqual(["MCP: Codex", "AI Agent"], observed_owners)
+
+    def test_external_write_is_available_to_ai_undo(self):
+        undo_manager = AiLLM.__new__(AiLLM)
+        undo_manager.app = self.app
+        undo_manager.ai_change_history = []
+        self.app.ai = undo_manager
+        external_context = AiMcpExecutionContext(
+            source="external_mcp", owner="MCP: Codex", client_name="Codex"
+        )
+
+        created = self.server.run_with_execution_context(
+            external_context,
+            lambda: self.server._call_tool_payload(
+                "codes_create_code", {"name": "external undo code"}, ""
+            ),
+        )
+        cid = created["structuredContent"]["code"]["cid"]
+        self.assertEqual(1, len(undo_manager.ai_change_history))
+        change_set = undo_manager.ai_change_history[0]
+        self.assertTrue(change_set["id"].startswith("mcp-run-"))
+        self.assertEqual("external_mcp", change_set["actor_source"])
+        self.assertEqual("MCP: Codex", change_set["actor_owner"])
+        self.assertTrue(change_set["name"].startswith("MCP: Codex - ["))
+
+        result = undo_manager._undo_ai_change_set(change_set)
+        self.assertEqual(1, result["undone"])
+        self.assertEqual(
+            0,
+            self.app.conn.execute("SELECT count(*) FROM code_name WHERE cid=?", (cid,)).fetchone()[0],
+        )
+        self.assertIn((["code_name"], "external_mcp_undo"), self.app.project_events.calls)
+
+        created = self.server.run_with_execution_context(
+            external_context,
+            lambda: self.server._call_tool_payload(
+                "codes_create_code", {"name": "externally reassigned code"}, ""
+            ),
+        )
+        cid = created["structuredContent"]["code"]["cid"]
+        self.app.conn.execute("UPDATE code_name SET owner='Kai' WHERE cid=?", (cid,))
+        self.app.conn.commit()
+        result = undo_manager._undo_ai_change_set(undo_manager.ai_change_history[-1])
+        self.assertEqual(0, result["undone"])
+        self.assertEqual(1, result["skipped_changed"])
+        self.assertEqual(
+            1,
+            self.app.conn.execute("SELECT count(*) FROM code_name WHERE cid=?", (cid,)).fetchone()[0],
+        )
+
+    def test_project_change_event_refreshes_ai_undo_button(self):
+        dialog = DialogAIChat.__new__(DialogAIChat)
+        dialog.app = SimpleNamespace(
+            ai=SimpleNamespace(has_undoable_ai_changes=MagicMock(return_value=True))
+        )
+        dialog.ui = SimpleNamespace(pushButton_undo=MagicMock())
+
+        dialog._on_project_data_changed(["code_name"], "external_mcp")
+
+        dialog.ui.pushButton_undo.setEnabled.assert_called_once_with(True)
+
+    def test_external_client_name_sanitization(self):
+        self.assertIsNone(self.server.sanitize_external_client_name("\x00\n\t"))
+        self.assertEqual(
+            "Claude Code unsafe",
+            self.server.sanitize_external_client_name(" Claude\nCode\x00unsafe "),
+        )
+        sanitized = self.server.sanitize_external_client_name("x" * 200)
+        self.assertEqual(72, len(sanitized))
+        request_context = SimpleNamespace(
+            session=SimpleNamespace(
+                client_params=SimpleNamespace(
+                    client_info=SimpleNamespace(name="Claude Code")
+                )
+            )
+        )
+        context = self.server.external_execution_context(request_context)
+        self.assertEqual("external_mcp", context.source)
+        self.assertEqual("MCP: Claude Code", context.owner)
+
+    def test_external_mcp_first_use_notice_and_checkbox_state(self):
+        qt_app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        checkbox = QtWidgets.QCheckBox()
+        dialog = SimpleNamespace(
+            settings={
+                "mcp_external_enabled": "False",
+                "external_mcp_notice_acknowledged": "False",
+            },
+            ui=SimpleNamespace(checkBox_MCP_enable=checkbox),
+        )
+        DialogSettings.load_external_mcp_setting(dialog)
+        self.assertFalse(checkbox.isChecked())
+        dialog.settings["mcp_external_enabled"] = "True"
+        DialogSettings.load_external_mcp_setting(dialog)
+        self.assertTrue(checkbox.isChecked())
+        checkbox.setChecked(False)
+        dialog.settings["mcp_external_enabled"] = "False"
+        checkbox.toggled.connect(
+            lambda checked: DialogSettings.external_mcp_toggled(dialog, checked)
+        )
+        with patch.object(
+                QtWidgets.QMessageBox, "warning",
+                return_value=QtWidgets.QMessageBox.StandardButton.No
+        ):
+            checkbox.setChecked(True)
+        qt_app.processEvents()
+        self.assertFalse(checkbox.isChecked())
+        self.assertEqual("False", dialog.settings["mcp_external_enabled"])
+
+        with patch.object(
+                QtWidgets.QMessageBox, "warning",
+                return_value=QtWidgets.QMessageBox.StandardButton.Yes
+        ) as warning:
+            checkbox.setChecked(True)
+        self.assertTrue(checkbox.isChecked())
+        self.assertEqual("True", dialog.settings["mcp_external_enabled"])
+        self.assertEqual("True", dialog.settings["external_mcp_notice_acknowledged"])
+        self.assertEqual(1, warning.call_count)
+
+        checkbox.setChecked(False)
+        with patch.object(QtWidgets.QMessageBox, "warning") as warning:
+            checkbox.setChecked(True)
+        self.assertEqual(0, warning.call_count)
+        self.assertEqual("True", dialog.settings["mcp_external_enabled"])
+
+    def test_streamable_http_transport_round_trip(self):
+        qt_app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        self.app.conn.execute(
+            "UPDATE annotation SET memo=? WHERE anid=1",
+            ("HTTP public\n#####\nHTTP private",)
+        )
+        self.app.conn.commit()
+        self.app.ai_mcp_server = self.server
+        self.app.settings.update({
+            "mcp_external_enabled": "True",
+            "mcp_external_port": 47364,
+            "ai_permissions": AiMcpServer.AI_PERMISSION_SANDBOXED,
+        })
+        controller = ExternalMcpController(self.app)
+        controller.start()
+        deadline = time.monotonic() + 5
+        while not controller.is_running and time.monotonic() < deadline:
+            qt_app.processEvents()
+            time.sleep(0.02)
+        self.assertTrue(controller.is_running)
+
+        result = {}
+        error = []
+
+        async def client_round_trip():
+            async with streamable_http_client(controller.endpoint) as streams:
+                async with ClientSession(
+                        streams[0], streams[1],
+                        client_info=types.Implementation(name="Claude Code", version="test")
+                ) as session:
+                    result["initialize"] = await session.initialize()
+                    result["tools"] = await session.list_tools()
+                    result["resource"] = await session.read_resource("qualcoder://annotations")
+                    result["status"] = await session.call_tool("project_get_status", {})
+                    result["write"] = await session.call_tool(
+                        "codes_create_code", {"name": "HTTP code"}
+                    )
+
+        def run_client():
+            try:
+                asyncio.run(client_round_trip())
+            except Exception as err:
+                error.append(err)
+
+        client_thread = threading.Thread(target=run_client)
+        client_thread.start()
+        deadline = time.monotonic() + 10
+        while client_thread.is_alive() and time.monotonic() < deadline:
+            qt_app.processEvents()
+            time.sleep(0.01)
+        client_thread.join(timeout=1)
+        controller.stop()
+        shutdown_deadline = time.monotonic() + 3
+        while controller._thread is not None and controller._thread.is_alive() \
+                and time.monotonic() < shutdown_deadline:
+            qt_app.processEvents()
+            time.sleep(0.01)
+
+        self.assertFalse(client_thread.is_alive())
+        if error:
+            raise error[0]
+        server_info = result["initialize"].server_info
+        self.assertEqual("qualcoder-mcp", server_info.name)
+        self.assertEqual("QualCoder MCP", server_info.title)
+        self.assertIsNone(server_info.description)
+        self.assertIn("project currently open", result["initialize"].instructions)
+        tool_names = [tool.name for tool in result["tools"].tools]
+        self.assertIn("project_get_status", tool_names)
+        self.assertIn("codes_get_tree", tool_names)
+        self.assertIn("codes_create_code", tool_names)
+        self.assertFalse(result["status"].is_error)
+        status_payload = result["status"].structured_content
+        self.assertEqual("Project public\n", status_payload["project_memo"])
+        self.assertNotIn("Project private", json.dumps(status_payload))
+        self.assertFalse(result["write"].is_error)
+        resource_payload = json.loads(result["resource"].contents[0].text)
+        self.assertEqual([1], [item["anid"] for item in resource_payload["annotations"]])
+        self.assertEqual("HTTP public\n", resource_payload["annotations"][0]["memo"])
+        self.assertNotIn("HTTP private", result["resource"].contents[0].text)
+        owner = self.app.conn.execute(
+            "SELECT owner FROM code_name WHERE name='HTTP code'"
+        ).fetchone()[0]
+        # The SDK's legacy stateless client does not repeat initialize clientInfo
+        # on later requests, so the required fallback applies on this transport.
+        self.assertEqual("External MCP", owner)
+        self.assertIn((["code_name"], "external_mcp"), self.app.project_events.calls)
+
+    def test_tool_write_waits_between_attempts_while_database_is_busy(self):
+        reader = sqlite3.connect(os.path.join(self.project_path, "data.qda"), check_same_thread=False)
+        reader.executemany("INSERT INTO code_cat (name) VALUES (?)", [("busy a",), ("busy b",)])
+        reader.commit()
+        half_read = reader.cursor()
+        half_read.execute("SELECT name FROM code_cat")
+        half_read.fetchone()
+        release = threading.Timer(0.6, half_read.close)
+        release.start()
+        try:
+            result = self.server._call_tool_payload("codes_create_code", {"name": "after the wait"}, "")
+        finally:
+            release.join()
+            reader.close()
+        self.assertTrue(result["structuredContent"]["created"])
+
+        blocker = sqlite3.connect(os.path.join(self.project_path, "data.qda"))
+        blocker.execute("UPDATE project SET memo='pending'")
+        self.server.DATABASE_BUSY_WAIT_SECONDS = 0.5
+        try:
+            with self.assertRaises(ProjectDatabaseLockedError) as caught:
+                self.server._call_tool_payload("codes_create_code", {"name": "never written"}, "")
+            self.assertFalse(caught.exception.gui_transaction_pending)
+        finally:
+            blocker.rollback()
+            blocker.close()
+        names = [row[0] for row in self.app.conn.execute("SELECT name FROM code_name").fetchall()]
+        self.assertIn("after the wait", names)
+        self.assertNotIn("never written", names)
+
+    def test_resource_tools_and_legacy_tool_names(self):
+        listing = self.server._call_tool_payload("qualcoder_list_resources", {}, "")["structuredContent"]
+        uris = [item["uri"] for item in listing["resources"]]
+        self.assertIn("qualcoder://documents", uris)
+        self.assertTrue(listing["resourceTemplates"])
+        read = self.server._call_tool_payload("qualcoder_read_resource", {"uri": "qualcoder://documents"}, "")
+        self.assertFalse(read["isError"])
+        self.assertIn("doc one", read["content"][0]["text"])
+        with self.assertRaises(ValueError):
+            self.server._call_tool_payload("qualcoder_read_resource", {"uri": "qualcoder://nope"}, "")
+        legacy = self.server._call_tool_payload("codes/create_code", {"name": "legacy name"}, "")
+        self.assertTrue(legacy["structuredContent"]["created"])
+        tool_names = [tool["name"] for tool in self.server._list_tools_payload()["tools"]]
+        self.assertTrue(all(re.fullmatch(r"[A-Za-z0-9_-]{1,64}", name) for name in tool_names))
+        self.assertIn("qualcoder_read_resource", tool_names)
+
+    def test_locked_delete_preserves_confirmation_token(self):
+        preview = self.server._call_tool_payload("codes_preview_delete_code", {"cid": 1}, "")
+        token = preview["structuredContent"]["preview_token"]
+        blocker = sqlite3.connect(self.db_path)
+        blocker.execute("UPDATE project SET memo='pending'")
+        self.server.DATABASE_BUSY_WAIT_SECONDS = 0.05
+        try:
+            with self.assertRaises(ProjectDatabaseLockedError):
+                self.server._call_tool_payload("codes_delete_code", {"cid": 1, "preview_token": token}, "")
+            self.assertIn(token, self.server._preview_tokens)
+        finally:
+            blocker.rollback()
+            blocker.close()
+        deleted = self.server._call_tool_payload("codes_delete_code", {"cid": 1, "preview_token": token}, "")
+        self.assertTrue(deleted["structuredContent"]["deleted"])
+        self.assertNotIn(token, self.server._preview_tokens)
+
+    def test_sync_resource_dispatch_preserves_external_context(self):
+        context = AiMcpExecutionContext(source="external_mcp", owner="External MCP")
+
+        async def request_source():
+            return self.server.request_source
+
+        async def nested_dispatch():
+            return self.server.run_with_execution_context(
+                context, lambda: self.server._run_sync(request_source())
+            )
+
+        self.assertEqual("external_mcp", asyncio.run(nested_dispatch()))
+
+    def test_sdk_tool_errors_are_classified(self):
+        context = ServerRequestContext(
+            session=SimpleNamespace(client_params=None), lifespan_context=None,
+            protocol_version="2025-06-18", method="tools/call", request_id=1,
+        )
+        params = types.CallToolRequestParams(name="codes_create_code", arguments={})
+        expected = asyncio.run(self.server._sdk_call_tool(context, params))
+        self.assertTrue(expected.is_error)
+        self.assertIn("must not be empty", expected.content[0].text)
+
+        for unexpected_error in (ZeroDivisionError, KeyError, IndexError):
+            async def fail_operation(operation, execution_context):
+                raise unexpected_error("internal bug")
+
+            self.server._external_executor = fail_operation
+            with self.assertRaises(unexpected_error):
+                asyncio.run(self.server._sdk_call_tool(context, params))
+        self.server._external_executor = None
+
+    def test_quote_search_tolerates_pdf_layout(self):
+        text = "Intro. El an\u00e1lisis socio-\npol\u00edtico de la de\ufb01ni\u00ad\nci\u00f3n legal \u201cvigente\u201d sigue. Fin."
+        quote = 'el an\u00e1lisis socio-pol\u00edtico de la definici\u00f3n legal "vigente" sigue.'
+        pos0, pos1 = self.server._quote_search(quote, text)
+        self.assertEqual(text.index("El an"), pos0)
+        self.assertEqual(text.index(" Fin."), pos1)
+        self.assertEqual((-1, -1), self.server._layout_tolerant_quote_search("otra cosa distinta", text))
+
+    def test_project_reset_invalidates_preview_tokens(self):
+        self.app.settings["ai_permissions"] = AiMcpServer.AI_PERMISSION_FULL_ACCESS
+        preview = self.server.handle_request(
+            {"jsonrpc": "2.0", "id": 110, "method": "tools/call",
+             "params": {"name": "codes_preview_delete_code", "arguments": {"cid": 1}}}
+        )["result"]["structuredContent"]
+        token = preview["preview_token"]
+        self.server.reset_project_state()
+        rejected = self.server.handle_request(
+            {"jsonrpc": "2.0", "id": 111, "method": "tools/call",
+             "params": {"name": "codes_delete_code",
+                        "arguments": {"cid": 1, "preview_token": token}}}
+        )
+        self.assertEqual(-32602, rejected["error"]["code"])
+
+    def test_dangerous_delete_preview_confirmation_is_single_use(self):
+        self.app.settings["ai_permissions"] = AiMcpServer.AI_PERMISSION_FULL_ACCESS
+        without_preview = self.server.handle_request(
+            {"jsonrpc": "2.0", "id": 12, "method": "tools/call",
+             "params": {"name": "codes_delete_code", "arguments": {"cid": 1, "preview_token": ""}}}
+        )
+        self.assertEqual(-32602, without_preview["error"]["code"])
+
+        preview = self.server.handle_request(
+            {"jsonrpc": "2.0", "id": 13, "method": "tools/call",
+             "params": {"name": "codes_preview_delete_code", "arguments": {"cid": 1}}}
+        )["result"]["structuredContent"]
+        self.assertTrue(preview["requires_confirmation"])
+        token = preview["preview_token"]
+        deleted = self.server.handle_request(
+            {"jsonrpc": "2.0", "id": 14, "method": "tools/call",
+             "params": {"name": "codes_delete_code", "arguments": {"cid": 1, "preview_token": token}}}
+        )
+        self.assertTrue(deleted["result"]["structuredContent"]["deleted"])
+        reused = self.server.handle_request(
+            {"jsonrpc": "2.0", "id": 15, "method": "tools/call",
+             "params": {"name": "codes_delete_code", "arguments": {"cid": 1, "preview_token": token}}}
+        )
+        self.assertEqual(-32602, reused["error"]["code"])
+        self.assertIn((["code_name", "code_text"], "ai_agent"), self.app.project_events.calls)
+
+    def test_create_annotation_requires_a_unique_exact_quote_or_positions(self):
+        self.app.settings["ai_permissions"] = AiMcpServer.AI_PERMISSION_SANDBOXED
+        with self.assertRaisesRegex(ValueError, "occurs 2 times"):
+            self.server._call_tool_payload(
+                "annotations_create", {"fid": 1, "quote": "Alpha", "memo": "ambiguous"}, "cs"
+            )
+        with self.assertRaisesRegex(ValueError, "not found exactly"):
+            self.server._call_tool_payload(
+                "annotations_create", {"fid": 1, "quote": "Unique Phrase", "memo": "wrong case"}, "cs"
+            )
+
+        created = self.server._call_tool_payload(
+            "annotations_create", {"fid": 1, "quote": "unique phrase", "memo": "agent note"}, "cs"
+        )
+        payload = created["structuredContent"]
+        self.assertTrue(payload["created"])
+        self.assertEqual((23, 36), (payload["annotation"]["pos0"], payload["annotation"]["pos1"]))
+        self.assertEqual("AI Agent", payload["annotation"]["owner"])
+
+        positioned = self.server._call_tool_payload(
+            "annotations_create", {"fid": 1, "pos0": 0, "pos1": 5, "quote": "Alpha", "memo": "first"}, "cs"
+        )
+        self.assertTrue(positioned["structuredContent"]["created"])
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            self.server._call_tool_payload(
+                "annotations_create", {"fid": 1, "pos0": 0, "pos1": 5, "quote": "alpha", "memo": "bad"}, "cs"
+            )
+
+        duplicate = self.server._call_tool_payload(
+            "annotations_create", {"fid": 1, "pos0": 0, "pos1": 5, "memo": "ignored"}, "cs"
+        )
+        self.assertFalse(duplicate["structuredContent"]["created"])
+        self.assertEqual("already_exists", duplicate["structuredContent"]["reason"])
+        self.assertIn((['annotation'], 'ai_agent'), self.app.project_events.calls)
+
+        create_operation = self.app.ai.operations[-1][1]
+        undo_manager = AiLLM.__new__(AiLLM)
+        undo_manager.app = self.app
+        undo_result = undo_manager._undo_ai_change_set({"operations": [create_operation]})
+        self.assertEqual(1, undo_result["undone"])
+        cur = self.app.conn.cursor()
+        positioned_anid = positioned["structuredContent"]["annotation"]["anid"]
+        cur.execute("SELECT count(*) FROM annotation WHERE anid=?", (positioned_anid,))
+        self.assertEqual(0, cur.fetchone()[0])
+
+    def test_update_delete_permissions_private_memo_and_undo(self):
+        self.app.settings["ai_permissions"] = AiMcpServer.AI_PERMISSION_READ_ONLY
+        denied = self.server._call_tool_payload(
+            "annotations_create", {"fid": 1, "quote": "unique phrase", "memo": "note"}, "cs"
+        )
+        self.assertTrue(denied["isError"])
+
+        self.app.settings["ai_permissions"] = AiMcpServer.AI_PERMISSION_SANDBOXED
+        denied_update = self.server._call_tool_payload(
+            "annotations_update", {"anid": 1, "memo": "not allowed"}, "cs"
+        )
+        self.assertTrue(denied_update["isError"])
+
+        self.app.settings["ai_permissions"] = AiMcpServer.AI_PERMISSION_FULL_ACCESS
+        cur = self.app.conn.cursor()
+        cur.execute("UPDATE annotation SET memo=? WHERE anid=1", ("public\n#####\nprivate",))
+        self.app.conn.commit()
+        updated = self.server._call_tool_payload(
+            "annotations_update", {"anid": 1, "memo": "revised"}, "cs-update"
+        )
+        self.assertEqual("revised\n", updated["structuredContent"]["annotation"]["memo"])
+        cur.execute("SELECT memo FROM annotation WHERE anid=1")
+        self.assertEqual("revised\n#####\nprivate", cur.fetchone()[0])
+
+        update_operation = self.app.ai.operations[-1][1]
+        undo_manager = AiLLM.__new__(AiLLM)
+        undo_manager.app = self.app
+        undo_result = undo_manager._undo_ai_change_set({"operations": [update_operation]})
+        self.assertEqual(1, undo_result["undone"])
+        cur.execute("SELECT memo FROM annotation WHERE anid=1")
+        self.assertEqual("public\n#####\nprivate", cur.fetchone()[0])
+
+        deleted = self.server._call_tool_payload("annotations_delete", {"anid": 1}, "cs-delete")
+        self.assertTrue(deleted["structuredContent"]["deleted"])
+        delete_operation = self.app.ai.operations[-1][1]
+        undo_result = undo_manager._undo_ai_change_set({"operations": [delete_operation]})
+        self.assertEqual(1, undo_result["undone"])
+        cur.execute("SELECT memo FROM annotation WHERE anid=1")
+        self.assertEqual("public\n#####\nprivate", cur.fetchone()[0])
+
+    def test_annotation_reads_support_reference_candidates_and_compaction(self):
+        dialog = DialogAIChat.__new__(DialogAIChat)
+        dialog.get_filename = lambda _fid: "doc one"
+        stored_result = {
+            "action": "mcp_result",
+            "contents": [
+                {
+                    "uri": "qualcoder://annotations?file_ids=1",
+                    "payload": {
+                        "annotations": [
+                            {
+                                "fid": 1,
+                                "source_name": "doc one",
+                                "pos0": 6,
+                                "quote": "beta",
+                                "context_before": "Alpha ",
+                                "context_after": " Alpha",
+                            }
+                        ]
+                    },
+                }
+            ],
+        }
+        candidates = dialog._extract_ref_candidates_from_tool_result(
+            "MCP result:\n" + json.dumps(stored_result)
+        )
+        self.assertEqual("beta", candidates[0]["text"])
+        self.assertEqual(6, candidates[0]["start"])
+        self.assertTrue(dialog._is_compactable_resource_uri("qualcoder://annotations?file_ids=1"))
+
+    def test_annotation_events_refresh_open_text_and_transcript_dialogs(self):
+        refreshed_annotations = [{"anid": 9, "memo": "revised"}]
+        fake_app = SimpleNamespace(get_annotations=lambda: refreshed_annotations)
+
+        text_dialog = SimpleNamespace(
+            app=fake_app,
+            attributes=[],
+            file_={"id": 1},
+            annotations=[],
+            refresh_count=0,
+        )
+
+        def refresh_text():
+            text_dialog.refresh_count += 1
+
+        text_dialog.get_coded_text_update_eventfilter_tooltips = refresh_text
+        DialogCodeText._on_project_data_changed(text_dialog, ["annotation"], "ai_agent")
+        self.assertEqual(refreshed_annotations, text_dialog.annotations)
+        self.assertEqual(1, text_dialog.refresh_count)
+
+        av_dialog = SimpleNamespace(
+            app=fake_app,
+            attributes=[],
+            annotations=[],
+            segments=[],
+            code_text=[],
+            refresh_count=0,
+        )
+
+        def refresh_transcript():
+            av_dialog.refresh_count += 1
+
+        av_dialog.get_coded_text_update_eventfilter_tooltips = refresh_transcript
+        DialogCodeAV._on_project_data_changed(av_dialog, ["annotation"], "ai_agent")
+        self.assertEqual(refreshed_annotations, av_dialog.annotations)
+        self.assertEqual(1, av_dialog.refresh_count)
 
 
 class DummyReferenceApp:
@@ -701,6 +1980,405 @@ class TestAiTextAnalysisPromptResolution(TestCase):
         self.assertEqual("text-analysis/system-prompt", prompt_record.name)
 
 
+class DummyChatSummaryRenderer:
+    """Minimal renderer stub for chat summary formatting tests."""
+
+    @staticmethod
+    def _render_plain_text_with_prompt_refs(text: str, style_role: str = "user") -> str:
+        del style_role
+        return text
+
+
+class TestAiChatSummaryRendering(TestCase):
+    """Regression tests for AI chat summary label formatting."""
+
+    @patch("qualcoder.ai_chat._", side_effect=lambda text: {
+        "\nDescription:": "\nBeschreibung:",
+        "\nPrompt:": "\nPrompt:",
+        "\nMaterial:": "\nMaterial:",
+    }.get(text, text), create=True)
+    def test_topic_exploration_labels_are_bold(self, _translate):
+        del _translate
+        renderer = DummyChatSummaryRenderer()
+
+        html_string = DialogAIChat._render_chat_summary(
+            renderer,
+            "Thema erkunden.\nBeschreibung: Details\nPrompt: system/default\nMaterial: 3 Dateien",
+            "topic_exploration",
+        )
+
+        self.assertEqual(
+            "Thema erkunden.<br /><b>Beschreibung:</b> Details"
+            "<br /><b>Prompt:</b> system/default<br /><b>Material:</b> 3 Dateien",
+            html_string,
+        )
+
+    @patch("qualcoder.ai_chat._", side_effect=lambda text: {
+        "\nDescription:": "\nBeschreibung:",
+    }.get(text, text), create=True)
+    def test_stored_source_label_is_also_bold(self, _translate):
+        del _translate
+        renderer = DummyChatSummaryRenderer()
+
+        html_string = DialogAIChat._render_chat_summary(
+            renderer,
+            "Explore topic.\nDescription: Details",
+            "topic_exploration",
+        )
+
+        self.assertEqual("Explore topic.<br /><b>Description:</b> Details", html_string)
+
+
+class TestAiReadinessChat(TestCase):
+    """Regression tests for starting the project AI-readiness audit."""
+
+    @patch("qualcoder.ai_chat._", side_effect=lambda text: text, create=True)
+    def test_readiness_chat_resolves_effective_prompt_and_starts_mcp_agent(self, _translate):
+        del _translate
+        readiness_prompt = AgentPromptRecord(
+            scope="user",
+            root_path="",
+            name="Check-project-AI-readiness",
+            file_path="",
+            content="Audit this project.",
+            description="",
+            is_internal=False,
+        )
+        worker = object()
+        messages = [object()]
+        chat = SimpleNamespace(
+            app=SimpleNamespace(
+                ai=SimpleNamespace(
+                    is_busy=MagicMock(return_value=False),
+                    is_ready=MagicMock(return_value=True),
+                )
+            ),
+            agent_prompts_catalog=SimpleNamespace(
+                get_prompt=MagicMock(return_value=readiness_prompt),
+            ),
+            _can_start_general_chat=MagicMock(return_value=True),
+            _start_general_chat_session=MagicMock(return_value=2),
+            _persist_agent_prompt_record=MagicMock(),
+            history_add_message=MagicMock(),
+            history_get_ai_messages_compacted=MagicMock(return_value=messages),
+            _start_mcp_agent_worker=MagicMock(),
+            _mcp_general_chat_worker=worker,
+            update_chat_window=MagicMock(),
+        )
+
+        DialogAIChat.new_project_ai_readiness_chat(chat)
+
+        chat.agent_prompts_catalog.get_prompt.assert_called_once_with("Check-project-AI-readiness")
+        chat._persist_agent_prompt_record.assert_called_once_with(
+            2,
+            readiness_prompt,
+            activation_source="bootstrap",
+        )
+        chat.history_add_message.assert_called_once_with(
+            "instruct",
+            "",
+            "Perform the activated project AI-readiness assessment now.",
+            2,
+        )
+        chat._start_mcp_agent_worker.assert_called_once_with(messages, 2, worker)
+        chat.update_chat_window.assert_called_once_with()
+
+
+class DummyAgentBasePromptCatalog:
+    """Minimal prompt catalog for agent base-system-prompt tests."""
+
+    def __init__(self) -> None:
+        self.base_prompt = AgentPromptRecord(
+            scope="system",
+            root_path="",
+            name="_agent",
+            file_path="",
+            content="Base agent prompt.",
+            description="",
+            is_internal=True,
+        )
+        self.resolve_prompt_references = MagicMock(return_value=[])
+
+    def get_internal_prompt(self, name: str) -> AgentPromptRecord | None:
+        if name == "_agent":
+            return self.base_prompt
+        return None
+
+    @staticmethod
+    def expand_prompt_references(prompts: list[AgentPromptRecord],
+                                 include_internal: bool = False) -> list[AgentPromptRecord]:
+        del include_internal
+        return prompts
+
+
+class TestAgentBasePromptProjectMemo(TestCase):
+    """Regression tests for the project-memo section in agent context."""
+
+    @staticmethod
+    def _build_chat(project_memo: str) -> tuple[SimpleNamespace, DummyAgentBasePromptCatalog]:
+        catalog = DummyAgentBasePromptCatalog()
+        chat = SimpleNamespace(
+            app=SimpleNamespace(get_project_memo=lambda: project_memo),
+            agent_prompts_catalog=catalog,
+            _agent_base_prompt_name=lambda: "_agent",
+            _render_base_agent_prompt_record=lambda prompt: prompt.content,
+        )
+        return chat, catalog
+
+    def test_nonempty_project_memo_is_explicitly_labelled(self):
+        chat, catalog = self._build_chat("Research question: How do participants adapt?")
+
+        system_prompt, _included_prompt_keys = DialogAIChat._collect_agent_base_prompt_context(chat)
+
+        self.assertIn(
+            "# Project memo\n\n"
+            "The following block is the current user-authored QualCoder project memo. "
+            "It contains background information about the research project that you are working on.\n\n"
+            "<project_memo>\n"
+            "Research question: How do participants adapt?\n"
+            "</project_memo>",
+            system_prompt,
+        )
+        catalog.resolve_prompt_references.assert_called_once_with(
+            "Research question: How do participants adapt?"
+        )
+
+    def test_empty_ai_visible_project_memo_has_explicit_empty_state(self):
+        chat, catalog = self._build_chat("#####\nPrivate note")
+
+        system_prompt, _included_prompt_keys = DialogAIChat._collect_agent_base_prompt_context(chat)
+
+        self.assertTrue(system_prompt.endswith("# Project memo\n\nThe project memo is currently empty."))
+        self.assertNotIn("<project_memo>", system_prompt)
+        self.assertNotIn("The following block", system_prompt)
+        self.assertNotIn("Private note", system_prompt)
+        catalog.resolve_prompt_references.assert_not_called()
+
+
+class DummyProgressSignal:
+    """Record AI progress payloads emitted by a chat operation."""
+
+    def __init__(self):
+        self.payloads = []
+
+    def emit(self, payload: str):
+        self.payloads.append(json.loads(payload))
+
+
+class DummyConfirmationSignal:
+    """Answer internal timeout confirmation requests without a GUI."""
+
+    def __init__(self, abort: bool):
+        self.abort = abort
+        self.requests = []
+
+    def emit(self, request: dict):
+        self.requests.append(request)
+        request["abort"] = self.abort
+        request["answered"].set()
+
+
+class DummyTimeoutAiService:
+    """Minimal AI service for internal timeout retry tests."""
+
+    def __init__(self):
+        self.run_count = 0
+
+    @staticmethod
+    def _get_current_run_context():
+        return SimpleNamespace(run_id="parent-run")
+
+    def _create_run_context(self, **kwargs):
+        del kwargs
+        self.run_count += 1
+        return SimpleNamespace(
+            run_id=f"internal-run-{self.run_count}",
+            cancel_event=threading.Event(),
+            error_text="",
+        )
+
+    @staticmethod
+    def _register_run_context(run_context):
+        del run_context
+
+    @staticmethod
+    def _set_current_run_context(run_context):
+        del run_context
+
+    @staticmethod
+    def _update_run_status(run_id, status, error_text=""):
+        del run_id, status, error_text
+
+    @staticmethod
+    def _finalize_run_context(run_context, terminal_status):
+        del run_context, terminal_status
+
+    @staticmethod
+    def _clear_current_run_context():
+        return None
+
+    @staticmethod
+    def is_current_run_canceled():
+        return False
+
+    @staticmethod
+    def _request_cancel_run(run_context):
+        run_context.cancel_event.set()
+
+
+class DummyInternalJsonInvoker:
+    """Minimal chat stub for internal JSON status tests."""
+
+    class App:
+        ai = None
+
+    def __init__(self):
+        self.app = self.App()
+
+    _emit_mcp_status_text = DialogAIChat._emit_mcp_status_text
+    _normalize_progress_note = DialogAIChat._normalize_progress_note
+
+    @staticmethod
+    def _invoke_json_llm(messages, **kwargs):
+        del messages, kwargs
+        return {"action": "final_answer"}
+
+
+class TestAiInternalJsonStatus(TestCase):
+    """Regression tests for AI status messages during internal JSON steps."""
+
+    @patch("qualcoder.ai_chat._", side_effect=lambda text: text, create=True)
+    def test_reflection_starts_with_analyzing_status(self, _translate):
+        del _translate
+        invoker = DummyInternalJsonInvoker()
+        progress = DummyProgressSignal()
+        signals = type("Signals", (), {"progress": progress})()
+
+        result = DialogAIChat._invoke_json_llm_with_step_timeout(
+            invoker,
+            [],
+            status_kind="reflection",
+            signals=signals,
+            chat_idx=7,
+        )
+
+        self.assertEqual({"action": "final_answer"}, result)
+        self.assertEqual(
+            [{"chat_idx": 7, "status": "Analyzing...", "status_kind": "reflection"}],
+            progress.payloads,
+        )
+
+    @patch("qualcoder.ai_chat._", side_effect=lambda text: text, create=True)
+    def test_reflection_timeout_question_mentions_provisional_answer(self, _translate):
+        del _translate
+
+        question = DialogAIChat._internal_step_timeout_question(
+            "Internal reflection",
+            "reflection",
+        )
+
+        self.assertIn("QualCoder's time limit", question)
+        self.assertIn("provisional answer", question)
+
+    @patch("qualcoder.ai_chat._", side_effect=lambda text: text, create=True)
+    def test_provider_timeout_does_not_request_confirmation(self, _translate):
+        del _translate
+        confirmation = DummyConfirmationSignal(abort=False)
+        signals = type(
+            "Signals",
+            (),
+            {"progress": DummyProgressSignal(), "confirmation": confirmation},
+        )()
+        invoker = DummyInternalJsonInvoker()
+        invoker.app.ai = DummyTimeoutAiService()
+        invoker._invoke_json_llm = MagicMock(side_effect=TimeoutError("provider timeout"))
+        invoker._internal_json_step_timeouts = lambda: (10.0, 20.0)
+
+        with self.assertRaises(TimeoutError):
+            DialogAIChat._invoke_json_llm_with_step_timeout(
+                invoker,
+                [],
+                step_name="Internal reflection",
+                status_kind="reflection",
+                signals=signals,
+                chat_idx=7,
+            )
+
+        self.assertEqual(0, len(confirmation.requests))
+
+    @patch("qualcoder.ai_chat._", side_effect=lambda text: text, create=True)
+    def test_hard_timeout_keeps_waiting_when_user_declines_abort(self, _translate):
+        del _translate
+        confirmation = DummyConfirmationSignal(abort=False)
+        signals = type(
+            "Signals",
+            (),
+            {"progress": DummyProgressSignal(), "confirmation": confirmation},
+        )()
+        invoker = DummyInternalJsonInvoker()
+        invoker.app.ai = DummyTimeoutAiService()
+
+        def delayed_result(messages, **kwargs):
+            del messages, kwargs
+            time.sleep(0.35)
+            return {"action": "final_answer"}
+
+        invoker._invoke_json_llm = delayed_result
+        invoker._internal_json_step_timeouts = lambda: (0.05, 0.1)
+        invoker._internal_step_timeout_question = DialogAIChat._internal_step_timeout_question
+        invoker._request_internal_step_timeout_confirmation = (
+            DialogAIChat._request_internal_step_timeout_confirmation.__get__(invoker)
+        )
+
+        result = DialogAIChat._invoke_json_llm_with_step_timeout(
+            invoker,
+            [],
+            step_name="Internal planning",
+            status_kind="planning",
+            signals=signals,
+            chat_idx=7,
+        )
+
+        self.assertEqual({"action": "final_answer"}, result)
+        self.assertEqual(1, len(confirmation.requests))
+
+    @patch("qualcoder.ai_chat._", side_effect=lambda text: text, create=True)
+    def test_timeout_dialog_closes_when_operation_finishes(self, _translate):
+        del _translate
+        operation_finished = threading.Event()
+        answered = threading.Event()
+        request = {
+            "question": "Continue?",
+            "abort": True,
+            "answered": answered,
+            "operation_finished": operation_finished,
+        }
+        msg_box = MagicMock()
+        completion_timer = MagicMock()
+        timer_callback = None
+
+        def connect_timer(callback):
+            nonlocal timer_callback
+            timer_callback = callback
+
+        def finish_during_dialog():
+            operation_finished.set()
+            timer_callback()
+            return QtWidgets.QMessageBox.StandardButton.No
+
+        completion_timer.timeout.connect.side_effect = connect_timer
+        msg_box.exec.side_effect = finish_during_dialog
+        chat = SimpleNamespace(app=SimpleNamespace(settings={"fontsize": "10"}))
+
+        with patch("qualcoder.ai_chat.Message", return_value=msg_box), \
+                patch("qualcoder.ai_chat.QtCore.QTimer", return_value=completion_timer):
+            DialogAIChat._ai_internal_timeout_confirmation_callback(chat, request)
+
+        msg_box.reject.assert_called_once_with()
+        self.assertTrue(answered.is_set())
+        self.assertFalse(request["abort"])
+
+
 # TEST_PERSIST_PATH = '/fake/path/'
 CONFIG_INI_AI_EX4C0559 = {
     "backup_num": "5",
@@ -781,6 +2459,7 @@ CONFIG_INI_AI_EX4C0559 = {
     "ai_temperature": "1.0",
     "ai_top_p": "1.0",
     "ai_timeout": "30.0",
+    "ai_model_upgrade_offer_pending": "",
 }
 
 

@@ -14,7 +14,7 @@ See the GNU General Public License for more details.
 You should have received a copy of the GNU Lesser General Public License along with QualCoder.
 If not, see <https://www.gnu.org/licenses/>.
 
-Author: Colin Curtain C, Kai Dröge, Justin Missaghieh--Poncet, Lorenzo Salomón
+Authors: Colin Curtain C, Kai Dröge, Justin Missaghieh--Poncet, Lorenzo Salomón
 https://github.com/ccbogel/QualCoder
 https://qualcoder.wordpress.com/
 https://qualcoder-org.github.io
@@ -22,12 +22,14 @@ https://qualcoder.org/
 """
 
 import html
-from markdown_it import MarkdownIt
-from PyQt6 import QtWidgets, QtCore, QtGui
-from pathlib import Path
+import json  # To get the latest GitHub release information
 import logging
+from markdown_it import MarkdownIt
+from pathlib import Path
+from PyQt6 import QtWidgets, QtCore, QtGui
 import qtawesome as qta
 import re
+import urllib.request
 
 from .GUI.ui_dialog_information import Ui_Dialog_information
 
@@ -159,9 +161,37 @@ class DialogInformation(QtWidgets.QDialog):
         if html_string == "":
             about_modifed = about.replace("qualcoder_version", app.version)
             about_modifed = about_modifed.replace("qualcoder_citation", app.citation)
+            about_modifed = about_modifed.replace("RELEASE INFORMATION", self.get_latest_github_release(app))
             self.setHtml(about_modifed)
         else:
             self.setHtml(html_string)
+
+    def get_latest_github_release(self, app) -> str:
+        """ Check GitHub for newer releases. Format as Qualoder #.# """
+
+        release_info = ""
+        try:
+            _json = json.loads(urllib.request.urlopen(urllib.request.Request(
+                'https://api.github.com/repos/ccbogel/QualCoder/releases/latest',
+                headers={'Accept': 'application/vnd.github.v3+json'},), timeout=10).read())
+            release_version_number = _json['name'].split()[1]
+            tmp_release_num = release_version_number.split('.', 1)
+            release_num = float(tmp_release_num[0] + '.' + tmp_release_num[1].replace('.', ''))
+            temp_this_version = app.version.replace("QualCoder", "")
+            tmp_this_version_num = temp_this_version.split('.', 1)
+            this_version_num = float(tmp_this_version_num[0] + '.' + tmp_this_version_num[1].replace('.', ''))
+            release_link = f'<a href="{html.escape(_json["html_url"])}">{html.escape(_json["name"])}</a>'
+            if release_num > this_version_num:
+                release_info = _("Newer release available: ") + release_link
+            elif str(release_num) == str(this_version_num):
+                release_info = _("Latest Release: ") + release_link
+            else:
+                release_info = _("This version may be a pre-release version.")
+        except Exception as err:  # URLError and more
+            print(err)
+            logger.warning(str(err))
+            release_info = _("Could not get latest release from Github")
+        return release_info
 
     def setHtml(self, html_string):
         """This method is used to populate the textEdit.
@@ -184,13 +214,14 @@ about = f'<h1 class="western">{_("About")} QualCoder</h1>\
 <p>{_("Optional: Install VLC for audio and video coding.")}<br /> \
 {_("Optional: Install ffmpeg for waveform images.")}</p>\
 <p>Tested on: Windows 11, Linux Mint 22.3.</p>\
+<p>RELEASE INFORMATION</p>\
 <p></p>\
 <h2 class="western">{_("Acknowledgements")}</h2>\
 <p>Ronggui Huang, Zhang Gehao - {_("Created RQDA - inspiration for QualCoder.")}<br /> \
 Mike MacCana -  {_("Source code for the docx module.")}<br /> \
 Julius Reich - {_("Created the QualCoder logo.")}<br /> \
 Kai Dröge -  {_("Programming, artificial intelligence and much more.")}<br /> \
-Justin Missaghieh-Poncet - {_("French translations, programming, setting up the new website and more.")}<br />\
+Justin Missaghieh-Poncet - {_("French translations, programming, setting up the new website and more.")} \
 <a href="https://qualcoder.org" target="_blank">https://qualcoder.org</a><br /> \
 Lorenzo Salomón - {_("Programming and Spanish translations.")}<br /> \
 Jofen Kihlstrom for past Swedish translations.<br /> \
@@ -455,6 +486,63 @@ Ctrl + Enter {_("Run SQL query")}<br />'
 coding_shortcuts_display = coding_text_shortcuts + coding_pdf_shortcuts
 coding_shortcuts_display += coding_image_shortcuts + coding_av_shortcuts + code_tree_shortcuts
 coding_shortcuts_display += database_queries_shortcuts
+
+def project_tab_info():
+    """Return translated Markdown for the Project tab placeholder."""
+
+    return _("""# Project
+
+The Project tab is the starting point for your work. Create or open a project with the cards on the left,
+and go back to your latest work from the Recent activity list. Everything else is in the [Project menu](qualcoder://menu/project).
+The action log, shown in place of this guide, records what you do during a session.
+
+
+## First steps
+
+1. [Import your files](qualcoder://menu/files_and_cases/manage_files), such as documents, PDFs, images, audio and video.
+2. Group participants or sites as [cases](qualcoder://menu/files_and_cases/manage_cases) and describe them with [attributes](qualcoder://menu/files_and_cases/manage_attributes).
+3. Start [coding text](qualcoder://menu/coding/codes), [PDFs](qualcoder://menu/coding/code_pdf), [images](qualcoder://menu/coding/code_image) or [audio and video](qualcoder://menu/coding/code_audio_video).
+4. Write your reflections in [journals](qualcoder://menu/files_and_cases/manage_journals) and the [project memo](qualcoder://menu/project/project_memo).
+5. Explore patterns in the [reports](qualcoder://menu/reports) or ask the [AI Agent](qualcoder://menu/ai).
+
+
+## About projects
+
+- A QualCoder project is a folder ending in .qda. It contains the project database and folders for imported documents, images, audio and video.
+- A dated backup of the project can be made each time it is opened. See the backup options in [Settings](qualcoder://menu/project/settings).
+- [Help: Creating a new project](qualcoder://help/3.1.-Creating-a-New-Project/)
+
+
+## [Project Memo](qualcoder://menu/project/project_memo)
+
+- Describe the research topic, questions, methodology, and the participants and data collected.
+- The AI agent reads this memo to understand the context of your project.
+
+
+## [Settings](qualcoder://menu/project/settings)
+
+- Set your coder name, fonts, language, colour style, backups, and the AI integration. Settings and Help are also next to the main tabs.
+- [Help: Settings](qualcoder://help/2.2.-Settings/)
+
+
+## [Project Summary](qualcoder://menu/project/project_summary)
+
+- Writes a detailed overview of the open project to the action log, with files, cases, codes, categories, attributes, journals, and any bad links to files.
+
+
+## [Import](qualcoder://menu/project/import) and [Export](qualcoder://menu/project/export)
+
+- Exchange projects and codebooks with other software through the REFI-QDA standard.
+- Import RQDA, Taguette and Sonal projects, or a plain text list of codes.
+- Export the codebook as an ODT file, with or without memos.
+- [Help: Imports and exports](qualcoder://help/6.1.-Imports-and-Exports/)
+
+
+## [Close Project](qualcoder://menu/project/close_project)
+
+- Closes the open project. Workspaces with unsaved changes are checked first, and a backup made on opening is removed if nothing changed.
+""")
+
 
 def manage_tab_info():
     """Return translated Markdown for the Manage tab placeholder."""

@@ -29,7 +29,7 @@ Please also read the manual here: [QualCoder Manual](https://qualcoder.org/)
 # QualCoder
 QualCoder is a qualitative data analysis application written in Python.
 
-Text files can be typed in manually or loaded from txt, odt, docx, html, htm, md, epub, rtf and  PDF files. Images, video, and audio can also be imported for coding. Codes can be assigned to text, images, and a/v selections and grouped into categories in a hierarchical fashion. Various types of reports can be produced including visual coding graphs, coder comparisons, and coding frequencies. AI models like GPT-4 from OpenAI can be used to explore your data and analyze the results.  
+Text files can be typed in manually or loaded from docx, epub, html, md, odt, rtf, tex, txt, rtf and  PDF files. Images, video, and audio can also be imported for coding. Codes can be assigned to text, images and audio/video selections and grouped into categories in a hierarchical fashion. Various types of reports can be produced including visual coding graphs, coder comparisons, and coding frequencies. AI models like GPT-4 from OpenAI can be used to explore your data and analyze the results.  
 
 This software has been used on MacOS and various Linux distros.
 Instructions and other information are available here: [Documentation](https://qualcoder.org/).
@@ -44,15 +44,15 @@ If you like QualCoder please buy me a coffee ...
 
 ### Prerequisites
 Optional: VLC for audio/video coding. 
-Optional: ffmpeg installed for waveform image see here to install ffmpeg on Windows:  https://phoenixnap.com/kb/ffmpeg-windows. 
+Optional: ffmpeg installed for waveform image see here to install [ffmpeg](https://phoenixnap.com/kb/ffmpeg-windows) on Windows. 
 
 On the first start of QualCoder, you may want to [setup the AI enhanced features](#setup-of-the-ai-features) as described below.
 
 ### Windows
 
-You have two options, see Releases link on the right-hand side of this page:
-- Newer releases contain an **exe file** created on Windows 11. Double-click to run, it takes 20 seconds to start.
-- There are **Windows installers** available on the release page. 
+You have various options, see Releases link on the right-hand side of this page:
+- There is a **Windows installer** available on the release page. 
+- Newer releases contain an **exe file** created on Windows 11. Double-click to run, it takes a minute to start.
 
 On first use of the exe, Windows may ask you to allow to run QualCoder. This is because it is from an unknown publisher. It costs a lot of money to get a trusted publisher certificate - so that will not be possible for the foreseeable future. If you are uncomfortable with these warnings install from the source as detailed next.
 
@@ -310,8 +310,8 @@ https://discover.utas.edu.au/Colin.Curtain/publications
 **Dr. Justin Missaghieh--Poncet**
 [Université de Pau et des Pays de l'Adour](https://www.univ-pau.fr/fr/index.html), France. Justin is a geography researcher, who works on the relationship between societies and their environment, with particular attention to energy and ecological transitions. Testing, translations into French, Webmaster of QualCoder.org and Linux version maintainer.
 
-**Dr. Lorenzo Salomón**
-Psic. Lorenzo Salomón Cárdenas. [Universidad Autónoma de Sinaloa](https://www.uas.edu.mx/), Mexico. Testing, software development enthusiast, translations into Spanish. Freelance Researcher and Human Rights Activist.
+**Psic. Lorenzo Salomón Cárdenas**
+[Universidad Autónoma de Sinaloa](https://www.uas.edu.mx/), México. Testing, software development enthusiast, translations into Spanish. Freelance Researcher and Human Rights Activist.
 
 ## Leave a review
 
@@ -325,7 +325,7 @@ Also, if you like Qualcoder a lot and want to advertise interest in its use, ple
 
 ## Other sources of information about QualCoder 
 
-Literature about QualCoder. Literature from authors not listed above may potneitally be inaccurate.
+Literature about QualCoder. Literature from authors not listed above may potentially be inaccurate or relate to older versions.
 
 Downloads of executables from other web sites. We do not endorse downloading of executables from anywhere other than the GitHub QualCoder releases page or the Codeberg equivalent: https://codeberg.org/qualcoder.
 

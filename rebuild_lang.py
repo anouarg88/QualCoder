@@ -6,7 +6,7 @@ Using --status option: Check status of translation.
 Using --zip option: Create zip for community languages.
 Using --check option: Check translation files for errors.
 
-Requires polib and PyQt5.
+Requires polib and PyQt6.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -30,21 +30,21 @@ https://github.com/ccbogel/QualCoder
 https://qualcoder.org/
 """
 
-from lxml import etree
 import os
-from pathlib import Path
-import polib
 import subprocess
 import sys
 import zipfile
-from typing import Dict, Any, List, Optional, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import polib
+from lxml import etree
 
 # --- Constants ---
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 I18N_DIR = os.path.join(PROJECT_ROOT, "src", "qualcoder", "i18n")
 OTHER_LANGS_DIR = os.path.join(PROJECT_ROOT, "other_languages")
-GUI_DIR = os.path.join(PROJECT_ROOT, "src", "qualcoder", "GUI")
-PROJECT_PRO_PATH = os.path.join(GUI_DIR, "project.pro")
+GUI_UI_DIR = os.path.join(PROJECT_ROOT, "src", "GUI_UIs")
 
 # --- Utility Functions ---
 def get_all_languages() -> List[str]:
@@ -92,9 +92,9 @@ def extract_pot_file(directory: str, pot_filename: str) -> None:
     if not py_files:
         print("No Python files found to extract translatable strings from.")
         return
-
+	# Justin: /usr/local/bin/xgettext
     run_subprocess(
-        ["xgettext", "--language=Python", "--keyword=_", "--output", pot_filename] + py_files
+        ["/usr/local/bin/xgettext", "--language=Python", "--keyword=_", "--output", pot_filename] + py_files
     )
     print(f"Extracted POT file: {pot_filename}")
 
@@ -113,27 +113,43 @@ def update_po_files(directory: str, pot_filename: str, lang: Optional[str] = Non
                 pass
 
 def delete_obsolete_ts(file_ts: str) -> None:
-    """Remove obsolete entries from a .ts file."""
+    """Remove obsolete and vanished entries from a `.ts` file."""
     parser = etree.XMLParser(remove_blank_text=True)
     tree = etree.parse(file_ts, parser)
     root = tree.getroot()
-    for message in root.xpath('//message[translation[@type="obsolete"]]'):
+    inactive_messages = root.xpath(
+        '//message[translation[@type="obsolete" or @type="vanished"]]'
+    )
+    for message in inactive_messages:
         message.getparent().remove(message)
     tree.write(file_ts, encoding="utf-8", xml_declaration=True, pretty_print=True)
 
-def build_pro_file(ts_files: List[str], ui_files: List[str]) -> None:
-    """Create/overwrite project.pro for pylupdate5."""
-    text = "SOURCES = \\\n" + " \\\n".join(ui_files) + "\n\n"
-    text += "TRANSLATIONS = \\\n" + " \\\n".join(ts_files) + "\n\n"
-    text += "CODECFORTR = ISO-8859-5\n"
+def run_pylupdate6(ts_files: List[str]) -> bool:
+    """Update Qt translation files from the Qt Designer sources.
 
-    os.makedirs(os.path.dirname(PROJECT_PRO_PATH), exist_ok=True)
-    with open(PROJECT_PRO_PATH, "w") as f:
-        f.write(text)
-    print("Created project.pro file")
+    Args:
+        ts_files: Paths of the Qt translation files to update or create.
+    """
+    ui_files = []
+    if os.path.exists(GUI_UI_DIR):
+        ui_files = sorted(
+            file
+            for file in os.listdir(GUI_UI_DIR)
+            if file.startswith("ui_") and file.endswith(".ui")
+        )
+
+    if not ui_files:
+        print(f"No Qt Designer UI files found in {GUI_UI_DIR}.")
+        return False
+
+    command = ["pylupdate6"]
+    for ts_file in ts_files:
+        command.extend(["--ts", ts_file])
+    command.extend(ui_files)
+    return run_subprocess(command, cwd=GUI_UI_DIR)
 
 def update_qt_ts_files(lang: Optional[str] = None) -> None:
-    """Update Qt .ts files using pylupdate5."""
+    """Update Qt .ts files using pylupdate6."""
     # Find all .ts files
     ts_files = []
     for directory in [I18N_DIR, OTHER_LANGS_DIR]:
@@ -147,100 +163,59 @@ def update_qt_ts_files(lang: Optional[str] = None) -> None:
     if lang:
         ts_files = [f for f in ts_files if Path(f).stem == lang]
 
-    # Find UI files
-    ui_files = []
-    if os.path.exists(GUI_DIR):
-        for ui_file in os.listdir(GUI_DIR):
-            if ui_file.startswith("ui_") and ui_file.endswith(".py"):
-                rel_path = os.path.relpath(
-                    os.path.join(GUI_DIR, ui_file), GUI_DIR
-                ).replace(os.path.sep, "/")
-                ui_files.append(rel_path)
-        ui_files.sort()
-
-    # Prepare .pro file entries
-    pro_ts_files = []
+    ts_paths = []
     for ts_file in ts_files:
         for directory in [I18N_DIR, OTHER_LANGS_DIR]:
-            if os.path.exists(os.path.join(directory, ts_file)):
-                rel_dir = os.path.relpath(directory, GUI_DIR).replace(os.path.sep, "/")
-                pro_ts_files.append(f"{rel_dir}/{ts_file}")
+            ts_path = os.path.join(directory, ts_file)
+            if os.path.exists(ts_path):
+                ts_paths.append(ts_path)
                 break
 
-    build_pro_file(pro_ts_files, ui_files)
-    run_subprocess(['pylupdate5', PROJECT_PRO_PATH], cwd=GUI_DIR)
+    if not ts_paths:
+        print("No Qt .ts files found to update.")
+        return
+
+    if not run_pylupdate6(ts_paths):
+        return
     print("Updated ts translation files")
 
-    # Clean obsolete entries
+    # Clean inactive entries
     for ts_file in ts_files:
         for directory in [I18N_DIR, OTHER_LANGS_DIR]:
             ts_path = os.path.join(directory, ts_file)
             if os.path.exists(ts_path):
                 delete_obsolete_ts(ts_path)
-                print(f"Cleaned obsolete entries in {ts_file}")
+                print(f"Cleaned inactive entries in {ts_file}")
 
 def update_translation_placeholders(language: Optional[str] = None) -> None:
     """Update .pot, .po, and .ts files for all or a specific language."""
     pot_filename = os.path.join(PROJECT_ROOT, "src", "qualcoder", "qualcoder.pot")
     extract_pot_file(os.path.join(PROJECT_ROOT, "src", "qualcoder"), pot_filename)
     update_po_files(I18N_DIR, pot_filename, language)
+    update_po_files(OTHER_LANGS_DIR, pot_filename, language)
     update_qt_ts_files(language)
 
 # --- New Language Placeholders ---
 def create_new_language_placeholders(language: str) -> None:
     """Create empty .po and .ts files for a new language in other_languages."""
     print(f"Creating placeholder files for language: {language}")
+    os.makedirs(OTHER_LANGS_DIR, exist_ok=True)
 
-    # Create empty .po file
     new_po_file = os.path.join(OTHER_LANGS_DIR, f"{language}.po")
-    with open(new_po_file, "w", encoding="utf-8"):
-        pass
-    print(f"Created empty .po file: {new_po_file}")
+    with open(new_po_file, "w", encoding="utf-8") as f:
+        f.write('msgid ""\nmsgstr ""\n')
+    print(f"Created .po file: {new_po_file}")
 
-    # Update .ts file via project.pro
+    # Create the .ts file with pylupdate6
     new_ts_file = os.path.join(OTHER_LANGS_DIR, f"{language}.ts")
-    if not os.path.exists(GUI_DIR):
-        print(f"Error: {GUI_DIR} does not exist.")
+    if not os.path.exists(GUI_UI_DIR):
+        print(f"Error: {GUI_UI_DIR} does not exist.")
         return
 
-    # Read existing project.pro
-    pro_content = ""
-    if os.path.exists(PROJECT_PRO_PATH):
-        with open(PROJECT_PRO_PATH, "r", encoding="utf-8") as f:
-            pro_content = f.read()
-
-    # Add new .ts entry
-    rel_ts_path = os.path.relpath(OTHER_LANGS_DIR, GUI_DIR).replace(os.path.sep, "/")
-    new_ts_entry = f"{rel_ts_path}/{language}.ts"
-
-    if new_ts_entry not in pro_content:
-        lines = pro_content.split("\n")
-        new_lines = []
-        in_translations = False
-        added = False
-
-        for line in lines:
-            new_lines.append(line)
-            if line.startswith("TRANSLATIONS"):
-                in_translations = True
-                continue
-            if in_translations and line.strip() and not line.strip().startswith("#"):
-                if line.strip().endswith(".ts") and not added:
-                    new_lines.append(new_ts_entry)
-                    added = True
-                    in_translations = False
-
-        if not added:
-            new_lines.extend(["", "TRANSLATIONS = \\", new_ts_entry])
-
-        with open(PROJECT_PRO_PATH, "w", encoding="utf-8") as f:
-            f.write("\n".join(new_lines))
-
-    # Run pylupdate5
-    run_subprocess(["pylupdate5", PROJECT_PRO_PATH], cwd=GUI_DIR)
+    if not run_pylupdate6([new_ts_file]):
+        return
     print(f"Created/updated .ts file: {new_ts_file}")
 
-    # Update placeholders
     update_translation_placeholders(language)
     print("New placeholder files created.")
 
@@ -343,7 +318,7 @@ def analyze_translation_status(language: Optional[str] = None) -> str:
     language_names = {
         "de": "Deutsch", "en": "English", "es": "Español", "fr": "Français",
         "it": "Italiano", "ja": "日本語", "pt": "Português", "ro": "Română",
-        "sv": "Svenska", "zh": "中文", "eu": "Euskara", "eo": "Esperanto", "fa": "فارسی",
+        "sv": "Svenska", "zh": "中文", "eu": "Euskara", "eo": "Esperanto", "oc": "Occitan", "fa": "فارسی",
     }
 
     # Collect languages
@@ -385,7 +360,10 @@ def analyze_translation_status(language: Optional[str] = None) -> str:
         )
         status = lang_info["status"]
 
-        lang_display = f"{language_names.get(lang, lang)} ({lang})"
+        if lang_info["status"] == "community maintained":
+            lang_display = f"[{language_names.get(lang, lang)}](https://github.com/ccbogel/QualCoder/raw/refs/heads/master/other_languages//{lang}.zip) ({lang})"
+        else:
+            lang_display = f"{language_names.get(lang, lang)} ({lang})"
 
         # Handle Gettext
         if gettext_stats.get("missing"):

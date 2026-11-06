@@ -39,6 +39,7 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QColor
 
 from .GUI.ui_dialog_view_av import Ui_Dialog_view_av
+from .context_help import open_module_help
 from .helpers import NumberBar, msecs_to_hours_mins_secs, Message, ExportDirectoryPathDialog
 from .html_parser import html_to_text  # Homologate transcript formats with Manage files
 from .select_items import DialogSelectItems
@@ -653,7 +654,7 @@ class DialogViewAV(QtWidgets.QDialog):
         sb.set_waveform_pixmap(None)
         sb.set_no_waveform_message(_("Generating waveform..."))
         thread = generate_waveform_png_async(self.abs_path, waveform_path,
-                                             waveform_colour(self.app.settings['stylesheet']))
+                                             waveform_colour())
         timer = QtCore.QTimer(self)
         timer.setInterval(300)
 
@@ -800,7 +801,7 @@ class DialogViewAV(QtWidgets.QDialog):
     def help(self):
         """ Open help for transcribe section in browser. """
 
-        self.app.help_wiki("3.2.-Files")
+        open_module_help(self.app, self)
 
     def ddialog_menu(self, position):
         """ Context menu to export a screenshot, to resize dialog """
@@ -1955,16 +1956,20 @@ class DialogViewAV(QtWidgets.QDialog):
         self.ui.label_search_totals.setText(str(self.search_index + 1) + " / " + str(len(self.search_indices)))
 
     def closeEvent(self, event):
-        """ Stop the vlc player and timers on close.
-        Record the dialog and video dialog0 size and positions. """
+        """Stop timers and playback, save edits, and record window geometry."""
 
+        # Qt player release processes events: no playback or save timer may run
+        # while the player and its video surface are being torn down.
+        for timer in self.findChildren(QtCore.QTimer):
+            timer.stop()
+        # Initialization may have failed before the player and UI were ready.
+        if getattr(self, 'mediaplayer', None) is None:
+            return
         self.update_sizes()
         self.ddialog.close()
         self.stop()
         if type(self.mediaplayer).__module__.endswith('media_player_qt'):
             self.mediaplayer.release()  # free the file handle (WinError 32 on delete)
-        self.textchanged_timer.stop()
-        self.timer.stop()
         self.app.write_config_ini(self.app.settings, self.app.ai_models)  # persist volume/sizes
         self.update_database_text()
         
@@ -1991,9 +1996,10 @@ class DialogViewAV(QtWidgets.QDialog):
             self.casetext = []
             self.app.conn.commit()  # Commit all changes in one go to prevent database inconsistencies
             # Update transcript in vectorstore
-            if self.app.settings['ai_enable'] == 'True':
-                name = self.transcription[2]
-                self.app.ai.sources_vectorstore.import_document(self.transcription[0], name, current_text)
+            name = self.transcription[2]
+            self.app.vectorstore_import_document(
+                self.transcription[0], name, current_text
+            )
         except Exception as e_:
             print(e_)
             self.app.conn.rollback()

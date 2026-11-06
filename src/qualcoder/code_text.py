@@ -29,32 +29,32 @@ import diff_match_patch
 import emoji
 import html
 import logging
+# Required for the _export_odt_clean method which generates native ODF files with ranged annotations using odfpy
+from odf.opendocument import OpenDocumentText  # Required for _export_odt_clean method
+from odf import text as odf_text, office as odf_office, dc as odf_dc, style as odf_style  # Need for _export_odt_clean
+from odf.namespaces import OFFICENS, DRAWNS  # Required for _export_odt_clean method
 from operator import itemgetter
 from pathlib import Path
+from PyQt6 import QtCore, QtGui, QtWidgets, sip
+from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QBrush, QColor
 import qtawesome as qta  # see: https://pictogrammers.com/library/mdi/
 import re
 import sqlite3
 import unicodedata
 import webbrowser
 
-from PyQt6 import QtCore, QtGui, QtWidgets
-from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QBrush, QColor
-# Required for the _export_odt_clean method which generates native ODF files with ranged annotations using odfpy
-from odf.opendocument import OpenDocumentText  # Required for _export_odt_clean method
-from odf import text as odf_text, office as odf_office, dc as odf_dc, style as odf_style  # Need for _export_odt_clean
-from odf.namespaces import OFFICENS, DRAWNS  # Required for _export_odt_clean method
-
 from .ai_agent_prompts import AiAgentPromptsCatalog, prompt_name_and_scope
-from .ai_prompt_library import DialogAiEditPrompts
-from .ai_search_dialog import DialogAiSearch
-from .ai_chat import ai_chat_signal_emitter
+from .ai_runtime import AI_READY, ensure_ai_ready
+from .ai_ui import ai_chat_signal_emitter
 from .code_in_all_files import DialogCodeInAllFiles
 from .code_text_coding_margin import (CodingMargin, DEFAULT_CODING_MARGIN_WIDTH, MINIMUM_CODING_MARGIN_WIDTH,
                                       MINIMUM_CODING_MARGIN_LABEL_WIDTH)
 from .code_tree import CodeTreeController
+from .codebook import build_codebook_path
 from .color_selector import DialogColorSelect, colour_ranges, TextColor, show_codes_of_colour_range
 from .confirm_delete import DialogConfirmDelete
+from .context_help import open_module_help
 from .helpers import Message, DialogGetStartAndEndMarks, ExportDirectoryPathDialog, NumberBar, CodeResizeHandle, \
     ToolTipEventFilter, init_persistent_tree_header
 from .GUI.ui_dialog_code_text import Ui_Dialog_code_text
@@ -75,6 +75,8 @@ class DialogCodeText(QtWidgets.QWidget):
     Add memos and colors to codes.
     Trialled using setHtml for documents, but on marking text Html formatting was replaced, also
     on unmarking text, the unmark was not immediately cleared (needed to reload the file). """
+
+    ai_search_message_shown = False  # Text view holds a search message, not file text.
 
     def __init__(self, app, parent_textedit, tab_reports):
 
@@ -147,7 +149,7 @@ class DialogCodeText(QtWidgets.QWidget):
         except (KeyError, AttributeError):
             saved_style = None
 
-        if saved_style in ('marker', 'underline'):
+        if saved_style in ('marker', 'marker light', 'underline'):
             self.highlight_style = saved_style
         else:
             self.highlight_style = 'marker'
@@ -218,6 +220,7 @@ class DialogCodeText(QtWidgets.QWidget):
         self.ui.plainTextEdit.installEventFilter(self)
         self.eventFilterTT = ToolTipEventFilter()
         self.ui.plainTextEdit.installEventFilter(self.eventFilterTT)
+        self.event_filter_installed = True
         self.ui.plainTextEdit.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.ui.plainTextEdit.customContextMenuRequested.connect(self.text_edit_menu)
         self.ui.plainTextEdit.cursorPositionChanged.connect(self.overlapping_codes_in_text)
@@ -327,8 +330,6 @@ class DialogCodeText(QtWidgets.QWidget):
         self.ui.pushButton_next.setEnabled(False)
         self.ui.pushButton_next.pressed.connect(self.move_to_next_search_text)
         self.ui.pushButton_previous.pressed.connect(self.move_to_previous_search_text)
-        self.ui.pushButton_help.setIcon(qta.icon('mdi6.help'))
-        self.ui.pushButton_help.pressed.connect(self.help)
         self.ui.pushButton_right_side_pane.setIcon(qta.icon('mdi6.arrow-expand-left', options=[{'scale_factor': 1.3}]))
         self.ui.pushButton_right_side_pane.pressed.connect(self.show_right_side_pane)
         self.ui.pushButton_delete_all_codes.setIcon(qta.icon('mdi6.delete-outline', options=[{'scale_factor': 1.4}]))
@@ -481,8 +482,6 @@ class DialogCodeText(QtWidgets.QWidget):
         self.app.project_events.project_data_changed.connect(self._on_project_data_changed)
         self.code_tree.fill_tree()
         # These signals after the tree is filled the first time
-        self.ui.treeWidget.itemCollapsed.connect(self.get_collapsed)
-        self.ui.treeWidget.itemExpanded.connect(self.get_collapsed)
         self.ui.treeWidget.itemClicked.connect(self.tree_item_clicked)
 
         # Variables and widgets for AI search
@@ -501,6 +500,7 @@ class DialogCodeText(QtWidgets.QWidget):
         self.ai_search_found = False
         self.ai_search_analysis_counter = 0
         self.ai_search_session_id = 0
+        self.ai_search_message_shown = False
         self.ui.pushButton_ai_search.pressed.connect(self.ai_search_clicked)
         self.ui.listWidget_ai.selectionModel().selectionChanged.connect(self.ai_search_selection_changed)
         self.ai_search_listview_action_label = None
@@ -591,6 +591,21 @@ class DialogCodeText(QtWidgets.QWidget):
 
         self.ui.pushButton_ai_search.setEnabled(self._ai_menu_options_enabled())
 
+    def closeEvent(self, event):
+        """Cancel a running AI search so it does not block the next coding window."""
+
+        try:
+            if self.ai_search_running:
+                self.ai_search_running = False
+                try:
+                    self.ai_search_spinner_timer.stop()
+                except RuntimeError:
+                    pass
+            self._cancel_ai_search_scope(wait_ms=0)
+        except Exception as err:
+            logger.debug(f"Could not cancel AI search on close: {err}")
+        event.accept()
+
     def _ai_search_scope_id(self):
         return id(self)
 
@@ -603,6 +618,33 @@ class DialogCodeText(QtWidgets.QWidget):
         except Exception as err:
             logger.warning(err)
             return False
+
+    def _ai_search_ui_alive(self) -> bool:
+        """Return whether the coding window's AI search widgets still exist."""
+
+        try:
+            ui = self.ui
+        except RuntimeError:
+            return False
+        if ui is None:
+            return False
+        for widget_name in ('listWidget_ai', 'plainTextEdit'):
+            widget = getattr(ui, widget_name, None)
+            if widget is None or sip.isdeleted(widget):
+                return False
+        return True
+
+    def _show_ai_search_message(self, message: str = '') -> None:
+        """Show a temporary search message instead of the file text."""
+
+        if not self._ai_search_ui_alive():
+            return
+        self.ai_search_message_shown = True
+        self.ui.plainTextEdit.setPlainText(message)
+        if getattr(self, 'eventFilterTT', None) is not None and self.file_ is not None:
+            self.eventFilterTT.set_codes_and_annotations(self.app, [], self.codes, [], self.file_)
+        if getattr(self, 'coding_margin', None) is not None:
+            self.coding_margin.update()
 
     def _ai_search_scope_status(self) -> str:
         ai = getattr(self.app, 'ai', None)
@@ -622,8 +664,8 @@ class DialogCodeText(QtWidgets.QWidget):
         return bool(ai.cancel(ask=False))
 
     def help(self):
-        """ Open help for transcribe section in browser. """
-        self.app.help_wiki("4.1.-Coding-Text")
+        """ Open help in browser, AI-assisted coding page when that tab is in view. """
+        open_module_help(self.app, self)
 
     def _build_code_tooltip_html(self, code):  # <- L
         """ Build the tooltip HTML for a single coded segment """
@@ -865,12 +907,17 @@ class DialogCodeText(QtWidgets.QWidget):
         menu.addSeparator()
 
         style_menu = menu.addMenu(_("Highlight style"))
-        action_style_marker = None
-        action_style_underline = None
-        if self.highlight_style != 'marker':
-            action_style_marker = style_menu.addAction(_("Marker"))
-        if self.highlight_style != 'underline':
-            action_style_underline = style_menu.addAction(_("Underline"))
+        action_style_marker = style_menu.addAction(_("Marker"))
+        action_style_marker_light = style_menu.addAction(_("Marker light"))
+        action_style_underline = style_menu.addAction(_("Underline"))
+        style_group = QtGui.QActionGroup(style_menu)
+        style_group.setExclusive(True)
+        for style_action, style in ((action_style_marker, 'marker'),
+                                    (action_style_marker_light, 'marker light'),
+                                    (action_style_underline, 'underline')):
+            style_action.setCheckable(True)
+            style_group.addAction(style_action)
+            style_action.setChecked(self.highlight_style == style)
 
         global_pos = source_widget.mapToGlobal(position)
         action = menu.exec(global_pos)
@@ -888,6 +935,9 @@ class DialogCodeText(QtWidgets.QWidget):
             return
         if action == action_style_marker:
             self._set_highlight_style('marker')
+            return
+        if action == action_style_marker_light:
+            self._set_highlight_style('marker light')
             return
         if action == action_style_underline:
             self._set_highlight_style('underline')
@@ -1100,7 +1150,7 @@ class DialogCodeText(QtWidgets.QWidget):
         cursor_start = self.ui.plainTextEdit.textCursor()
         cursor_start.setPosition(max(0, code_to_handle['pos0'] - self.file_['start']))
         rect_start = self.ui.plainTextEdit.cursorRect(cursor_start)
-        h_start = CodeResizeHandle(self.ui.plainTextEdit, True, code_to_handle, self)
+        h_start = CodeResizeHandle(self.ui.plainTextEdit, True, [code_to_handle], self)
         # start teardrop tip is at its top-right corner -> shift left by full width
         h_start.move(rect_start.x() - h_start.width(), rect_start.y())
         self.active_handles.append(h_start)
@@ -1110,7 +1160,7 @@ class DialogCodeText(QtWidgets.QWidget):
         cursor_end.setPosition(min(len(self.ui.plainTextEdit.toPlainText()),
                                    code_to_handle['pos1'] - self.file_['start']))
         rect_end = self.ui.plainTextEdit.cursorRect(cursor_end)
-        h_end = CodeResizeHandle(self.ui.plainTextEdit, False, code_to_handle, self)
+        h_end = CodeResizeHandle(self.ui.plainTextEdit, False, [code_to_handle], self)
         # end teardrop tip is at its top-left corner -> align directly to the cursor x
         h_end.move(rect_end.x(), rect_end.y())
         self.active_handles.append(h_end)
@@ -1170,7 +1220,7 @@ class DialogCodeText(QtWidgets.QWidget):
     def _set_highlight_style(self, style):  # <- L
         """ Switch in-text highlight style between 'marker' and 'underline'. """
 
-        if style not in ('marker', 'underline'):
+        if style not in ('marker', 'marker light', 'underline'):
             return
         if style == self.highlight_style:
             return
@@ -1190,7 +1240,7 @@ class DialogCodeText(QtWidgets.QWidget):
 
         if style is None:
             style = self.app.settings.get('codetext_highlight_style', 'marker')
-        if style not in ('marker', 'underline'):
+        if style not in ('marker', 'marker light', 'underline'):
             style = 'marker'
         self._set_highlight_style(style)
 
@@ -1344,19 +1394,6 @@ class DialogCodeText(QtWidgets.QWidget):
                         self.recent_codes.append(code_)
             except ValueError:
                 pass
-
-    def get_collapsed(self, item):
-        """ On category collapse or expansion signal, find the collapsed parent category items.
-        This will fill the self.app.collapsed_categories and is the expanded/collapsed tree is then replicated across
-        other areas of the app. """
-
-        # print(item.text(0), item.text(1), "Expanded:", item.isExpanded())
-        if item.text(1)[:3] == "cid":
-            return
-        if not item.isExpanded() and item.text(1) not in self.app.collapsed_categories:
-            self.app.collapsed_categories.append(item.text(1))
-        if item.isExpanded() and item.text(1) in self.app.collapsed_categories:
-            self.app.collapsed_categories.remove(item.text(1))
 
     def get_files(self, ids=None, sort="name asc", preserve_current_file: bool = False):
         """ Get files with additional details and fill list widget.
@@ -2199,9 +2236,16 @@ class DialogCodeText(QtWidgets.QWidget):
             action_show_top_groupbox = menu.addAction(_("Show control panel (H)"))
         if not self.ui.groupBox.isHidden():
             action_hide_top_groupbox = menu.addAction(_("Hide control panel (H)"))
-
+        action_tooltips = menu.addAction(_("Toggle tooltips"))
         action = menu.exec(source.mapToGlobal(position))
         if action is None:
+            return
+        if action == action_tooltips:
+            if self.event_filter_installed:
+                self.ui.plainTextEdit.removeEventFilter(self.eventFilterTT)
+            else:
+                self.ui.plainTextEdit.installEventFilter(self.eventFilterTT)
+            self.event_filter_installed = not self.event_filter_installed
             return
         if action == action_important:
             self.set_important(cursor.position())
@@ -2267,6 +2311,8 @@ class DialogCodeText(QtWidgets.QWidget):
             self.mark_with_new_code(in_vivo=True)
             return
         if action.property('submenu') == 'ai_text_analysis':
+            if not ensure_ai_ready(self.app, _("AI Text Analysis")):
+                return
             if self.file_ is None:
                 Message(self.app, _('Warning'), _("No file was selected"), "warning").exec()
                 return
@@ -2280,6 +2326,8 @@ class DialogCodeText(QtWidgets.QWidget):
                                                           action.data())
             return
         if action.property('submenu') == 'ai_text_analysis_prompts':
+            from .ai_prompt_library import DialogAiEditPrompts
+
             DialogAiEditPrompts(self.app, 'text_analysis').exec()
             return
         # Remaining actions will be the submenu codes
@@ -3302,11 +3350,15 @@ class DialogCodeText(QtWidgets.QWidget):
             if code['cid'] == item['cid']:
                 color = code['color']
         fmt = QtGui.QTextCharFormat()
-        brush = QBrush(QColor(color))
-        fmt.setBackground(brush)
+        if self.highlight_style == 'marker light':
+            brush = QBrush(QColor(color.replace("#", "#40")))
+            fmt.setBackground(brush)
+        if self.highlight_style == 'marker':
+            brush = QBrush(QColor(color))
+            fmt.setBackground(brush)
+            fmt.setForeground(QBrush(QColor(TextColor(color).recommendation)))
         if item['important']:
             fmt.setFontWeight(QtGui.QFont.Weight.Bold)
-        fmt.setForeground(QBrush(QColor(TextColor(color).recommendation)))
         cursor.setCharFormat(fmt)
         self.apply_underline_to_overlaps()
 
@@ -3340,6 +3392,8 @@ class DialogCodeText(QtWidgets.QWidget):
 
         self.overlaps_at_pos = []
         self.overlaps_at_pos_idx = 0
+        if self.ai_search_message_shown:
+            return
         pos = self.ui.plainTextEdit.textCursor().position()
         for item in self.code_text:
             if item['pos0'] <= pos + self.file_['start'] <= item['pos1']:
@@ -3405,6 +3459,18 @@ class DialogCodeText(QtWidgets.QWidget):
         
         norm_fmt = QtGui.QTextCharFormat()
         norm_fmt.setFontPointSize(12)
+        ref_fmt = QtGui.QTextCharFormat()
+        ref_fmt.setFontPointSize(9)
+        ref_fmt.setFontItalic(True)
+        # Add reference, if any
+        cur = self.app.conn.cursor()
+        cur.execute("select risid from source where source.id=?", [self.file_['id']])
+        ris_res = cur.fetchone()
+        if ris_res and ris_res[0]:
+            ris = Ris(self.app)
+            ris.get_references(ris_res[0])
+            if ris.refs:
+                cursor.insertText(_("Reference: ") + ris.refs[0]['apa'].replace('\n', ' ') + "\n\n", ref_fmt)
 
         # Content by mode
         if mode == "highlight":
@@ -3537,12 +3603,28 @@ class DialogCodeText(QtWidgets.QWidget):
         normal_st.addElement(odf_style.TextProperties(fontsize="12pt"))
         doc.styles.addElement(normal_st)
 
+        ref_st = odf_style.Style(name="ExportRef", family="paragraph")
+        ref_st.addElement(odf_style.TextProperties(fontsize="9pt", fontstyle="italic"))
+        doc.styles.addElement(ref_st)
+
         # Header
         doc.text.addElement(odf_text.P(stylename=header_st, text=project_header))
         doc.text.addElement(odf_text.P(stylename=header_st, text=_("File: ") + self.file_['name']))
         report_date = datetime.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
         doc.text.addElement(odf_text.P(stylename=header_st, text=_("Generated report: ") + report_date))
         doc.text.addElement(odf_text.P(stylename=normal_st, text=""))
+
+        # Add reference, if any
+        cur = self.app.conn.cursor()
+        cur.execute("select risid from source where source.id=?", [self.file_['id']])
+        ris_res = cur.fetchone()
+        if ris_res and ris_res[0]:
+            ris = Ris(self.app)
+            ris.get_references(ris_res[0])
+            if ris.refs:
+                ref_text =_("Reference: ") + ris.refs[0]['apa'].replace('\n', ' ')
+                doc.text.addElement(odf_text.P(stylename=ref_st, text=ref_text))
+                doc.text.addElement(odf_text.P(stylename=normal_st, text=""))
 
         # Prepare annotation boundaries
         ann_counter = 0
@@ -3845,7 +3927,18 @@ class DialogCodeText(QtWidgets.QWidget):
         current_fid = self.file_['id']
         offset = self.file_['start']
         codes_in_file = [c for c in self.code_text if c['fid'] == current_fid]
- 
+
+        # Add reference, if any
+        reference = ""
+        cur = self.app.conn.cursor()
+        cur.execute("select risid from source where source.id=?", [self.file_['id']])
+        ris_res = cur.fetchone()
+        if ris_res and ris_res[0]:
+            ris = Ris(self.app)
+            ris.get_references(ris_res[0])
+            if ris.refs:
+                reference = html.escape(_("Reference: ") + ris.refs[0]['apa'])
+
         boundaries = {0, len(plain_text)}
         for c in codes_in_file:
             p0 = max(0, int(c['pos0']) - offset)
@@ -3935,6 +4028,7 @@ class DialogCodeText(QtWidgets.QWidget):
         {html_body}
     </div>
     <div class="footer">
+        <p>{reference}</p>
         <b>{_("Software citation")}</b><br>
         {escaped_apa}
     </div>
@@ -4026,7 +4120,7 @@ class DialogCodeText(QtWidgets.QWidget):
     # Export a codebook text file
     def export_codebook(self):
         """ Export a codebook text file with only codes used in the current file.
-        Format: Category>>CodeName[TAB]Memo """
+        Format: Category>>SubCategory>>Code>>>SubCode[TAB]Memo (importable). """
 
         if self.file_ is None:
             return
@@ -4041,14 +4135,9 @@ class DialogCodeText(QtWidgets.QWidget):
         for cid in used_cids:
             for code in self.codes:
                 if code['cid'] == cid:
-                    cat_path = ""
-                    if code['catid'] is not None:
-                        for cat in self.categories:
-                            if cat['catid'] == code['catid']:
-                                cat_path = cat['name'] + " >> "
-                                break
                     memo = str(code.get('memo', '')).replace('\n', ' ').strip()
-                    lines.append(f"{cat_path}{code['name']}\t{memo}")
+                    code_path = build_codebook_path(code, self.codes, self.categories)
+                    lines.append(f"{code_path}\t{memo}")
                     break
         lines.sort()
         text_content = "\n".join(lines)
@@ -4307,7 +4396,7 @@ class DialogCodeText(QtWidgets.QWidget):
         self.ui.plainTextEdit.setTextCursor(cursor)
         cursor.setPosition(cur_pos, QtGui.QTextCursor.MoveMode.MoveAnchor)
         cursor.setPosition(end_pos, QtGui.QTextCursor.MoveMode.KeepAnchor)
-        brush = QBrush(QColor(color))
+        brush = QBrush(QColor(color.replace("#", "#40")))
         fmt = QtGui.QTextCharFormat()
         fmt.setBackground(brush)
         foreground_color = TextColor(color).recommendation
@@ -4378,7 +4467,7 @@ class DialogCodeText(QtWidgets.QWidget):
         self.ui.plainTextEdit.setTextCursor(cursor)
         cursor.setPosition(cur_pos, QtGui.QTextCursor.MoveMode.MoveAnchor)
         cursor.setPosition(end_pos, QtGui.QTextCursor.MoveMode.KeepAnchor)
-        brush = QBrush(QColor(color))
+        brush = QBrush(QColor(color.replace("#," "#40")))
         fmt = QtGui.QTextCharFormat()
         fmt.setBackground(brush)
         foreground_colour = TextColor(color).recommendation
@@ -4489,6 +4578,11 @@ class DialogCodeText(QtWidgets.QWidget):
             self.annotations = self.app.get_annotations()
             self.load_file(self.file_)
             return
+        annotation_changed = "annotation" in tables
+        if annotation_changed:
+            self.annotations = self.app.get_annotations()
+            if self.file_ is not None:
+                self.get_coded_text_update_eventfilter_tooltips()
         if "code_cat" not in tables and "code_name" not in tables:
             if "code_text" not in tables:
                 return
@@ -4862,6 +4956,7 @@ class DialogCodeText(QtWidgets.QWidget):
         if self.text.endswith('\n'):
             self.text = self.text[:-1]
         self.detect_text_direction()
+        self.ai_search_message_shown = False
         self.ui.plainTextEdit.setPlainText(self.text)
         # Load formatted view (HTML) if available
         if hasattr(self, '_formatted_text_edit'):
@@ -4936,6 +5031,12 @@ class DialogCodeText(QtWidgets.QWidget):
             if 'color' not in item:
                 item['color'] = '#cccccc'
             self.code_text.append(item)
+        if self.ai_search_message_shown:
+            self.eventFilterTT.set_codes_and_annotations(self.app, [], self.codes, [], self.file_)
+            if getattr(self, 'coding_margin', None) is not None:
+                self.coding_margin.update()
+            return
+
         # Update filter for tooltip and redo formatting
         if self.important:
             imp_coded = []
@@ -4979,7 +5080,7 @@ class DialogCodeText(QtWidgets.QWidget):
             cursor2.select(QtGui.QTextCursor.SelectionType.Document)
             cursor2.mergeCharFormat(fmt)
 
-    def _apply_format_to_code_item(self, item, codes_lookup):  # <- L
+    def _apply_format_to_code_item(self, item, codes_lookup):
         """ Apply highlight formatting to a single coded text item.
         Extracted from highlight() so it can be reused by the incremental
         refresh path in mark(). Honors self.highlight_style and important state.
@@ -4996,11 +5097,14 @@ class DialogCodeText(QtWidgets.QWidget):
         if self.highlight_style == 'underline':
             fmt.setUnderlineStyle(QtGui.QTextCharFormat.UnderlineStyle.DashUnderline)
             fmt.setUnderlineColor(self._code_label_contrast_color(color))
-        else:
+        if self.highlight_style == 'marker':
             brush = QBrush(QColor(color))
             fmt.setBackground(brush)
             text_brush = QBrush(QColor(TextColor(color).recommendation))
             fmt.setForeground(text_brush)
+        if self.highlight_style == 'marker light':
+            brush = QBrush(QColor(color.replace("#", "#40")))
+            fmt.setBackground(brush)
 
         if item.get('memo', '') != "":
             fmt.setFontItalic(True)
@@ -5121,7 +5225,7 @@ class DialogCodeText(QtWidgets.QWidget):
         bold/italic/underline from the HTML is preserved.
         """
 
-        if self.file_ is None or self.ui.plainTextEdit.toPlainText() == "":
+        if self.file_ is None or self.ai_search_message_shown or self.ui.plainTextEdit.toPlainText() == "":
             # still refresh the side margin so it clears properly <- L
             self._refresh_coding_margins()
             return
@@ -5249,6 +5353,9 @@ class DialogCodeText(QtWidgets.QWidget):
 
         if self.file_ is None:
             Message(self.app, _('Warning'), _("No file was selected"), "warning").exec()
+            return
+        if self.ai_search_message_shown:
+            Message(self.app, _('Warning'), _("Open a search result before coding"), "warning").exec()
             return
         self.clear_edit_variables()
         item = self.ui.treeWidget.currentItem()
@@ -6142,6 +6249,7 @@ class DialogCodeText(QtWidgets.QWidget):
         self.file_['start'] = 0
         self.file_['end'] = len(file_result['fulltext'])
         self.text = file_result['fulltext']
+        self.ai_search_message_shown = False
         self.ui.plainTextEdit.setPlainText(self.text)
         self.prev_text = copy(self.text)
         self.ui.plainTextEdit.removeEventFilter(self.eventFilterTT)
@@ -6196,8 +6304,9 @@ class DialogCodeText(QtWidgets.QWidget):
             self.ed_update_annotations()
             self.ed_update_casetext()
             # Update vectorstore
-            if self.app.settings['ai_enable'] == 'True':
-                self.app.ai.sources_vectorstore.import_document(self.file_['id'], self.file_['name'], self.text)
+            self.app.vectorstore_import_document(
+                self.file_['id'], self.file_['name'], self.text
+            )
 
         self.ui.plainTextEdit.setTextInteractionFlags(
             # make the textEdit read only by removing the 'TextEditable' flag
@@ -6653,23 +6762,16 @@ class DialogCodeText(QtWidgets.QWidget):
         This will open a DialogAISearch to collect the search parameters and then 
         start phase 1 of the search, looking for suitable chunks of data in the vectorstore.
         """
+        if not ensure_ai_ready(self.app, _("AI Search")):
+            return
         if self.edit_mode:
             msg = _('Please finish editing the text before starting an AI search.')
-            Message(self.app, _('AI Search'), msg, "warning").exec()
-            return
-        if self.app.ai.get_status() == 'disabled':
-            msg = _('The AI is disabled. Go to "AI > Setup Wizard" first.')
             Message(self.app, _('AI Search'), msg, "warning").exec()
             return
         if self.ai_search_running:
             msg = _('The AI is already performing a search. Please stop it before starting a new one.')
             Message(self.app, _('AI Search'), msg, "warning").exec()
             return
-        if not self.app.ai.is_ready():
-            msg = _('The AI is busy, please wait a moment and retry.')
-            Message(self.app, _('AI Search'), msg, "warning").exec()
-            return
-
         # Get currently selected item in code tree
         code_item = self.ui.treeWidget.currentItem()
         if code_item is None:  # nothing selected
@@ -6683,6 +6785,8 @@ class DialogCodeText(QtWidgets.QWidget):
             selected_is_code = True
 
         # Sort option lives in the shared code tree controller
+        from .ai_search_dialog import DialogAiSearch
+
         ui = DialogAiSearch(self.app, 'search', selected_id, selected_is_code, self.code_tree.tree_sort_option)
         ret = ui.exec()
         if ret == QtWidgets.QDialog.DialogCode.Accepted:
@@ -6704,7 +6808,7 @@ class DialogCodeText(QtWidgets.QWidget):
             self.ui.listWidget_ai.clear()
             self.ai_search_current_result_index = None
             self.ai_search_spinner_timer.start(500)
-            self.ui.plainTextEdit.setPlainText(_('Searching for related data, please wait...'))
+            self._show_ai_search_message(_('Searching for related data, please wait...'))
 
             # Phase 1: find similar chunks of data from the vectorstore
             self.ai_search_session_id += 1
@@ -6729,12 +6833,15 @@ class DialogCodeText(QtWidgets.QWidget):
 
         if session_id is not None and int(session_id) != int(self.ai_search_session_id):
             return
+        if not self._ai_search_ui_alive():
+            self.ai_search_running = False
+            return
         if self._ai_search_scope_status() == 'canceled':
             self.ai_search_running = False
-            self.ui.plainTextEdit.setPlainText('')
+            self._show_ai_search_message()
             return
         if chunks is None or len(chunks) == 0:
-            self.ui.plainTextEdit.setPlainText('')
+            self._show_ai_search_message()
             msg = _('AI: No related data found for "') + self.ai_search_code_name + '".'
             Message(self.app, _('AI Search'), msg, "warning").exec()
             self.ai_search_running = False
@@ -6774,14 +6881,14 @@ class DialogCodeText(QtWidgets.QWidget):
             chunks = filtered_chunks
 
         if len(chunks) == 0:
-            self.ui.plainTextEdit.setPlainText('')
+            self._show_ai_search_message()
             msg = _('AI: No new data found for "') + self.ai_search_code_name + _(
                 '" beside what has already been coded with this code.')
             Message(self.app, _('AI Search'), msg, "warning").exec()
             self.ai_search_running = False
             return
 
-        self.ui.plainTextEdit.setPlainText(
+        self._show_ai_search_message(
             _('Potentially related data found, inspecting it closer. Please be patient...'))
 
         # 2) Send the first "ai_search_analysis_max_count" chunks to the llm for further analysis 
@@ -6800,6 +6907,10 @@ class DialogCodeText(QtWidgets.QWidget):
         the user has to click on 'find more' to continue), or 
         2) 'len(self.ai_search_similar_chunk_list)' is reached, meaning that all the 
         chunks found in step 1 have been analyzed and the search is finished."""
+
+        if not self._ai_search_ui_alive():
+            self.ai_search_running = False
+            return
 
         if self.ai_search_chunks_pos < len(self.ai_search_similar_chunk_list):
             # still chunks left for analysis            
@@ -6821,7 +6932,7 @@ class DialogCodeText(QtWidgets.QWidget):
                 self.ai_search_running = False
                 if len(self.ai_search_results) == 0:  # nothing found
                     self.ai_search_update_listview_action()
-                    self.ui.plainTextEdit.setPlainText('')
+                    self._show_ai_search_message()
                     msg = _('The closer inspection of the first ') + str(self.ai_search_chunks_pos) + ' ' + \
                           _('pieces of data yielded no results. You can continue to inspect more by clicking on "find '
                             'more" in the list on the left.')
@@ -6829,7 +6940,7 @@ class DialogCodeText(QtWidgets.QWidget):
         else:  # search finished
             self.ai_search_running = False
             if len(self.ai_search_results) == 0:  # nothing found
-                self.ui.plainTextEdit.setPlainText('')
+                self._show_ai_search_message()
                 self.ai_search_update_listview_action()
                 msg = _(
                     'Upon closer inspection, no pieces of data relevant to your search query could be identified. '
@@ -6847,6 +6958,9 @@ class DialogCodeText(QtWidgets.QWidget):
         if session_id is not None and int(session_id) != int(self.ai_search_session_id):
             return
         if not self.ai_search_running:  # Search has been cancelled
+            return
+        if not self._ai_search_ui_alive():
+            self.ai_search_running = False
             return
         if doc is not None:
             self.ai_search_results.append(doc)
@@ -6876,6 +6990,9 @@ class DialogCodeText(QtWidgets.QWidget):
         - Stop search: Shown if a search is actually running in the background
         - (search finished): Shown if all results from stage 1 have already been analyzed  
         """
+        if not self._ai_search_ui_alive():
+            return
+
         # add action item to the list if necessary
         if self.ui.listWidget_ai.count() <= len(self.ai_search_results):
             self.ui.listWidget_ai.addItem('')
@@ -6939,7 +7056,7 @@ class DialogCodeText(QtWidgets.QWidget):
                 if self.ai_search_chunks_pos >= len(self.ai_search_similar_chunk_list):
                     msg = _('There are no more pieces of data to analyze for this search. Please start a new search.')
                     Message(self.app, _('AI Search'), msg, "warning").exec()
-                elif self.ai_search_running or (not self.app.ai.is_ready()):
+                elif self.ai_search_running or self.app.get_ai_status() != AI_READY:
                     msg = _('The AI is busy. Please wait a moment and retry.')
                     Message(self.app, _('AI Search'), msg, "warning").exec()
                 else:
@@ -7017,6 +7134,8 @@ class DialogCodeText(QtWidgets.QWidget):
     def scroll_text_into_view(self):
         """Scroll so the current selection is centered in the viewport."""
 
+        if not self._ai_search_ui_alive():
+            return
         editor = self.ui.plainTextEdit
         original_cursor = editor.textCursor()
         if not original_cursor.hasSelection():
@@ -7040,6 +7159,13 @@ class DialogCodeText(QtWidgets.QWidget):
     def ai_search_update_spinner(self):
         """ Updating the ai_progressBar and the text spinner in the list view to indicate to the user that 
         an AI search is running in the background. """
+        if not self._ai_search_ui_alive():
+            self.ai_search_running = False
+            try:
+                self.ai_search_spinner_timer.stop()
+            except RuntimeError:
+                pass
+            return
         if self._ai_search_scope_status() in ('finished', 'errored', 'canceled', 'idle'):
             self.ai_search_running = False
         if self.ai_search_running:
@@ -7104,28 +7230,38 @@ class DialogCodeText(QtWidgets.QWidget):
                 coded_text_list.append(item)
         if not coded_text_list:
             return
-        code_to_handle = coded_text_list[-1]
+        codes_to_handle = [coded_text_list[-1]]
         if len(coded_text_list) > 1:
-            ui = DialogSelectItems(self.app, coded_text_list, _("Select code to resize"), "single")
+            ui = DialogSelectItems(self.app, coded_text_list, _("Select code to resize. Select multiple if exactly overlapping."), "multiple")
             if ui.exec():
-                code_to_handle = ui.get_selected()
+                codes_to_handle = ui.get_selected()
             else:
                 return
+        # Ensure all codes have same segment length
+        pos0 = codes_to_handle[0]['pos0']
+        pos1 = codes_to_handle[0]['pos1']
+        if len(codes_to_handle) > 1:
+            for c in codes_to_handle:
+                if c['pos0'] != pos0 or c['pos1'] != pos1:
+                    msg = _("Selected codes have differing start and end positions to other codes selected.\nMultiple selected coded segments must have identical positions")
+                    Message(self.app,_('Different positions'),msg, 'warning').exec()
+                    return
+
         self.hide_resize_handles()
 
         # Create start handle
         cursor_start = self.ui.plainTextEdit.textCursor()
-        cursor_start.setPosition(max(0, code_to_handle['pos0'] - self.file_['start']))
+        cursor_start.setPosition(max(0, codes_to_handle[0]['pos0'] - self.file_['start']))
         rect_start = self.ui.plainTextEdit.cursorRect(cursor_start)
-        h_start = CodeResizeHandle(self.ui.plainTextEdit, True, code_to_handle, self)
+        h_start = CodeResizeHandle(self.ui.plainTextEdit, True, codes_to_handle, self)
         h_start.move(rect_start.x() - 6, rect_start.y() + 2)
         self.active_handles.append(h_start)
 
         # Create end handle
         cursor_end = self.ui.plainTextEdit.textCursor()
-        cursor_end.setPosition(min(len(self.ui.plainTextEdit.toPlainText()), code_to_handle['pos1'] - self.file_['start']))
+        cursor_end.setPosition(min(len(self.ui.plainTextEdit.toPlainText()), codes_to_handle[0]['pos1'] - self.file_['start']))
         rect_end = self.ui.plainTextEdit.cursorRect(cursor_end)
-        h_end = CodeResizeHandle(self.ui.plainTextEdit, False, code_to_handle, self)
+        h_end = CodeResizeHandle(self.ui.plainTextEdit, False, codes_to_handle, self)
         h_end.move(rect_end.x() - 6, rect_end.y() + 2)
         self.active_handles.append(h_end)
 
@@ -7136,53 +7272,51 @@ class DialogCodeText(QtWidgets.QWidget):
             h.deleteLater()
         self.active_handles = []
 
-    def update_code_position_from_handle(self, code_item, new_pos, is_start, orig_pos0, orig_pos1):
-        """ Receive final drop coordinates from a handle and update the database. """
+    def update_code_position_from_handle(self, code_items, new_pos, is_start, orig_pos0, orig_pos1):
+        """ Receive final drop coordinates from a handle and update the database. 
+        For one or more codes if they have exact same start and end positions. """
+
         if is_start:
-            if new_pos >= code_item['pos1']:
-                code_item['pos0'] = orig_pos0  # Revert visually
+            if new_pos >= code_items[0]['pos1']:
+                for code_item in code_items:
+                    code_item['pos0'] = orig_pos0  # Revert visually
                 self.hide_resize_handles()
                 self.unlight()
                 self.highlight()
                 return
-            code_item['pos0'] = new_pos
+            for code_item in code_items:
+                code_item['pos0'] = new_pos
         else:
-            if new_pos <= code_item['pos0']:
-                code_item['pos1'] = orig_pos1  # Revert visually
+            if new_pos <= code_items[0]['pos0']:
+                for code_item in code_items:
+                    code_item['pos1'] = orig_pos1  # Revert visually
                 self.hide_resize_handles()
                 self.unlight()
                 self.highlight()
                 return
-            code_item['pos1'] = new_pos
+            for code_item in code_items:
+                code_item['pos1'] = new_pos
 
+        cursor = self.ui.plainTextEdit.textCursor()
+        cursor.setPosition(code_items[0]['pos0'])
+        cursor.setPosition(code_items[0]['pos1'], QtGui.QTextCursor.MoveMode.KeepAnchor)
+        seltext = cursor.selectedText()
+
+        sql = "update code_text set pos0=?, pos1=?, seltext=? where ctid=?"
         cur = self.app.conn.cursor()
-        cur.execute("select substr(fulltext,?,?) from source where id=?",
-                    [code_item['pos0'] + 1, code_item['pos1'] - code_item['pos0'], code_item['fid']])
-        res = cur.fetchone()
-        
-        if not res:
-            # Revert on extraction error
-            code_item['pos0'] = orig_pos0
-            code_item['pos1'] = orig_pos1
-            self.hide_resize_handles()
-            self.unlight()
-            self.highlight()
-            return
-        seltext = res[0]
-
-        try:
-            sql = "update code_text set pos0=?, pos1=?, seltext=? where ctid=?"
-            cur.execute(sql, [code_item['pos0'], code_item['pos1'], seltext, code_item['ctid']])
-            self.app.conn.commit()
-            self.app.delete_backup = False
-            self._emit_project_table_changes(['code_text'])
-        except sqlite3.IntegrityError:
-            self.app.conn.rollback()
-            # Revert in-memory positions to undo temporary highlight
-            code_item['pos0'] = orig_pos0
-            code_item['pos1'] = orig_pos1
-            Message(self.app, _("Duplicate Error"),
-                    _("This code already exists at this exact location."), "warning").exec()
+        for code_item in code_items:
+            try:
+                cur.execute(sql, [code_item['pos0'], code_item['pos1'], seltext, code_item['ctid']])
+                self.app.conn.commit()
+                self.app.delete_backup = False
+                self._emit_project_table_changes(['code_text'])
+            except sqlite3.IntegrityError:
+                self.app.conn.rollback()
+                # Revert in-memory positions to undo temporary highlight
+                code_item['pos0'] = orig_pos0
+                code_item['pos1'] = orig_pos1
+                Message(self.app, _("Duplicate Error"),
+                        _("This code already exists at this exact location."), "warning").exec()
         self.hide_resize_handles()
         self.get_coded_text_update_eventfilter_tooltips()
 

@@ -24,11 +24,10 @@ https://qualcoder.org/
 from copy import deepcopy, copy
 import logging
 from pathlib import Path
-import qtawesome as qta
-
 from PyQt6 import QtCore, QtGui, QtWidgets
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QBrush
+import qtawesome as qta
 
 from .color_selector import colors, colors_red_weak, colors_red_blind, colors_green_weak, colors_green_blind, TextColor
 from .GUI.ui_dialog_code_colours import Ui_Dialog_code_colors
@@ -50,7 +49,7 @@ class DialogCodeColorScheme(QtWidgets.QDialog):
     selected_colors = []
 
     def __init__(self, app, parent_textedit):
-        """ """
+        """ Colour scheme editor and viewer for various colour impairments. """
 
         super(DialogCodeColorScheme, self).__init__()
         self.app = app
@@ -86,6 +85,14 @@ class DialogCodeColorScheme(QtWidgets.QDialog):
         self.ui.pushButton_undo.setIcon(qta.icon('mdi6.undo', options=[{'scale_factor': 1.3}]))
         self.ui.pushButton_undo.pressed.connect(self.undo_color_changes)
 
+    def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:
+        """Keep unhandled Escape presses from closing the workspace."""
+
+        if event.key() == QtCore.Qt.Key.Key_Escape:
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
     def _emit_project_table_changes(self, tables):
         """Notify other open dialogs about changed project tables."""
 
@@ -102,7 +109,6 @@ class DialogCodeColorScheme(QtWidgets.QDialog):
         self.original_code_colors = deepcopy(self.codes)
 
     def undo_color_changes(self):
-        """  """
 
         cur = self.app.conn.cursor()
         sql = "update code_name set color=? where cid=?"
@@ -137,9 +143,10 @@ class DialogCodeColorScheme(QtWidgets.QDialog):
                 if int(ci.text(1)[4:]) == code_['cid']:
                     code_['color'] = color_list[i]
                     code_['perspective'] = color_list[i]
-                    ci.setBackground(0, QBrush(QtGui.QColor(color_list[i]), Qt.BrushStyle.SolidPattern))
+                    ci.setIcon(0, qta.icon('mdi6.square-rounded', color=color_list[i]))
+                    '''ci.setBackground(0, QBrush(QtGui.QColor(color_list[i]), Qt.BrushStyle.SolidPattern))
                     color = TextColor(color_list[i]).recommendation
-                    ci.setForeground(0, QBrush(QtGui.QColor(color)))
+                    ci.setForeground(0, QBrush(QtGui.QColor(color)))'''
                     cur.execute(sql, [color_list[i], int(ci.text(1)[4:])])
         self.app.conn.commit()
         self._emit_project_table_changes(['code_name'])
@@ -269,9 +276,10 @@ class DialogCodeColorScheme(QtWidgets.QDialog):
                     top_item.setText(0, f"{c['name'][:25]}..{c['name'][-25:]}")
                     top_item.setToolTip(0, c['name'])
                 top_item.setToolTip(2, c['memo'])
-                top_item.setBackground(0, QBrush(QtGui.QColor(c['perspective']), Qt.BrushStyle.SolidPattern))
+                top_item.setIcon(0, qta.icon('mdi6.square-rounded', color=c['perspective']))
+                '''top_item.setBackground(0, QBrush(QtGui.QColor(c['perspective']), Qt.BrushStyle.SolidPattern))
                 color = TextColor(c['color']).recommendation
-                top_item.setForeground(0, QBrush(QtGui.QColor(color)))
+                top_item.setForeground(0, QBrush(QtGui.QColor(color)))'''
                 top_item.setFlags(
                     Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsUserCheckable |
                     Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsDragEnabled)
@@ -291,9 +299,10 @@ class DialogCodeColorScheme(QtWidgets.QDialog):
                     if c['memo'] != "":
                         memo = "Memo"
                     child = QtWidgets.QTreeWidgetItem([c['name'], f'cid:{c["cid"]}', memo])
-                    child.setBackground(0, QBrush(QtGui.QColor(c['perspective']), Qt.BrushStyle.SolidPattern))
+                    child.setIcon(0, qta.icon('mdi6.square-rounded', color=c['perspective']))
+                    '''child.setBackground(0, QBrush(QtGui.QColor(c['perspective']), Qt.BrushStyle.SolidPattern))
                     color = TextColor(c['color']).recommendation
-                    child.setForeground(0, QBrush(QtGui.QColor(color)))
+                    child.setForeground(0, QBrush(QtGui.QColor(color)))'''
                     child.setToolTip(0, c['name'])
                     if len(c['name']) > 52:
                         child.setText(0, f"{c['name'][:25]}..{c['name'][-25:]}")
@@ -316,8 +325,15 @@ class DialogCodeColorScheme(QtWidgets.QDialog):
     def update_selected_colors(self):
         """ Update colour list. Prior to applying colors. """
 
+        for row in range(0, ROWS):
+            for col in range(0, COLS):
+                try:
+                    self.ui.tableWidget.item(row, col).setText("")
+                except AttributeError:
+                    pass
         self.selected_colors = []
         for i in self.ui.tableWidget.selectedItems():
+            self.ui.tableWidget.item(i.row(), i.column()).setText("*")
             self.selected_colors.append(colors[i.row() * COLS + i.column()])
 
     def change_perspective(self):

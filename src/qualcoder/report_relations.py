@@ -26,15 +26,12 @@ import logging
 import openpyxl
 import pandas as pd
 import plotly.express as px
+from PyQt6 import QtGui, QtWidgets, QtCore
+from PyQt6.QtCore import Qt
 import qtawesome as qta  # see: https://pictogrammers.com/library/mdi/
 import statistics
 from typing import Any
 
-from PyQt6 import QtGui, QtWidgets, QtCore
-from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QBrush
-
-from .color_selector import TextColor
 from .GUI.ui_dialog_code_relations import Ui_Dialog_CodeRelations
 from .helpers import DialogCodeInText, ExportDirectoryPathDialog, Message, init_persistent_tree_header, \
     restore_persistent_tree_widths
@@ -115,6 +112,14 @@ class DialogReportRelations(QtWidgets.QDialog):
         for r in res:
             self.files.append({'name': r[0], 'fid': r[1]})
         self.app.project_events.project_data_changed.connect(self._on_project_data_changed)
+
+    def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:
+        """Keep unhandled Escape presses from closing the workspace."""
+
+        if event.key() == QtCore.Qt.Key.Key_Escape:
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def select_files(self):
         """ Select files for analysis. """
@@ -1171,7 +1176,6 @@ class DialogReportRelations(QtWidgets.QDialog):
         """
 
         self.ui.treeWidget.clear()
-
         cats = copy(self.categories)
         codes = copy(self.codes)
         self.ui.treeWidget.clear()
@@ -1182,7 +1186,7 @@ class DialogReportRelations(QtWidgets.QDialog):
         remove_list = []
         for c in cats:
             if c['supercatid'] is None:
-                top_item = QtWidgets.QTreeWidgetItem([c['name'], 'catid:' + str(c['catid'])])
+                top_item = QtWidgets.QTreeWidgetItem([c['name'], f"catid:{c['catid']}"])
                 top_item.setToolTip(0, c['name'])
                 self.ui.treeWidget.addTopLevelItem(top_item)
                 if f"catid:{c['catid']}" in self.app.collapsed_categories:
@@ -1202,9 +1206,8 @@ class DialogReportRelations(QtWidgets.QDialog):
                 it = QtWidgets.QTreeWidgetItemIterator(self.ui.treeWidget)
                 item = it.value()
                 while item:  # while there is an item in the list
-                    # logger.debug("While: ", item.text(0), item.text(1), c['catid'], c['supercatid'])
                     if item.text(1) == 'catid:' + str(c['supercatid']):
-                        child = QtWidgets.QTreeWidgetItem([c['name'], 'catid:' + str(c['catid'])])
+                        child = QtWidgets.QTreeWidgetItem([c['name'], f"catid:{c['catid']}"])
                         child.setToolTip(0, c['name'])
                         item.addChild(child)
                         if f"catid:{c['catid']}" in self.app.collapsed_categories:
@@ -1222,10 +1225,11 @@ class DialogReportRelations(QtWidgets.QDialog):
         remove_items = []
         for c in codes:
             if c['catid'] is None:
-                top_item = QtWidgets.QTreeWidgetItem([c['name'], 'cid:' + str(c['cid'])])
-                top_item.setBackground(0, QBrush(QtGui.QColor(c['color']), Qt.BrushStyle.SolidPattern))
+                top_item = QtWidgets.QTreeWidgetItem([c['name'], f"cid:{c['cid']}"])
+                top_item.setIcon(0, qta.icon('mdi6.square-rounded', color=c['color']))
+                '''top_item.setBackground(0, QBrush(QtGui.QColor(c['color']), Qt.BrushStyle.SolidPattern))
                 color = TextColor(c['color']).recommendation
-                top_item.setForeground(0, QBrush(QtGui.QColor(color)))
+                top_item.setForeground(0, QBrush(QtGui.QColor(color)))'''
                 top_item.setFlags(
                     Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
                 top_item.setToolTip(0, c['name'])
@@ -1239,11 +1243,12 @@ class DialogReportRelations(QtWidgets.QDialog):
             it = QtWidgets.QTreeWidgetItemIterator(self.ui.treeWidget)
             item = it.value()
             while item:
-                if item.text(1) == 'catid:' + str(c['catid']):
-                    child = QtWidgets.QTreeWidgetItem([c['name'], 'cid:' + str(c['cid'])])
-                    child.setBackground(0, QBrush(QtGui.QColor(c['color']), Qt.BrushStyle.SolidPattern))
+                if item.text(1) == f"catid:{c['catid']}":
+                    child = QtWidgets.QTreeWidgetItem([c['name'], f"cid:{c['cid']}"])
+                    child.setIcon(0, qta.icon('mdi6.square-rounded', color=c['color']))
+                    '''child.setBackground(0, QBrush(QtGui.QColor(c['color']), Qt.BrushStyle.SolidPattern))
                     color = TextColor(c['color']).recommendation
-                    child.setForeground(0, QBrush(QtGui.QColor(color)))
+                    child.setForeground(0, QBrush(QtGui.QColor(color)))'''
                     child.setFlags(
                         Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
                     child.setToolTip(0, c['name'])
@@ -1252,5 +1257,4 @@ class DialogReportRelations(QtWidgets.QDialog):
                 it += 1
                 item = it.value()
         restore_persistent_tree_widths(self.ui.treeWidget)
-        # self.ui.treeWidget.expandAll()
-        self._nest_subcodes_in_tree()  # <- L
+        self._nest_subcodes_in_tree()

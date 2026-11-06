@@ -30,6 +30,10 @@ datas += [('LICENSE.txt', '.')]
 
 hiddenimports = collect_submodules('transformers')
 hiddenimports += collect_submodules('pydantic')
+hiddenimports += collect_submodules('mcp.server')
+hiddenimports += collect_submodules('mcp.client')
+hiddenimports += collect_submodules('mcp.types')
+hiddenimports += collect_submodules('uvicorn')
 hiddenimports += ['scipy._external.array_api_compat.numpy.fft']
 
 a = Analysis(
@@ -67,7 +71,8 @@ exe = EXE(
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
-    console=False,
+    console=sys.platform == 'win32',
+    hide_console='hide-early' if sys.platform == 'win32' else None,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,

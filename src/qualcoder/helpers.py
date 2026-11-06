@@ -32,13 +32,11 @@ Get start and end marks - used to automatically assign to selected case or a cod
 Code in text - View the coded text in context of the original file
 Code in A/V - View the coded A/V and text in context of the original file
 Code in image - View the coded image in context of the original file
-Import plain text codes - import from codebook file
 Markdown highlighter
 Number bar - display line numbers alongside text content
 Code resize handles for text coding
 """
 
-import csv
 import datetime
 import pymupdf
 from io import BytesIO
@@ -46,12 +44,10 @@ import logging
 from pathlib import Path
 from PIL import Image, ImageOps, ImageFilter
 import platform
-from random import randint
-import sqlite3
 
 from PyQt6 import QtCore, QtGui, QtWidgets, sip  # sip: detect deleted C++ objects in deferred callbacks
 
-from .color_selector import TextColor, colors
+from .color_selector import TextColor
 from .GUI.ui_dialog_code_context_image import Ui_Dialog_code_context_image
 from .GUI.ui_dialog_start_and_end_marks import Ui_Dialog_StartAndEndMarks
 
@@ -422,6 +418,76 @@ def extract_epub_fulltext(filepath):
     return text_
 
 
+class ComboWheelGuard(QtCore.QObject):
+    """App-wide filter: the wheel never changes a closed combobox; it scrolls the parent instead."""
+
+    def eventFilter(self, obj, event):
+        if event.type() != QtCore.QEvent.Type.Wheel or not isinstance(obj, QtWidgets.QComboBox):
+            return False
+        if obj.view().isVisible():
+            return False  # Popup open: the list handles the wheel
+        # Forward to the nearest scroll area so page scrolling continues over the combo
+        parent = obj.parentWidget()
+        while parent is not None and not isinstance(parent, QtWidgets.QAbstractScrollArea):
+            parent = parent.parentWidget()
+        if parent is not None:
+            viewport = parent.viewport()
+            global_pos = event.globalPosition()
+            local = QtCore.QPointF(viewport.mapFromGlobal(global_pos.toPoint()))
+            forwarded = QtGui.QWheelEvent(local, global_pos, event.pixelDelta(), event.angleDelta(),
+                                          event.buttons(), event.modifiers(), event.phase(),
+                                          event.inverted())
+            QtWidgets.QApplication.sendEvent(viewport, forwarded)
+        return True
+
+
+class ActionLog(QtWidgets.QTextBrowser):
+    """Keep ordinary log entries from inheriting a selected link's formatting."""
+
+    @QtCore.pyqtSlot(str)
+    def append(self, text: str) -> None:
+        """Append plain text or HTML without carrying over cursor formatting.
+
+        Args:
+            text: Log entry to append.
+        """
+
+        cursor = self.textCursor()
+        original_position = cursor.position()
+        original_anchor = cursor.anchor()
+        restore_cursor = cursor.hasSelection() or not cursor.atEnd()
+        self.moveCursor(QtGui.QTextCursor.MoveOperation.End)
+        self.setCurrentCharFormat(QtGui.QTextCharFormat())
+        super().append(text)
+        if restore_cursor:
+            cursor.setPosition(original_anchor)
+            cursor.setPosition(original_position, QtGui.QTextCursor.MoveMode.KeepAnchor)
+            self.setTextCursor(cursor)
+
+
+class ElidedLabel(QtWidgets.QLabel):
+    """Keep the full text accessible while painting an ellipsis when necessary."""
+
+    def __init__(self, parent: QtWidgets.QWidget = None):
+        super().__init__(parent)
+        self.setTextFormat(QtCore.Qt.TextFormat.PlainText)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored, QtWidgets.QSizePolicy.Policy.Preferred)
+
+    def setText(self, text: str) -> None:
+        super().setText(text)
+        self.setToolTip(text)
+
+    def paintEvent(self, event):
+        painter = QtWidgets.QStylePainter(self)
+        style_option = QtWidgets.QStyleOption()
+        style_option.initFrom(self)
+        painter.drawPrimitive(QtWidgets.QStyle.PrimitiveElement.PE_Widget, style_option)
+        visible_text = self.fontMetrics().elidedText(
+            self.text(), QtCore.Qt.TextElideMode.ElideRight, self.contentsRect().width())
+        painter.drawItemText(self.contentsRect(), self.alignment() | QtCore.Qt.TextFlag.TextSingleLine,
+                             self.palette(), self.isEnabled(), visible_text, QtGui.QPalette.ColorRole.WindowText)
+
+
 class Message(QtWidgets.QMessageBox):
     """ This is called a lot , but is styled to font size """
 
@@ -455,10 +521,9 @@ class ExportDirectoryPathDialog:
         options = QtWidgets.QFileDialog.Option.DontResolveSymlinks | QtWidgets.QFileDialog.Option.ShowDirsOnly
         directory = QtWidgets.QFileDialog.getExistingDirectory(None,
                                                                _("Select directory to save file"),
-                                                               app.last_export_directory, options)
+                                                               str(app.last_export_directory or ""), options)
         if directory:
-            if directory != app.last_export_directory:
-                app.last_export_directory = directory
+            app.last_export_directory = directory
             self.filepath = directory + "/" + filename_only + "." + extension
             counter = 0
             while Path(self.filepath).exists():
@@ -732,6 +797,12 @@ class DialogCodeInAV(QtWidgets.QDialog):
         self.gridLayout = QtWidgets.QGridLayout(self)
         self.frame = QtWidgets.QFrame(self)
         self.gridLayout.addWidget(self.frame, 0, 0, 0, 0)
+        # filled by add_coded_segment (co-occurring codes on the same media)
+        self.label_cooc = QtWidgets.QLabel(self)
+        self.label_cooc.setWordWrap(True)
+        self.label_cooc.hide()
+        self.gridLayout.addWidget(self.label_cooc, 1, 0)
+        self.extra_segments = []
         self.mediaplayer = None
         try:
             if self.app.settings.get('av_player', 'vlc') == 'qt' or vlc is None:
@@ -787,6 +858,21 @@ class DialogCodeInAV(QtWidgets.QDialog):
         self.timer = QtCore.QTimer(self)
         self.timer.timeout.connect(self.update_ui)
         self.timer.start()
+
+    def add_coded_segment(self, data):
+        """ List another coded segment of the same media (e.g. a co-occurring code).
+        data: dictionary with codename, color, pos0, pos1 and optional memo. """
+
+        self.extra_segments.append(data)
+        lines = []
+        for d in self.extra_segments:
+            line = (f'<span style="background-color:{d["color"]}">&nbsp;{d["codename"]}&nbsp;</span> '
+                    f'{msecs_to_mins_and_secs(d["pos0"])} - {msecs_to_mins_and_secs(d["pos1"])}')
+            if d.get('memo'):
+                line += f' ({d["memo"]})'
+            lines.append(line)
+        self.label_cooc.setText(_("Co-occurring:") + "<br>" + "<br>".join(lines))
+        self.label_cooc.show()
 
     def update_ui(self):
         """ Checks for end of playing segment. """
@@ -898,47 +984,59 @@ class DialogCodeInImage(QtWidgets.QDialog):
             self.ui.horizontalSlider.setValue(slider_value)
         self.draw_scene()
 
+    def add_coded_area(self, data):
+        """ Show another coded area (e.g. a co-occurring code) on the same image.
+        data: dictionary with codename, color, x1, y1, width, height and optional memo. """
+
+        if not hasattr(self, 'extra_areas'):
+            self.extra_areas = []
+        self.extra_areas.append(data)
+        self.draw_scene()
+
     def draw_coded_area(self):
-        """ Draw the coded rectangle in the scene.
+        """ Draw the coded rectangle in the scene, plus any extra areas added with add_coded_area.
          The coded memo can be in the data as ['memo'] if data from DialogCodeText, DialogCodeImage, DialogCodeAV
          It is in the data as ['coded memo'] if data from DialogReportCodes.
          DialogReportCodes can produce various memos on output: source memo, coded memo, codename memo.
          Called by: draw_scene
          """
 
-        tooltip = self.data['codename']
-        try:
-            tooltip += "\nMemo: " + self.data['memo']
-        except KeyError:
-            pass
-        try:
-            tooltip += "\nMemo: " + self.data['coded memo']
-        except KeyError:
-            pass
+        for data in getattr(self, 'extra_areas', []):
+            self._draw_area(data, QtCore.Qt.PenStyle.DotLine)
+        self._draw_area(self.data, QtCore.Qt.PenStyle.DashLine)
 
+    def _draw_area(self, data, pen_style):
+        tooltip = data['codename']
+        try:
+            tooltip += "\nMemo: " + data['memo']
+        except KeyError:
+            pass
+        try:
+            tooltip += "\nMemo: " + data['coded memo']
+        except KeyError:
+            pass
         # Degrees 0
-        x = self.data['x1'] * self.scale
-        y = self.data['y1'] * self.scale
-        width = self.data['width'] * self.scale
-        height = self.data['height'] * self.scale
+        x = data['x1'] * self.scale
+        y = data['y1'] * self.scale
+        width = data['width'] * self.scale
+        height = data['height'] * self.scale
         if self.degrees == 90:
-            y = (self.data['x1']) * self.scale
-            x = (self.pixmap.height() - self.data['y1'] - self.data['height']) * self.scale
-            height = self.data['width'] * self.scale
-            width = self.data['height'] * self.scale
+            y = (data['x1']) * self.scale
+            x = (self.pixmap.height() - data['y1'] - data['height']) * self.scale
+            height = data['width'] * self.scale
+            width = data['height'] * self.scale
         if self.degrees == 180:
-            x = (self.pixmap.width() - self.data['x1'] - self.data['width']) * self.scale
-            y = (self.pixmap.height() - self.data['y1'] - self.data['height']) * self.scale
-            width = self.data['width'] * self.scale
-            height = self.data['height'] * self.scale
+            x = (self.pixmap.width() - data['x1'] - data['width']) * self.scale
+            y = (self.pixmap.height() - data['y1'] - data['height']) * self.scale
+            width = data['width'] * self.scale
+            height = data['height'] * self.scale
         if self.degrees == 270:
-            y = (self.pixmap.width() - self.data['x1'] - self.data['width']) * self.scale
-            x = (self.data['y1']) * self.scale
-            height = self.data['width'] * self.scale
-            width = self.data['height'] * self.scale
-
+            y = (self.pixmap.width() - data['x1'] - data['width']) * self.scale
+            x = (data['y1']) * self.scale
+            height = data['width'] * self.scale
+            width = data['height'] * self.scale
         rect_item = QtWidgets.QGraphicsRectItem(x, y, width, height)
-        rect_item.setPen(QtGui.QPen(QtGui.QColor(self.data['color']), 2, QtCore.Qt.PenStyle.DashLine))
+        rect_item.setPen(QtGui.QPen(QtGui.QColor(data['color']), 2, pen_style))
         rect_item.setToolTip(tooltip)
         self.scene.addItem(rect_item)
 
@@ -1104,103 +1202,6 @@ class DialogCodeInImage(QtWidgets.QDialog):
         Message(self.app, _("Image exported"), filepath).exec()
 
 
-class ImportPlainTextCodes:
-    """ Import a list of plain text codes codebook.
-        The codebook is a plain text file or csv file.
-        In plain text file, Tab separates the codename from the code description.
-        The >> symbol is used to assign code to category:
-        category>>code
-        category>>category>>code
-        code
-            """
-
-    def __init__(self, app, text_edit):
-        self.app = app
-        self.text_edit = text_edit
-        response = QtWidgets.QFileDialog.getOpenFileNames(None, _('Select plain text codes file'),
-                                                          self.app.settings['directory'], "Text (*.txt *.csv)",
-                                                          options=QtWidgets.QFileDialog.Option.DontUseNativeDialog
-                                                          )
-        filepath = response[0]
-        if not filepath:
-            self.text_edit.append(_("Codes list text file not imported"))
-            return
-        filepath = filepath[0]  # List to string of file path
-        self.text_edit.append("\n" + _("Importing codes from: ") + filepath)
-        with open(filepath, 'r', encoding='UTF-8-sig') as file_:
-            rows = []
-            if filepath[-4:].lower() == ".csv":
-                reader = csv.reader(file_, delimiter=",", quoting=csv.QUOTE_MINIMAL)
-                for row in reader:
-                    rows.append(row)
-            else:
-                reader = csv.reader(file_, delimiter="\t", quoting=csv.QUOTE_MINIMAL)
-                for row in reader:
-                    if row:
-                        rows.append(row)
-        cur = self.app.conn.cursor()
-        imported_tables = set()  # only tables that really got a row
-        # Insert categories
-        for row in rows:
-            categories = row[0].split(">>")
-            if len(categories) < 2 or categories[0] == "":
-                continue
-            categories.pop()  # Remove code name
-            for i, category in enumerate(categories):
-                supercatid = None
-                if i >= 1:
-                    cur.execute("select catid from code_cat where name=?", [categories[i - 1].strip()])
-                    res = cur.fetchone()
-                    if res:
-                        supercatid = res[0]
-                try:
-                    cur.execute("insert into code_cat (name,memo,owner,date,supercatid) values(?,?,?,?,?)",
-                                (category.strip(), "", self.app.settings['codername'],
-                                 datetime.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S"), supercatid))
-                    self.app.conn.commit()
-                    imported_tables.add('code_cat')
-                    self.text_edit.append(_("Imported category: ") + category)
-                except sqlite3.IntegrityError:
-                    pass
-        # Insert codes
-        for row in rows:
-            memo = ""
-            if len(row) > 1:
-                memo = row[1]
-            code_name = row[0].strip()  # only code name
-            category_name = None
-            if ">>" in code_name:
-                code_name = row[0].split(">>")[-1].strip()
-                category_name = row[0].split(">>")[-2].strip()
-            if code_name == "":
-                continue
-            catid = None
-            if category_name:
-                cur.execute("select catid from code_cat where name=?", [category_name])
-                res = cur.fetchone()
-                if res:
-                    catid = res[0]
-            date_ = datetime.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
-            color = colors[randint(0, len(colors) - 1)]
-            try:
-                cur.execute("insert into code_name (name,memo,owner,date,catid,color) values(?,?,?,?,?,?)",
-                            (code_name, memo, self.app.settings['codername'], date_, catid, color))
-                self.app.conn.commit()
-                imported_tables.add('code_name')
-                self.text_edit.append(_("Imported code: ") + code_name)
-            except sqlite3.IntegrityError:
-                self.text_edit.append(_("Duplicate code not imported: ") + code_name)
-        # One event for the whole import, not one per row
-        if imported_tables:
-            self._emit_project_table_changes(sorted(imported_tables))
-    def _emit_project_table_changes(self, tables):
-        """Notify other open dialogs about changed project tables."""
-
-        if getattr(self.app, "project_events", None) is not None:
-            self.app.project_events.emit_table_changes(tables, source=self)
-
-
-
 class MarkdownHighlighter(QtGui.QSyntaxHighlighter):
     """ Text markdown highlighter.
     Used in journals and ? """
@@ -1251,9 +1252,7 @@ class MarkdownHighlighter(QtGui.QSyntaxHighlighter):
         # URLs
         ul_format = QtGui.QTextCharFormat()
         ul_format.setUnderlineStyle(QtGui.QTextCharFormat.SingleUnderline)
-        brush = QtGui.QBrush(QtCore.Qt.GlobalColor.darkBlue, QtCore.Qt.BrushStyle.SolidPattern)
-        if self.app.settings['stylesheet'] in ('dark', 'rainbow'):  
-            brush = QtGui.QBrush(QtGui.QColor("#00BFFF"), QtCore.Qt.BrushStyle.SolidPattern)
+        brush = QtWidgets.QApplication.instance().palette().brush(QtGui.QPalette.ColorRole.Link)
         ul_format.setForeground(brush)
         # HTTP HTTPS protocol
         self.highlighting_rules += [(QtCore.QRegularExpression(r"https?:\/\/(?:www\.)?[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,63}\b(?:[-a-zA-Z0-9()@:%_\+.~#?&\/=]*)"), ul_format)]
@@ -1457,30 +1456,31 @@ class NumberBar(QtWidgets.QFrame):
 
 class CodeResizeHandle(QtWidgets.QWidget):
     """ Overlay widget used as visual drag handles for text code resizing.
-    Used in code_text, code_av, code_pdf. """
+    Used in code_text, code_av, code_pdf. 
+    code_items is a list of coded segments to resize. All codes must be same pos0 and pos1. """
 
-    def __init__(self, parent_editor, is_start, code_item, main_dialog):
+    def __init__(self, parent_editor, is_start, code_items, main_dialog):
         super().__init__(parent_editor.viewport())
         self.editor = parent_editor
         self.is_start = is_start
-        self.code_item = code_item
+        self.code_items = code_items
+        #self.code_item = code_item
         self.main_dialog = main_dialog
-
         # Store original positions in case of cancel or error
-        self.orig_pos0 = code_item['pos0']
-        self.orig_pos1 = code_item['pos1']
+        self.orig_pos0 = code_items[0]['pos0']
+        self.orig_pos1 = code_items[0]['pos1']
         self.setCursor(QtCore.Qt.CursorShape.SizeHorCursor)
-        self.setFixedSize(20, 26)  # larger to fit the Android-style teardrop <- L
-        # transparent background so only the painted teardrop shape is visible <- L
+        self.setFixedSize(20, 26)  # larger to fit the Android-style teardrop
+        # transparent background so only the painted teardrop shape is visible
         self.setAttribute(QtCore.Qt.WidgetAttribute.WA_TranslucentBackground, True)
 
-        self._color = self.code_item.get('color', '#0078d7')  # store color for paintEvent <- L
+        self._color = self.code_items[0].get('color', '#0078d7')  # store color for paintEvent
         self.dragging = False
         self.show()
         self.raise_()  # Ensure it stays on top of the text
 
     # Draw an Android-style text-selection teardrop handle.
-    # Start handle points to the bottom-right, end handle points to the bottom-left <- L
+    # Start handle points to the bottom-right, end handle points to the bottom-left
     def paintEvent(self, event):
         painter = QtGui.QPainter(self)
         painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
@@ -1514,7 +1514,7 @@ class CodeResizeHandle(QtWidgets.QWidget):
             # Move the handle visually
             cursor = self.editor.cursorForPosition(viewport_pos)
             cursor_rect = self.editor.cursorRect(cursor)
-            # keep teardrop tip aligned during drag (start->top-right, end->top-left) <- L
+            # keep teardrop tip aligned during drag (start->top-right, end->top-left)
             if self.is_start:
                 self.move(cursor_rect.x() - self.width(), cursor_rect.y())
             else:
@@ -1529,11 +1529,15 @@ class CodeResizeHandle(QtWidgets.QWidget):
 
             # Update position in memory for live highlight feedback
             if self.is_start:
-                if new_pos < self.code_item['pos1']:
-                    self.code_item['pos0'] = new_pos
+                if new_pos < self.code_items[0]['pos1']:
+                    for c in self.code_items:
+                        c['pos0'] = new_pos
+                    #self.code_item['pos0'] = new_pos
             else:
-                if new_pos > self.code_item['pos0']:
-                    self.code_item['pos1'] = new_pos
+                if new_pos > self.code_items[0]['pos0']:
+                    for c in self.code_items:
+                        c['pos1'] = new_pos
+                    #self.code_item['pos1'] = new_pos
 
             # Refresh the text highlighting
             self.main_dialog.unlight()
@@ -1546,8 +1550,10 @@ class CodeResizeHandle(QtWidgets.QWidget):
             cursor = self.editor.cursorForPosition(viewport_pos)
             new_pos = cursor.position() + self.main_dialog.file_['start']
             # Pass original positions for potential revert
-            self.main_dialog.update_code_position_from_handle(self.code_item, new_pos, self.is_start, self.orig_pos0,
+            self.main_dialog.update_code_position_from_handle(self.code_items, new_pos, self.is_start, self.orig_pos0,
                                                               self.orig_pos1)
+            '''self.main_dialog.update_code_position_from_handle(self.code_item, new_pos, self.is_start, self.orig_pos0,
+                                                                          self.orig_pos1)'''
 
 
 class ToolTipEventFilter(QtCore.QObject):

@@ -21,18 +21,16 @@ https://qualcoder-org.github.io
 https://qualcoder.org/
 """
 
+import copy
 import logging
 import os
-from typing import Any
-from PyQt6 import QtGui, QtWidgets, QtCore
-import qtawesome as qta
-import copy
 import re
 import unicodedata  # <- L normalize localized numerals when reading numeric combos
+from typing import Any, Callable, Optional
 
-from .GUI.ui_dialog_settings import Ui_Dialog_settings
-from .coder_names import DialogCoderNames
-from .helpers import get_default_user_directory, Message
+from PyQt6 import QtCore, QtGui, QtWidgets
+import qtawesome as qta
+
 from .ai_llm import (
     add_new_ai_model,
     ensure_chatgpt_oauth_profile_defaults,
@@ -41,6 +39,12 @@ from .ai_llm import (
     is_chatgpt_oauth_profile,
     renew_chatgpt_oauth,
 )
+from .ai_runtime import ai_runtime_ready, show_ai_runtime_not_ready
+from .coder_names import DialogCoderNames
+from .confirm_delete import DialogConfirmDelete
+from .GUI.ui_dialog_settings import Ui_Dialog_settings
+from .helpers import get_default_user_directory, Message
+from .themes import STYLE_OPTIONS
 
 home = os.path.expanduser('~')
 path = os.path.abspath(os.path.dirname(__file__))
@@ -78,8 +82,8 @@ Notes
 FONT_SIZES = [8, 10, 12, 14, 16, 18]        # comboBox_fontsize / codetree / docfontsize  
 BACKUP_COUNTS = [0, 1, 2, 3, 4, 5]          # comboBox_backups  
 CONTEXT_CHARS = [100, 200, 300]             # comboBox_surrounding_chars  
-STYLE_OPTIONS = ["native", "original", "dark", "blue", "green", "orange", "purple", "yellow", "rainbow"]
-HIGHLIGHT_STYLE_OPTIONS = ["marker", "underline"]
+HIGHLIGHT_STYLE_OPTIONS = ["marker", "marker light", "underline"]
+MAIN_TABS_OPTIONS = ["top", "left"]
 
 
 def _setting_is_true(value: Any) -> bool:
@@ -165,7 +169,9 @@ class StrictDoubleRangeValidator(QtGui.QDoubleValidator):
     def validate(self, text: str, pos: int):
         state, text, pos = super().validate(text, pos)
         normalized = text.strip().replace(',', '.')
-        if normalized in ('', '.', '-', '-.', '+', '+.'):
+        if normalized == '':
+            return QtGui.QValidator.State.Acceptable, text, pos
+        if normalized in ('.', '-', '-.', '+', '+.'):
             return QtGui.QValidator.State.Intermediate, text, pos
         try:
             value = float(normalized)
@@ -181,9 +187,11 @@ class DialogSettings(QtWidgets.QDialog):
 
     settings = {}
 
-    def __init__(self, app, parent=None, section=None, enable_ai=False):
+    def __init__(self, app, parent=None, section=None, enable_ai=False,
+                 ai_runtime_loader: Optional[Callable[..., bool]] = None):
 
         self.app = app
+        self.ai_runtime_loader = ai_runtime_loader
         if self.app.conn is not None:
             self.initial_changes = self.app.conn.total_changes
         self.settings = copy.deepcopy(self.app.settings)
@@ -223,16 +231,18 @@ class DialogSettings(QtWidgets.QDialog):
         _set_combo_by_value(self.ui.comboBox_codetreefontsize, FONT_SIZES, self.settings['treefontsize'])
         _set_combo_by_value(self.ui.comboBox_docfontsize, FONT_SIZES, self.settings['docfontsize'])
         self.ui.checkBox_auto_backup.stateChanged.connect(self.backup_state_changed)
-        if self.settings['showids'] == 'True':
-            self.ui.checkBox.setChecked(True)
-        else:
-            self.ui.checkBox.setChecked(False)
+        # showids is loaded as a bool from config.ini, not the string 'True'
+        self.ui.checkBox.setChecked(_setting_is_true(self.settings['showids']))
         styles = STYLE_OPTIONS
         styles_translated = [_(style_name) for style_name in styles]
         self.ui.comboBox_style.addItems(styles_translated)
         for index, style in enumerate(styles):
             if style == self.settings['stylesheet']:
                 self.ui.comboBox_style.setCurrentIndex(index)
+        self.ui.comboBox_main_tabs.addItems([_("Top"), _("Left, icons only")])
+        main_tabs = self.settings.get('main_tabs_position', 'top')
+        if main_tabs in MAIN_TABS_OPTIONS:
+            self.ui.comboBox_main_tabs.setCurrentIndex(MAIN_TABS_OPTIONS.index(main_tabs))
         if self.settings['backup_on_open'] == 'True':
             self.ui.checkBox_auto_backup.setChecked(True)
         else:
@@ -271,6 +281,8 @@ class DialogSettings(QtWidgets.QDialog):
         else:
             self.ui.checkBox_AI_enable.setChecked(False)
         self.ui.checkBox_AI_enable.stateChanged.connect(self.ai_enable_state_changed)
+        self.load_external_mcp_setting()
+        self.ui.checkBox_MCP_enable.toggled.connect(self.external_mcp_toggled)
         self.ui.comboBox_reasoning.addItems(['default', 'low', 'medium', 'high'])
         self.ui.comboBox_ai_profile.clear()
         self.load_ai_profiles()
@@ -304,7 +316,7 @@ class DialogSettings(QtWidgets.QDialog):
         self.ui.lineEdit_top_p.setText(self.settings.get('ai_top_p', '1.0'))
         self.ui.lineEdit_top_p.setValidator(self._create_ai_float_validator(0.0, 1.0))
         self.ui.lineEdit_top_p.editingFinished.connect(self.validate_ai_top_p)
-        self.ui.comboBox_reasoning.currentIndexChanged.connect(self.ai_model_parameters_changed)
+        self.ui.comboBox_reasoning.currentTextChanged.connect(self.ai_model_parameters_changed)
         self.ui.lineEdit_ai_api_base.editingFinished.connect(self.ai_api_base_changed)
         self.ui.pushButton_ai_new_profile.clicked.connect(self.new_ai_profile)
         
@@ -324,6 +336,49 @@ class DialogSettings(QtWidgets.QDialog):
             self.ui.widget_ai.setStyleSheet('')
 
         self.load_ai_permissions()
+
+    def load_external_mcp_setting(self) -> None:
+        """Restore the canonical External MCP checkbox from persisted settings."""
+
+        with QtCore.QSignalBlocker(self.ui.checkBox_MCP_enable):
+            self.ui.checkBox_MCP_enable.setChecked(
+                _setting_is_true(self.settings.get('mcp_external_enabled', 'False'))
+            )
+
+    def external_mcp_toggled(self, checked: bool) -> None:
+        """Show the first-use privacy notice before enabling External MCP.
+
+        Args:
+            checked: The checkbox's requested state.
+        """
+
+        if not checked:
+            self.settings['mcp_external_enabled'] = 'False'
+            return
+        acknowledged = _setting_is_true(
+            self.settings.get('external_mcp_notice_acknowledged', 'False')
+        )
+        if not acknowledged:
+            message = _(
+                'External MCP allows third-party AI applications to access data from the currently '
+                'opened project. Data returned by MCP tools may be transmitted to the AI provider '
+                'configured in that application.\n\nOnly enable External MCP if you trust the '
+                'connected application and understand how it handles your data.'
+            )
+            reply = QtWidgets.QMessageBox.warning(
+                self,
+                _('External MCP privacy warning'),
+                message,
+                QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+                QtWidgets.QMessageBox.StandardButton.No,
+            )
+            if reply != QtWidgets.QMessageBox.StandardButton.Yes:
+                with QtCore.QSignalBlocker(self.ui.checkBox_MCP_enable):
+                    self.ui.checkBox_MCP_enable.setChecked(False)
+                self.settings['mcp_external_enabled'] = 'False'
+                return
+            self.settings['external_mcp_notice_acknowledged'] = 'True'
+        self.settings['mcp_external_enabled'] = 'True'
 
     def load_ai_permissions(self):
         ai_permissions = self.settings.get('ai_permissions', 1)
@@ -499,6 +554,9 @@ class DialogSettings(QtWidgets.QDialog):
         if not self.current_ai_profile_uses_oauth():
             self.ui.label_auth_result.setText('')
             return
+        if not ai_runtime_ready(self.app):
+            self.ui.label_auth_result.setText(_("AI components are still loading."))
+            return
         is_authenticated, status_text = get_chatgpt_oauth_status()
         self.ui.label_auth_result.setText(status_text)
 
@@ -524,13 +582,26 @@ class DialogSettings(QtWidgets.QDialog):
             self.ui.label_auth_result.setText('')
 
     def ai_enable_state_changed(self):
+        if (self.ui.checkBox_AI_enable.isChecked()
+                and not ai_runtime_ready(self.app)
+                and self.ai_runtime_loader is not None):
+            loaded = self.ai_runtime_loader(_("AI Settings"), self)
+            if not loaded:
+                with QtCore.QSignalBlocker(self.ui.checkBox_AI_enable):
+                    self.ui.checkBox_AI_enable.setChecked(False)
         self.ui.comboBox_ai_profile.setEnabled(self.ui.checkBox_AI_enable.isChecked())
+        self.ui.pushButton_ai_profile_edit.setEnabled(self.ui.checkBox_AI_enable.isChecked())
+        self.ui.comboBox_ai_permissions.setEnabled(self.ui.checkBox_AI_enable.isChecked())
+        self.ui.pushButton_advanced_AI_options.setEnabled(self.ui.checkBox_AI_enable.isChecked())
         self.ui.label_ai_model_desc.setEnabled(self.ui.checkBox_AI_enable.isChecked())
         self.ui.label_ai_access_info_url.setEnabled(self.ui.checkBox_AI_enable.isChecked())
         self.ui.lineEdit_ai_temperature.setEnabled(self.ui.checkBox_AI_enable.isChecked())
         self.ui.lineEdit_top_p.setEnabled(self.ui.checkBox_AI_enable.isChecked())
         self.ui.checkBox_AI_language_ui.setEnabled(self.ui.checkBox_AI_enable.isChecked())
         self.ui.lineEdit_AI_language.setEnabled(self.ui.checkBox_AI_enable.isChecked() and (not self.ui.checkBox_AI_language_ui.isChecked()))
+        if not self.ui.checkBox_AI_enable.isChecked():  # collapse advanced options
+            self.ui.pushButton_advanced_AI_options.setChecked(False)
+            self.ui.widget_AI_advanced_options.hide()
         self.update_ai_auth_widgets()
     
     def load_ai_profiles(self):
@@ -631,8 +702,7 @@ class DialogSettings(QtWidgets.QDialog):
                 self.ui.comboBox_ai_profile.setCurrentText = new_name
         
     def ai_model_parameters_changed(self):
-        """Called if the selected large or fast model has changed or if one of the 
-        context window numbers has been altered."""
+        """Save changes to model names, context windows, and reasoning effort."""
         ai_model_index = int(self.settings['ai_model_index'])
         if 0 <= ai_model_index < len(self.ai_models):
             self.ai_models[ai_model_index]['large_model'] = self.ui.comboBox_AI_model_large.currentText()
@@ -645,7 +715,7 @@ class DialogSettings(QtWidgets.QDialog):
                 self.ai_models[ai_model_index]['fast_model_context_window'] = self.ui.lineEdit_ai_fast_context_window.text()
             else:
                 self.ai_models[ai_model_index]['fast_model_context_window'] = '32768' # default
-            self.ai_models[ai_model_index]['reasoning_effort'] = self.ui.comboBox_reasoning.currentText()        
+            self.ai_models[ai_model_index]['reasoning_effort'] = self.ui.comboBox_reasoning.currentText().strip()
 
     def validate_ai_api_key(self, api_key: str, focus_field: bool = False) -> bool:
         """Reject API keys that contain non-ASCII characters.
@@ -690,6 +760,9 @@ class DialogSettings(QtWidgets.QDialog):
 
     def ai_update_available_models(self):
         if not self.ui.widget_AI_advanced_options.isVisible():
+            return
+        if not ai_runtime_ready(self.app):
+            show_ai_runtime_not_ready(self.app, _("AI Models"))
             return
         model_list = []
         if int(self.settings['ai_model_index']) >= 0:
@@ -741,11 +814,11 @@ class DialogSettings(QtWidgets.QDialog):
 
     @staticmethod
     def parse_bounded_float(text: str, minimum: float, maximum: float) -> str:
-        """Normalize a user-entered float and ensure it stays within range."""
+        """Normalize an optional float and ensure nonempty values stay within range."""
 
         normalized = text.strip().replace(',', '.')
         if normalized == '':
-            raise ValueError("empty float value")
+            return ''
         value = float(normalized)
         if not (minimum <= value <= maximum):
             raise ValueError(f"float value {value} outside [{minimum}, {maximum}]")
@@ -782,6 +855,9 @@ class DialogSettings(QtWidgets.QDialog):
         """Start or renew ChatGPT OAuth authentication for the current profile."""
 
         if not self.current_ai_profile_uses_oauth():
+            return
+        if not ai_runtime_ready(self.app):
+            show_ai_runtime_not_ready(self.app, _("AI Authentication"))
             return
         QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.CursorShape.WaitCursor)
         try:
@@ -888,15 +964,13 @@ class DialogSettings(QtWidgets.QDialog):
         self.settings['docfontsize'] = _combo_value(self.ui.comboBox_docfontsize, FONT_SIZES,
                                                     self.app.settings['docfontsize']) 
         self.settings['directory'] = self.ui.label_directory.text()
-        if self.ui.checkBox.isChecked():
-            self.settings['showids'] = 'True'
-        else:
-            self.settings['showids'] = 'False'
+        self.settings['showids'] = self.ui.checkBox.isChecked()  # Keep as bool
         index = self.ui.comboBox_style.currentIndex()
         styles = STYLE_OPTIONS
         if self.settings['stylesheet'] != styles[index]:
             restart_qualcoder = True
         self.settings['stylesheet'] = styles[index]
+        self.settings['main_tabs_position'] = _combo_choice(self.ui.comboBox_main_tabs, MAIN_TABS_OPTIONS, 'top')
         selected_language = self.get_selected_language_code()
         if self.settings['language'] != selected_language:
             restart_qualcoder = True
@@ -932,6 +1006,9 @@ class DialogSettings(QtWidgets.QDialog):
         ai_model_index = self.ui.comboBox_ai_profile.currentIndex() 
         self.settings['ai_model_index'] = ai_model_index
         self.settings['ai_permissions'] = self.current_ai_permissions()
+        self.settings['mcp_external_enabled'] = (
+            'True' if self.ui.checkBox_MCP_enable.isChecked() else 'False'
+        )
         if self.settings['ai_enable'] == 'True' and ai_model_index < 0:
             msg = _('Please select an AI profile or disable the AI altogether.')
             Message(self.app, _('AI profile'), msg).exec()

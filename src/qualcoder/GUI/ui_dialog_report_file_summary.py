@@ -67,16 +67,6 @@ class Ui_Dialog_file_summary(object):
         Dialog_file_summary.setWindowTitle(_translate("Dialog_file_summary", "File summary"))
         self.label_search_results.setText(_translate("Dialog_file_summary", "Search:"))
         self.lineEdit_search_results.setToolTip(_translate("Dialog_file_summary", "Search results for text"))
-        self.pushButton_search_next.setToolTip(_translate("Dialog_file_summary", "Search for next occurence in results"))
+        self.pushButton_search_next.setToolTip(_translate("Dialog_file_summary", "Search for next occurrence in results"))
         self.label_files.setText(_translate("Dialog_file_summary", "File summary report"))
         self.comboBox_stopwords.setToolTip(_translate("Dialog_file_summary", "Select stopwords list by language"))
-
-
-if __name__ == "__main__":
-    import sys
-    app = QtWidgets.QApplication(sys.argv)
-    Dialog_file_summary = QtWidgets.QDialog()
-    ui = Ui_Dialog_file_summary()
-    ui.setupUi(Dialog_file_summary)
-    Dialog_file_summary.show()
-    sys.exit(app.exec())

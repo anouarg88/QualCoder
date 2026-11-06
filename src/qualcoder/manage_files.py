@@ -45,6 +45,7 @@ import zipfile
 from .add_attribute import DialogAddAttribute
 from .add_item_name import DialogAddItemName
 from .code_pdf import DialogCodePdf
+from .context_help import open_module_help
 from .pdf_utils import extract_pdf_fulltext, extract_pdf_highlights, \
     pdf_annotations_to_file_memo, code_pdf_highlights, \
     pdf_markups_question_text  # Same extractor and word map as the PDF viewer
@@ -321,8 +322,6 @@ class DialogManageFiles(QtWidgets.QDialog):
 
         self.ui.pushButton_bulk_rename.setIcon(qta.icon('mdi6.file-multiple-outline', options=[{'scale_factor': 1.2}]))
         self.ui.pushButton_bulk_rename.clicked.connect(self.bulk_rename_database_entry)
-        self.ui.pushButton_help.setIcon(qta.icon('mdi6.help'))
-        self.ui.pushButton_help.pressed.connect(self.help)
         self.ui.pushButton_clear_filter.setIcon(qta.icon('mdi6.filter-off-outline', options=[{'scale_factor': 1.3}]))
         self.ui.pushButton_clear_filter.pressed.connect(self.clear_file_filter)
         self.ui.pushButton_clear_filter.setToolTip(_("Clear filter"))
@@ -342,6 +341,9 @@ class DialogManageFiles(QtWidgets.QDialog):
         self.ui.tableWidget.horizontalHeader().setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
         self.ui.tableWidget.horizontalHeader().customContextMenuRequested.connect(self.table_header_menu)
         self.ui.tableWidget.horizontalHeader().setToolTip(_("Right click header row to hide columns"))
+        self.ui.tableWidget.setShowGrid(False)
+        self.ui.tableWidget.setAlternatingRowColors(True)
+        self.ui.tableWidget.verticalHeader().hide()
         self.load_file_data()
         if getattr(self.app, "project_events", None) is not None:
             self.app.project_events.project_data_changed.connect(self._on_project_data_changed)
@@ -394,8 +396,8 @@ class DialogManageFiles(QtWidgets.QDialog):
         self._reload_after_attribute_change()
 
     def help(self):
-        """ Open help for transcribe section in browser. """
-        self.app.help_wiki("3.2.-Files")
+        """ Open help in browser. """
+        open_module_help(self.app, self)
 
     FILE_TYPE_KEYS = ("text", "pdf", "image", "audio", "video")
     PLAIN_TEXT_KEY = "__plain__"
@@ -925,6 +927,10 @@ class DialogManageFiles(QtWidgets.QDialog):
         def
         """
 
+        if event.type() != QtCore.QEvent.Type.KeyPress:
+            # ShortcutOverride and KeyRelease are QKeyEvent too, so one keystroke
+            # ran the action three times (Delete showed the dialog again on cancel)
+            return False
         if type(event) == QtGui.QKeyEvent:
             key = event.key()
             mod = event.modifiers()
@@ -950,6 +956,8 @@ class DialogManageFiles(QtWidgets.QDialog):
         action_hide_columns_starting = menu.addAction(_("Hide columns starting with"))
         action_show_columns_starting = menu.addAction(_("Show columns starting with"))
         action = menu.exec(self.ui.tableWidget.mapToGlobal(position))
+        if action is None:  # Dismissed menu: None matches unbuilt actions
+            return
         if action == action_show_all_columns:
             for c in range(0, self.ui.tableWidget.columnCount()):
                 self.ui.tableWidget.setColumnHidden(c, False)
@@ -963,6 +971,8 @@ class DialogManageFiles(QtWidgets.QDialog):
             msg = _("Hide columns starting with:")
             hide_filter, ok = QtWidgets.QInputDialog.getText(self, _("Hide Columns"), msg,
                                                              QtWidgets.QLineEdit.EchoMode.Normal)
+            if not ok or hide_filter == "":  # Empty prefix matched every column
+                return
             for c in range(1, self.ui.tableWidget.columnCount()):
                 h_text = self.ui.tableWidget.horizontalHeaderItem(c).text()
                 if len(h_text) >= len(hide_filter) and hide_filter == h_text[:len(hide_filter)]:
@@ -971,6 +981,8 @@ class DialogManageFiles(QtWidgets.QDialog):
             msg = _("Show columns starting with:")
             show_filter, ok = QtWidgets.QInputDialog.getText(self, _("Show Columns"), msg,
                                                              QtWidgets.QLineEdit.EchoMode.Normal)
+            if not ok or show_filter == "":  # Cancel must not rearrange columns
+                return
             for c in range(4, self.ui.tableWidget.columnCount()):
                 h_text = self.ui.tableWidget.horizontalHeaderItem(c).text()
                 if len(h_text) >= len(show_filter) and show_filter == h_text[:len(show_filter)]:
@@ -1345,8 +1357,7 @@ class DialogManageFiles(QtWidgets.QDialog):
         for a in attr_types:
             cur.execute(insert_sql, [a[0], id_, now_, self.app.settings['codername']])
         self.app.conn.commit()
-        if self.app.settings['ai_enable'] == 'True':
-            self.app.ai.sources_vectorstore.import_document(id_, entry['name'], entry['fulltext'])
+        self.app.vectorstore_import_document(id_, entry['name'], entry['fulltext'])
         self.parent_text_edit.append(_("Text extracted from pdf to new file: ") + new_name)
         self.load_file_data()
         self.fill_table()
@@ -1512,9 +1523,10 @@ class DialogManageFiles(QtWidgets.QDialog):
         self._emit_project_table_changes(['source'])
         # update doc in vectorstore
         id_ = int(self.ui.tableWidget.item(row, self.ID_COLUMN).text())
-        if self.app.settings['ai_enable'] == 'True':
-            docs = self.app.get_file_texts(file_ids=[id_])
-            self.app.ai.sources_vectorstore.import_document(docs[0]['id'], docs[0]['name'], docs[0]['fulltext'])
+        docs = self.app.get_file_texts(file_ids=[id_])
+        self.app.vectorstore_import_document(
+            docs[0]['id'], docs[0]['name'], docs[0]['fulltext']
+        )
 
     def undo_file_rename(self):
         """ Undo file name rename. """
@@ -1544,8 +1556,7 @@ class DialogManageFiles(QtWidgets.QDialog):
         self.parent_text_edit.append(_("Reversed renamed database file entry: ") +
                                      f"{selection['name']} -> {selection['old_name']}")
         self.load_file_data()
-        if self.app.settings['ai_enable'] == 'True':
-            self.app.ai.sources_vectorstore.update_vectorstore()
+        self.app.vectorstore_update()
         self.files_renamed = [x for x in self.files_renamed if not (selection['fid'] == x.get('fid'))]
         self._emit_project_table_changes(['source'])
         if len(self.files_renamed) == 0:
@@ -1598,8 +1609,7 @@ class DialogManageFiles(QtWidgets.QDialog):
         self.parent_text_edit.append(msg + err_msg)
         self._emit_project_table_changes(['source'])
         # Updating vectorstore
-        if self.app.settings['ai_enable'] == 'True':
-            self.app.ai.sources_vectorstore.update_vectorstore()
+        self.app.vectorstore_update()
 
         self.ui.pushButton_undo.setEnabled(True)
         self.load_file_data()
@@ -1869,7 +1879,7 @@ class DialogManageFiles(QtWidgets.QDialog):
 
     def load_file_data(self, order_by :str=""):
         """ Documents images and audio contain the filetype suffix.
-        No suffix implies the 'file' was imported from a survey question or created internally.
+        No suffix implies the 'file' was created internally or imported from a survey by an older version.
         This also fills out the table header labels with file attribute names.
         Db versions < 5: Files with the '.transcribed' suffix mean they are associated with audio and
         video files.
@@ -2236,6 +2246,9 @@ class DialogManageFiles(QtWidgets.QDialog):
 
         x = self.ui.tableWidget.currentRow()
         y = self.ui.tableWidget.currentColumn()
+        if x < 0 or x >= len(self.source):
+            # itemChanged can fire while the table is refilled, with no current row
+            return
         # Update attribute value
         if y > self.CASE_COLUMN:
             value = str(self.ui.tableWidget.item(x, y).text()).strip()
@@ -2289,6 +2302,9 @@ class DialogManageFiles(QtWidgets.QDialog):
                 self.av_dialog_open.mediaplayer.stop()
             self.av_dialog_open = None
         x = self.ui.tableWidget.currentRow()
+        if x < 0 or x >= len(self.source):
+            # No current row (-1 opened the last file, or crashed on an empty project)
+            return
         self.ui.tableWidget.selectRow(x)
         if self.source[x]['mediapath'] is not None and 'docs:' != self.source[x]['mediapath'][0:5]:
             if len(self.source[x]['mediapath']) > 6 and self.source[x]['mediapath'][:7] in ("/images", "images:"):
@@ -2402,8 +2418,9 @@ class DialogManageFiles(QtWidgets.QDialog):
         self.app.conn.commit()
 
         # add doc to vectorstore
-        if self.app.settings['ai_enable'] == 'True':
-            self.app.ai.sources_vectorstore.import_document(entry['id'], entry['name'], entry['fulltext'])
+        self.app.vectorstore_import_document(
+            entry['id'], entry['name'], entry['fulltext']
+        )
 
         # Add file attribute placeholders
         cur.execute('select name from attribute_type where caseOrFile ="file"')
@@ -2537,9 +2554,8 @@ class DialogManageFiles(QtWidgets.QDialog):
                 s['fulltext'] = text_
                 break
 
-        # Update the AI vectorstore if enabled
-        if self.app.settings['ai_enable'] == 'True':
-            self.app.ai.sources_vectorstore.import_document(tr_id, tr_name, text_)
+        # Update the shared vectorstore if enabled
+        self.app.vectorstore_import_document(tr_id, tr_name, text_)
 
         self.parent_text_edit.append(_("Transcription imported into ") + tr_name)
         self.load_file_data()
@@ -2611,7 +2627,6 @@ class DialogManageFiles(QtWidgets.QDialog):
         id_ = cur.fetchone()[0]
         item['id'] = id_
         ui = DialogEditTextFile(self.app, id_)
-        ui.ui.textEdit.setAcceptRichText(False)
         ui.exec()
         icon, metadata, err_ = self.get_icon_and_metadata(id_)
         item['icon'] = icon
@@ -2719,6 +2734,9 @@ class DialogManageFiles(QtWidgets.QDialog):
         # Needed for matching an updated data set to existing survey rows
         existing_files = self.app.get_text_filenames()
 
+        # Category for codes created by this import, made on first new code
+        survey_cat_name = _("Survey")
+        survey_catid = None
         count = 0
         for index, row in df.iterrows():
             fulltext = ""
@@ -2754,7 +2772,8 @@ class DialogManageFiles(QtWidgets.QDialog):
             filename = base_filename
             suffix = 1
             while True:
-                cur.execute("select name from source where name=?", [filename])
+                # Also check the suffix-less names of older survey imports
+                cur.execute("select name from source where name in (?,?)", [filename + ".txt", filename])
                 if not cur.fetchone():
                     break
                 filename = f"{base_filename}_{suffix}"
@@ -2765,8 +2784,9 @@ class DialogManageFiles(QtWidgets.QDialog):
                 filepath_save = Path(self.app.project_path) / "documents" / filename_txt
                 with open(filepath_save, 'w', encoding='utf-8') as f:
                     f.write(fulltext)
+                # Named and stored like any imported .txt file
                 cur.execute("insert into source(name, fulltext, mediapath, memo, owner, date) values(?,?,?,?,?,?)",
-                            (filename, fulltext, None, "", self.app.settings['codername'], now))
+                            (filename_txt, fulltext, "/docs/" + filename_txt, "", self.app.settings['codername'], now))
                 file_id = cur.lastrowid
             else:
                 file_id = None
@@ -2780,8 +2800,10 @@ class DialogManageFiles(QtWidgets.QDialog):
                     else:
                         grays = next((colr for colr in colour_ranges if colr['name'] == 'gray'), None)
                         color = colors[randint(grays['min'], grays['max'] - 1)]
-                        cur.execute("insert into code_name (name, memo, owner, date, color) values(?,?,?,?,?)",
-                                    (col_name, "", self.app.settings['codername'], now, color))
+                        if survey_catid is None:
+                            survey_catid = self.get_or_create_category(cur, survey_cat_name, now)
+                        cur.execute("insert into code_name (name, memo, owner, date, color, catid) values(?,?,?,?,?,?)",
+                                    (col_name, "", self.app.settings['codername'], now, color, survey_catid))
                         cid = cur.lastrowid
                     if text_cols:
                         cur.execute("insert into code_text (cid, fid, seltext, pos0, pos1, owner, date, memo) values(?,?,?,?,?,?,?,?)",
@@ -2819,7 +2841,7 @@ class DialogManageFiles(QtWidgets.QDialog):
                 # Check if fid is None, try getting from a file name match
                 if attr_file_or_case == "file":
                     for item in existing_files:
-                        if item['name'] == base_filename:
+                        if item['name'] in (base_filename + ".txt", base_filename):
                             file_or_case_id = item['id']
                             break
 
@@ -2852,6 +2874,9 @@ class DialogManageFiles(QtWidgets.QDialog):
             changed_tables.update({"cases", "case_text"})
         if autocode_enabled:
             changed_tables.update({"code_name", "code_text"})
+        if survey_catid is not None:
+            changed_tables.add("code_cat")
+            msg += "\n" + _("New codes placed in category: ") + survey_cat_name
         self._emit_project_table_changes(sorted(changed_tables))
         if updated_data:
             msg += "\n" + _("Some existing data updated.")
@@ -2866,6 +2891,17 @@ class DialogManageFiles(QtWidgets.QDialog):
         if updated_data:
             dlg_msg += "\n" + _("Some existing data updated")
         Message(self.app, _("Import successful."), dlg_msg).exec()
+
+    def get_or_create_category(self, cur, name:str, date:str):
+        """ Return the catid of the named category, creating it if missing. """
+
+        cur.execute("select catid from code_cat where name=?", [name])
+        res = cur.fetchone()
+        if res:
+            return res[0]
+        cur.execute("insert into code_cat (name, memo, owner, date, supercatid) values(?,?,?,?,?)",
+                    (name, "", self.app.settings['codername'], date, None))
+        return cur.lastrowid
 
     def import_files(self, link:bool=False):
         """ Import files and store into relevant directories (documents, images, audio, video).
@@ -3103,7 +3139,7 @@ class DialogManageFiles(QtWidgets.QDialog):
         # Fire-and-forget worker thread so importing long media does not freeze the UI.
         # Runs are serialised in the helper; the coding dialog waits if still pending.
         generate_waveform_png_async(abs_path, waveform_path,
-                                    waveform_colour(self.app.settings['stylesheet']))
+                                    waveform_colour())
 
     def remove_waveform_png(self, file_id):
         """ Remove the cached waveform image for a deleted media file, to avoid residual files. """
@@ -3172,8 +3208,9 @@ class DialogManageFiles(QtWidgets.QDialog):
             self.app.conn.commit()
 
             # add doc to vectorstore
-            if self.app.settings['ai_enable'] == 'True':
-                self.app.ai.sources_vectorstore.import_document(entry['id'], entry['name'], entry['fulltext'])
+            self.app.vectorstore_import_document(
+                entry['id'], entry['name'], entry['fulltext']
+            )
 
             # Add file attribute placeholders
             att_sql = 'select name from attribute_type where caseOrFile ="file"'
@@ -3395,8 +3432,9 @@ class DialogManageFiles(QtWidgets.QDialog):
             self.app.conn.commit()
 
         # add doc to vectorstore
-        if self.app.settings['ai_enable'] == 'True':
-            self.app.ai.sources_vectorstore.import_document(entry['id'], entry['name'], entry['fulltext'])
+        self.app.vectorstore_import_document(
+            entry['id'], entry['name'], entry['fulltext']
+        )
 
         msg = entry['name']
         if link_path == "":
@@ -3602,7 +3640,7 @@ class DialogManageFiles(QtWidgets.QDialog):
 
     def vectorstore_delete_document_safe(self, fid:int):
         """
-        Removes the document from the AI index without letting a vectorstore lock
+        Removes the document from the search index without letting a vectorstore lock
         abort the project file deletion (e.g. "database is locked" when an embeddings
         worker is writing to search.sqlite in the background). The index is derived
         data: the next update_vectorstore prunes ids no longer in source, so failing
@@ -3612,14 +3650,12 @@ class DialogManageFiles(QtWidgets.QDialog):
             fid: source id, Integer
         """
 
-        if self.app.settings['ai_enable'] != 'True':
-            return
         try:
-            self.app.ai.sources_vectorstore.delete_document(fid)
+            self.app.vectorstore_delete_document(fid)
         except Exception as err:
             logger.warning(f"vectorstore delete_document fid {fid}: {err}")
             self.parent_text_edit.append(
-                _("AI index is busy; the deleted file will be removed from the index "
+                _("Search index is busy; the deleted file will be removed from the index "
                   "on the next update."))
 
     def _unlink_media_with_retry(self, filepath):
@@ -3669,6 +3705,23 @@ class DialogManageFiles(QtWidgets.QDialog):
             except Exception:
                 pass
 
+    def internal_text_file_path(self, docs_dir:Path, name:str):
+        """ Disk file of a text source with no mediapath, or None if there is none.
+        Survey imports are saved as name.txt while the source name has no suffix. """
+
+        p = (docs_dir / name).resolve()
+        if p.is_file():
+            return p
+        # name.txt may belong to another source with that exact name
+        cur = self.app.conn.cursor()
+        cur.execute("select id from source where name=?", [name + ".txt"])
+        if cur.fetchone():
+            return None
+        p = (docs_dir / (name + ".txt")).resolve()
+        if p.is_file():
+            return p
+        return None
+
     def delete_button_multiple_files(self):
         """ Delete files from database and update model and widget.
         Also, delete files from sub-directories, if not externally linked.
@@ -3677,11 +3730,7 @@ class DialogManageFiles(QtWidgets.QDialog):
         """
 
         if self.av_dialog_open is not None:
-            # Guard: a dialog that failed mid-init can leave mediaplayer as None
-            if getattr(self.av_dialog_open, 'mediaplayer', None) is not None:
-                self.av_dialog_open.mediaplayer.stop()
-                if type(self.av_dialog_open.mediaplayer).__module__.endswith('media_player_qt'):
-                    self.av_dialog_open.mediaplayer.release()  # free handle before unlink
+            # Closing stops the timers before releasing the player and saves edits.
             self.av_dialog_open.close()
             self.av_dialog_open = None
         # Respect active filters: only visible files are offered for deletion
@@ -3700,6 +3749,7 @@ class DialogManageFiles(QtWidgets.QDialog):
         for selected in selection:
             names = f"{names}{selected['name']}\n"
         ui = DialogConfirmDelete(self.app, names)
+        self.set_cancel_as_default(ui)
         ok = ui.exec()
         if not ok:
             return
@@ -3719,8 +3769,8 @@ class DialogManageFiles(QtWidgets.QDialog):
                     docs_dir = (Path(self.app.project_path) / "documents").resolve()
                     p = None
                     if s['mediapath'] is None:
-                        # Legacy for older < 3.4 QualCoder projects
-                        p = (docs_dir / s['name']).resolve()
+                        # Legacy < 3.4 projects, survey imports and internal files
+                        p = self.internal_text_file_path(docs_dir, s['name'])
                     elif s['mediapath'][0:6] == '/docs/':
                         # elif: None cannot be sliced. Previously sliced s['name'][6:].
                         p = (docs_dir / s['mediapath'][6:]).resolve()
@@ -3797,6 +3847,24 @@ class DialogManageFiles(QtWidgets.QDialog):
         self.app.delete_backup = False
         self._emit_project_table_changes(['source', 'code_text', 'code_image', 'code_av', 'annotation', 'case_text', 'attribute'])
 
+    @staticmethod
+    def set_cancel_as_default(dialog):
+        """ Make Cancel the default button of a confirm delete dialog, so that
+        Enter or Space right after the Delete key does not confirm the deletion. """
+
+        button_box = getattr(dialog.ui, 'buttonBox', None)
+        if button_box is None:
+            return
+        ok = button_box.button(QtWidgets.QDialogButtonBox.StandardButton.Ok)
+        cancel = button_box.button(QtWidgets.QDialogButtonBox.StandardButton.Cancel)
+        if ok is not None:
+            ok.setAutoDefault(False)
+            ok.setDefault(False)
+        if cancel is not None:
+            cancel.setAutoDefault(True)
+            cancel.setDefault(True)
+            cancel.setFocus()
+
     def delete(self):
         """ Delete files from database and update model and widget.
         Also, delete the files from subdirectories, if not externally linked.
@@ -3804,11 +3872,7 @@ class DialogManageFiles(QtWidgets.QDialog):
         """
 
         if self.av_dialog_open is not None:
-            # Guard: a dialog that failed mid-init can leave mediaplayer as None
-            if getattr(self.av_dialog_open, 'mediaplayer', None) is not None:
-                self.av_dialog_open.mediaplayer.stop()
-                if type(self.av_dialog_open.mediaplayer).__module__.endswith('media_player_qt'):
-                    self.av_dialog_open.mediaplayer.release()  # free handle before unlink
+            # Closing stops the timers before releasing the player and saves edits.
             self.av_dialog_open.close()
             self.av_dialog_open = None
         rows = self.visible_selected_rows()
@@ -3818,6 +3882,7 @@ class DialogManageFiles(QtWidgets.QDialog):
         for r in rows:
             filenames += f"\n{self.source[r]['name']}"
         ui = DialogConfirmDelete(self.app, filenames, _("Delete files"))
+        self.set_cancel_as_default(ui)
         ok = ui.exec()
         if not ok:
             return
@@ -3836,9 +3901,8 @@ class DialogManageFiles(QtWidgets.QDialog):
                     docs_dir = (Path(self.app.project_path) / "documents").resolve()
                     p = None
                     if self.source[row]['mediapath'] is None:
-                        # Legacy for older QualCoder Projects < 3.3
-                        # The condition was inverted (deleted when mediapath was present).
-                        p = (docs_dir / self.source[row]['name']).resolve()
+                        # Legacy < 3.3 projects, survey imports and internal files
+                        p = self.internal_text_file_path(docs_dir, self.source[row]['name'])
                     elif self.source[row]['mediapath'][0:6] == '/docs/':
                         p = (docs_dir / self.source[row]['mediapath'][6:]).resolve()
                     # Never unlink outside the project documents folder (../ guard).

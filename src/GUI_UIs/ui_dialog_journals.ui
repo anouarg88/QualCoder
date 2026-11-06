@@ -131,7 +131,12 @@
        </rect>
       </property>
       <property name="toolTip">
-       <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Search uses Regex functions. &lt;/p&gt;&lt;p&gt;A dot ‘.’ is used as a wild card, e.g. ‘.ears’ will match ‘bears’ and ‘years’. &lt;/p&gt;&lt;p&gt;A ‘?’ after a character will match one or none times that character, e.g. ‘bears?’ will match ‘bear’ and ‘bears’ &lt;/p&gt;&lt;p&gt;&lt;span style=&quot; background-color:transparent;&quot;&gt;A ‘*’ after a character will match zero or more times. &lt;/span&gt;&lt;/p&gt;&lt;p&gt;&lt;span style=&quot; background-color:transparent;&quot;&gt;‘&lt;/span&gt;\. will match the dot symbol, ‘\?’ will match the question mark. ‘\n’ will match the line ending symbol. &lt;/p&gt;&lt;p&gt;Regex cheatsheet: &lt;a href=&quot;http://www.rexegg.com/regex-quickstart.html&quot;&gt;&lt;span style=&quot; text-decoration: underline; color:#000080;&quot;&gt;www.rexegg.com/regex-quickstart.html&lt;/span&gt;&lt;/a&gt;&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+       <string>Search uses Regex functions.
+A dot ‘.’ is used as a wild card, e.g. ‘.ears’ will match ‘bears’ and ‘years’.
+A ‘?’ after a character will match one or none times that character, e.g. ‘bears?’ will match ‘bear’ and ‘bears’
+A ‘*’ after a character will match zero or more times.
+‘\. will match the dot symbol, ‘\?’ will match the question mark. ‘\n’ will match the line ending symbol.
+Regex cheatsheet: www.rexegg.com/regex-quickstart.html</string>
       </property>
       <property name="autoFillBackground">
        <bool>false</bool>
@@ -194,7 +199,8 @@
        </rect>
       </property>
       <property name="toolTip">
-       <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Search for text.&lt;/p&gt;&lt;p&gt;check &lt;span style=&quot; font-weight:600;&quot;&gt;All journals&lt;/span&gt; for searching all journals&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+       <string>Search for text.
+check All journals for searching all journals</string>
       </property>
      </widget>
      <widget class="QCheckBox" name="checkBox_search_all_journals">
@@ -321,7 +327,95 @@
        </property>
       </column>
      </widget>
-     <widget class="QTextEdit" name="textEdit"/>
+     <widget class="QWidget" name="widget_editor" native="true">
+      <layout class="QVBoxLayout" name="verticalLayout_editor">
+       <property name="spacing">
+        <number>0</number>
+       </property>
+       <property name="leftMargin">
+        <number>0</number>
+       </property>
+       <property name="topMargin">
+        <number>0</number>
+       </property>
+       <property name="rightMargin">
+        <number>0</number>
+       </property>
+       <property name="bottomMargin">
+        <number>0</number>
+       </property>
+       <item>
+        <widget class="QGroupBox" name="groupBox_editor">
+         <property name="minimumSize">
+          <size>
+           <width>0</width>
+           <height>32</height>
+          </size>
+         </property>
+         <property name="maximumSize">
+          <size>
+           <width>16777215</width>
+           <height>32</height>
+          </size>
+         </property>
+         <property name="title">
+          <string/>
+         </property>
+         <widget class="QPushButton" name="pushButton_insert_datetime">
+          <property name="geometry">
+           <rect>
+            <x>10</x>
+            <y>2</y>
+            <width>28</width>
+            <height>28</height>
+           </rect>
+          </property>
+          <property name="toolTip">
+           <string>Insert current date and time at the cursor position</string>
+          </property>
+          <property name="text">
+           <string/>
+          </property>
+         </widget>
+         <widget class="QPushButton" name="pushButton_insert_coded_segment">
+          <property name="geometry">
+           <rect>
+            <x>40</x>
+            <y>2</y>
+            <width>28</width>
+            <height>28</height>
+           </rect>
+          </property>
+          <property name="toolTip">
+           <string>Insert coded segments from any file, case or code in the project</string>
+          </property>
+          <property name="text">
+           <string/>
+          </property>
+         </widget>
+         <widget class="QPushButton" name="pushButton_insert_reference">
+          <property name="geometry">
+           <rect>
+            <x>70</x>
+            <y>2</y>
+            <width>28</width>
+            <height>28</height>
+           </rect>
+          </property>
+          <property name="toolTip">
+           <string>Insert a bibliographic reference from the project</string>
+          </property>
+          <property name="text">
+           <string/>
+          </property>
+         </widget>
+        </widget>
+       </item>
+       <item>
+        <widget class="QTextEdit" name="textEdit"/>
+       </item>
+      </layout>
+     </widget>
     </widget>
    </item>
   </layout>
@@ -335,6 +429,9 @@
   <tabstop>pushButton_previous</tabstop>
   <tabstop>pushButton_next</tabstop>
   <tabstop>tableWidget</tabstop>
+  <tabstop>pushButton_insert_datetime</tabstop>
+  <tabstop>pushButton_insert_coded_segment</tabstop>
+  <tabstop>pushButton_insert_reference</tabstop>
   <tabstop>textEdit</tabstop>
   <tabstop>checkBox_search_all_journals</tabstop>
   <tabstop>pushButton_help</tabstop>

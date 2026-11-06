@@ -1,7 +1,7 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 
 """
-Internal MCP server for QualCoder.
+Shared MCP server for QualCoder.
 
 This module uses the official MCP Python SDK (low-level server) and exposes
 an in-process JSON-RPC bridge (`handle_request`) so the current chat flow can
@@ -30,37 +30,77 @@ https://qualcoder.org/
 """
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import ContextVar, copy_context
+from dataclasses import dataclass
+from datetime import datetime
 import hashlib
 import json
 import os
 import random
 import re
 import sqlite3
-from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+import time
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple, TypeVar
+import unicodedata
 from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
 
 from mcp import types
+from mcp.server.context import ServerRequestContext
 from mcp.server.lowlevel import Server
-try:
-    from mcp.server.lowlevel.server import ReadResourceContents
-except ImportError:  # Quick fix
-    from mcp.server.lowlevel.helper_types import ReadResourceContents
-    """ SDK authors recommend migrating away from low-level server types. Use FastMCP, which manages these complex 
-    structural return types behind the scenes.
-    """
-
 
 from .ai_help_index import AiHelpIndex
 from .ai_memo import extract_ai_memo, merge_public_memo
+from .ai_runtime import (
+    VECTORSTORE_DISABLED,
+    VECTORSTORE_FAILED,
+    VECTORSTORE_INDEXING,
+    VECTORSTORE_LOADING,
+    VECTORSTORE_UNLOADED,
+)
 from .color_selector import color_matcher, colors
 
 
+@dataclass(frozen=True)
+class AiMcpExecutionContext:
+    """Describe one internal or external MCP caller."""
+
+    source: str
+    owner: str
+    client_name: Optional[str] = None
+
+
+INTERNAL_AI_CONTEXT = AiMcpExecutionContext(source="ai_agent", owner="AI Agent")
+_execution_context: ContextVar[AiMcpExecutionContext] = ContextVar(
+    "qualcoder_ai_mcp_execution_context", default=INTERNAL_AI_CONTEXT
+)
+# Set while a tool runs: database waits then happen between attempts, never while holding a lock
+_fail_fast_database: ContextVar[bool] = ContextVar("qualcoder_mcp_fail_fast_database", default=False)
+ResultT = TypeVar("ResultT")
+
+
+class ProjectDatabaseLockedError(RuntimeError):
+    """The project database stayed locked for the whole retry window; nothing was written."""
+
+    def __init__(self, message: str, gui_transaction_pending: bool):
+        super().__init__(message)
+        self.gui_transaction_pending = gui_transaction_pending
+
+
+class ProjectNotOpenError(RuntimeError):
+    """No project is open in QualCoder, so nothing can be read or written."""
+
+
+# Failures a client can act on; anything else is an internal error and stays a protocol error
+EXPECTED_TOOL_ERRORS = (ValueError, ProjectNotOpenError, ProjectDatabaseLockedError)
+
+
 class AiMcpServer:
-    """Internal MCP server for QualCoder project data."""
+    """MCP server for QualCoder project data."""
 
     protocol_version = "2025-06-18"
-    server_name = "qualcoder-internal-mcp"
+    server_name = "qualcoder-mcp"
+    server_title = "QualCoder MCP"
     server_version = "0.1.0"
     max_read_length = 12000
     default_read_length = 4000
@@ -77,6 +117,8 @@ class AiMcpServer:
     max_regex_page_size = 100
     default_regex_context_chars = 120
     max_regex_context_chars = 1000
+    default_annotation_page_size = 40
+    max_annotation_page_size = 200
     default_snippet_context_min_chars = 200
     max_snippet_context_chars = 500
     max_regex_hits = 20000
@@ -94,77 +136,158 @@ class AiMcpServer:
         "Ref_Journal",
     )
     SANDBOX_WRITE_TOOL_NAMES = (
-        "codes/create_category",
-        "codes/create_code",
-        "codes/create_text_coding",
-        "cases/create_case",
-        "cases/link_text_to_case",
+        "codes_create_category",
+        "codes_create_code",
+        "codes_create_text_coding",
+        "annotations_create",
+        "cases_create_case",
+        "cases_link_text_to_case",
     )
     FULL_ACCESS_WRITE_TOOL_NAMES = (
-        "codes/update_category",
-        "codes/update_code",
-        "codes/update_text_coding",
-        "codes/move_category",
-        "codes/move_code",
-        "codes/delete_category",
-        "codes/delete_code",
-        "codes/move_text_coding",
-        "codes/delete_text_coding",
-        "cases/update_case",
-        "cases/create_attribute",
-        "cases/update_attributes",
-        "cases/unlink_text_from_case",
-        "documents/create_attribute",
-        "documents/update_document",
-        "documents/update_attributes",
+        "codes_update_category",
+        "codes_update_code",
+        "codes_update_text_coding",
+        "codes_move_category",
+        "codes_move_code",
+        "codes_delete_category",
+        "codes_delete_code",
+        "codes_move_text_coding",
+        "codes_delete_text_coding",
+        "cases_update_case",
+        "cases_create_attribute",
+        "cases_update_attributes",
+        "cases_unlink_text_from_case",
+        "documents_create_attribute",
+        "documents_update_document",
+        "documents_update_attributes",
+        "annotations_update",
+        "annotations_delete",
     )
     PREVIEW_TOOL_NAMES = (
-        "codes/preview_delete_category",
-        "codes/preview_delete_code",
+        "codes_preview_delete_category",
+        "codes_preview_delete_code",
     )
     WRITE_TOOL_NAMES = SANDBOX_WRITE_TOOL_NAMES + FULL_ACCESS_WRITE_TOOL_NAMES
     PREVIEW_REQUIRED_EXECUTE_TOOLS = (
-        "codes/delete_category",
-        "codes/delete_code",
+        "codes_delete_category",
+        "codes_delete_code",
     )
 
     def __init__(self, app):
         self.app = app
+        self._external_executor: Optional[
+            Callable[[Callable[[], ResultT], AiMcpExecutionContext], Awaitable[ResultT]]
+        ] = None
         self._request_seq = 1
         self._preview_tokens: Dict[str, Dict[str, Any]] = {}
         self._sdk_server = Server(
             self.server_name,
             version=self.server_version,
+            title=self.server_title,
             instructions=self._server_instructions(),
+            on_list_resources=self._sdk_list_resources,
+            on_list_resource_templates=self._sdk_list_resource_templates,
+            on_read_resource=self._sdk_read_resource,
+            on_list_tools=self._sdk_list_tools,
+            on_call_tool=self._sdk_call_tool,
+            on_list_prompts=self._sdk_list_prompts,
+            on_get_prompt=self._sdk_get_prompt,
         )
         self.help_index = AiHelpIndex()
+
+    def set_external_executor(
+            self,
+            executor: Optional[Callable[[Callable[[], ResultT], AiMcpExecutionContext], Awaitable[ResultT]]]
+    ) -> None:
+        """Set the adapter that marshals external work onto the application thread."""
+
+        self._external_executor = executor
+
+    def streamable_http_app(self):
+        """Build a fresh stateless Streamable HTTP app for an external listener."""
+
+        return self._sdk_server.streamable_http_app(
+            streamable_http_path="/mcp",
+            stateless_http=True,
+            host="127.0.0.1",
+        )
+
+    def reset_project_state(self) -> None:
+        """Discard transient state that must not survive a project change."""
+
+        self._preview_tokens.clear()
+
+    @staticmethod
+    def sanitize_external_client_name(client_name: Any, max_length: int = 72) -> Optional[str]:
+        """Return a safe, short client display name, or None when unusable."""
+
+        raw_name = "" if client_name is None else str(client_name)
+        cleaned = "".join(
+            " " if unicodedata.category(character) in ("Cc", "Cf") else character
+            for character in raw_name
+        )
+        cleaned = " ".join(cleaned.split()).strip()
+        if cleaned == "":
+            return None
+        return cleaned[:max_length].rstrip()
+
+    def external_execution_context(self, request_context: ServerRequestContext[Any]) -> AiMcpExecutionContext:
+        """Build request-local provenance from self-reported SDK client information."""
+
+        client_name = None
+        client_params = getattr(getattr(request_context, "session", None), "client_params", None)
+        client_info = getattr(client_params, "client_info", None)
+        if client_info is not None:
+            client_name = self.sanitize_external_client_name(getattr(client_info, "name", None))
+        owner = "External MCP" if client_name is None else f"MCP: {client_name}"
+        return AiMcpExecutionContext(
+            source="external_mcp",
+            owner=owner,
+            client_name=client_name,
+        )
+
+    def run_with_execution_context(
+            self, context: AiMcpExecutionContext, operation: Callable[[], ResultT]
+    ) -> ResultT:
+        """Run one operation with request-local owner and event provenance."""
+
+        token = _execution_context.set(context)
         try:
-            self._register_sdk_handlers()
-        except AttributeError:
-            print("AttributeError: 'Server' object has no attribute 'list_resources'")
+            return operation()
+        finally:
+            _execution_context.reset(token)
+
+    async def _run_sdk_operation(
+            self, request_context: Optional[ServerRequestContext[Any]], operation: Callable[[], ResultT]
+    ) -> ResultT:
+        """Run internal work directly and marshal external work through the configured adapter."""
+
+        if request_context is None:
+            return operation()
+        context = self.external_execution_context(request_context)
+        if self._external_executor is None:
+            return self.run_with_execution_context(context, operation)
+        return await self._external_executor(operation, context)
+
+    @property
+    def request_owner(self) -> str:
+        """Return the owner for the current request."""
+
+        return _execution_context.get().owner
+
+    @property
+    def request_source(self) -> str:
+        """Return the source for the current request."""
+
+        return _execution_context.get().source
 
     def _server_instructions(self) -> str:
         return (
-            "QualCoder internal MCP server. "
-            "Use resources/list, resources/read, tools/list, and tools/call. "
-            "Available resources: text documents list (qualcoder://documents), document text by id "
-            "(qualcoder://documents/text/{id}, with optional start/length or line_start/line_end), "
-            "cases list (qualcoder://cases), case details by id (qualcoder://cases/{id}), "
-            "and case text segments by case id (qualcoder://cases/text/{id}), "
-            "code tree (qualcoder://codes/tree), and coded text segments by code id "
-            "(qualcoder://codes/segments/{cid}) with optional filters file_ids, case_ids, and owner, "
-            "semantic vector search "
-            "(qualcoder://vector/search?q=...) with optional filters file_ids, case_ids, and exclude_cids, "
-            "BM25 chunk search "
-            "(qualcoder://search/bm25?q=...) with optional filters file_ids, case_ids, and exclude_cids, "
-            "and regular-expression search "
-            "(qualcoder://search/regex?pattern=...) with optional filters file_ids, case_ids, and exclude_cids. "
-            "It also provides cached access to the English QualCoder help wiki: page list "
-            "(qualcoder://help/pages), help search (qualcoder://help/search?q=...), and help page reads "
-            "(qualcoder://help/page/{slug}). "
-            "Available tools include preview and write operations for categories, codes, text codings, "
-            "case attributes, document attributes, and cases. "
-            "Delete actions on categories or codes should be previewed before execution."
+            "QualCoder is an open-source application for computer-assisted qualitative data analysis. "
+            "It is used to organize, code, retrieve, and analyze qualitative research data. "
+            "This MCP server provides access to the project currently open in the running "
+            "QualCoder application. If no project is open, instruct the user to open or create "
+            "a project in QualCoder before retrying project operations."
         )
 
     def _current_ai_permissions(self) -> int:
@@ -264,13 +387,14 @@ class AiMcpServer:
             return f"{tool_name} prepared a preview."
         return f"{tool_name} completed."
 
-    def _emit_project_table_changes(self, tables: List[str], source: str = "ai_agent") -> None:
+    def _emit_project_table_changes(self, tables: List[str], source: Optional[str] = None) -> None:
         """Emit one app-level project data change event if the event bus exists."""
 
         project_events = getattr(self.app, "project_events", None)
         if project_events is None or not hasattr(project_events, "emit_table_changes") or not isinstance(tables, list):
             return
-        project_events.emit_table_changes(tables, source=source)
+        event_source = _execution_context.get().source if source is None else source
+        project_events.emit_table_changes(tables, source=event_source)
 
     def _snapshot_changed_table_names(self, snapshot: Dict[str, Any]) -> List[str]:
         """Return non-empty table names from one snapshot payload."""
@@ -370,11 +494,9 @@ class AiMcpServer:
             if method == "initialize":
                 result = self._initialize_result()
             elif method == "resources/list":
-                req = types.ListResourcesRequest(params=self._pagination_params(params))
-                result = self._dispatch_sdk(types.ListResourcesRequest, req)
+                result = self._dispatch_sdk("resources/list", self._pagination_params(params))
             elif method == "resources/templates/list":
-                req = types.ListResourceTemplatesRequest(params=self._pagination_params(params))
-                result = self._dispatch_sdk(types.ListResourceTemplatesRequest, req)
+                result = self._dispatch_sdk("resources/templates/list", self._pagination_params(params))
             elif method == "resources/read":
                 uri = params.get("uri")
                 if not isinstance(uri, str) or uri.strip() == "":
@@ -386,10 +508,10 @@ class AiMcpServer:
                     params.get("line_start"),
                     params.get("line_end"),
                 )
-                req = types.ReadResourceRequest(params=types.ReadResourceRequestParams(uri=uri_with_window))
-                result = self._dispatch_sdk(types.ReadResourceRequest, req)
+                request_params = types.ReadResourceRequestParams(uri=uri_with_window)
+                result = self._dispatch_sdk("resources/read", request_params)
             elif method == "tools/list":
-                result = self._list_tools_payload()
+                result = self._dispatch_sdk("tools/list", self._pagination_params(params))
             elif method == "tools/call":
                 name = str(params.get("name", "")).strip()
                 if name == "":
@@ -427,17 +549,17 @@ class AiMcpServer:
             tool_args = params.get("arguments", {})
             if not isinstance(tool_args, dict):
                 tool_args = {}
-            if tool_name == "codes/create_category":
+            if tool_name == "codes_create_category":
                 cat_name = " ".join(str(tool_args.get("name", "")).split()).strip()
                 if cat_name == "":
                     cat_name = _("(unnamed category)")
                 return _('Creating category "{name}"...').format(name=cat_name)
-            if tool_name == "codes/create_code":
+            if tool_name == "codes_create_code":
                 code_name = " ".join(str(tool_args.get("name", "")).split()).strip()
                 if code_name == "":
                     code_name = _("(unnamed code)")
                 return _('Creating code "{name}"...').format(name=code_name)
-            if tool_name == "codes/create_text_coding":
+            if tool_name == "codes_create_text_coding":
                 cid = self._to_int(tool_args.get("cid"), -1)
                 fid = self._to_int(tool_args.get("fid"), -1)
                 code_name = self._fetch_code_name(cid) if cid > 0 else None
@@ -450,27 +572,38 @@ class AiMcpServer:
                     code=str(code_name),
                     document=str(file_name),
                 )
-            if tool_name in ("codes/delete_category", "codes/move_category", "codes/preview_delete_category"):
+            if tool_name == "annotations_create":
+                fid = self._to_int(tool_args.get("fid"), -1)
+                file_name = self._fetch_source_name(fid) if fid > 0 else None
+                if file_name is None or str(file_name).strip() == "":
+                    file_name = _("Document") + (f" #{fid}" if fid > 0 else "")
+                return _('Creating annotation in document "{name}"...').format(name=str(file_name))
+            if tool_name in ("annotations_update", "annotations_delete"):
+                anid = self._to_int(tool_args.get("anid"), -1)
+                if tool_name == "annotations_update":
+                    return _('Updating annotation #{anid}...').format(anid=anid if anid > 0 else "?")
+                return _('Deleting annotation #{anid}...').format(anid=anid if anid > 0 else "?")
+            if tool_name in ("codes_delete_category", "codes_move_category", "codes_preview_delete_category"):
                 catid = self._to_int(tool_args.get("catid"), -1)
                 category_name = self._fetch_category_name(catid) if catid > 0 else None
                 if category_name is None or str(category_name).strip() == "":
                     category_name = _("Category") + (f" #{catid}" if catid > 0 else "")
-                if tool_name == "codes/preview_delete_category":
+                if tool_name == "codes_preview_delete_category":
                     return _('Reviewing impact of deleting category "{name}"...').format(name=str(category_name))
-                if tool_name == "codes/move_category":
+                if tool_name == "codes_move_category":
                     return _('Moving category "{name}"...').format(name=str(category_name))
                 return _('Deleting category "{name}"...').format(name=str(category_name))
-            if tool_name in ("codes/delete_code", "codes/move_code", "codes/preview_delete_code"):
+            if tool_name in ("codes_delete_code", "codes_move_code", "codes_preview_delete_code"):
                 cid = self._to_int(tool_args.get("cid"), -1)
                 code_name = self._fetch_code_name(cid) if cid > 0 else None
                 if code_name is None or str(code_name).strip() == "":
                     code_name = _("Code") + (f" #{cid}" if cid > 0 else "")
-                if tool_name == "codes/preview_delete_code":
+                if tool_name == "codes_preview_delete_code":
                     return _('Reviewing impact of deleting code "{name}"...').format(name=str(code_name))
-                if tool_name == "codes/move_code":
+                if tool_name == "codes_move_code":
                     return _('Moving code "{name}"...').format(name=str(code_name))
                 return _('Deleting code "{name}"...').format(name=str(code_name))
-            if tool_name == "codes/update_category":
+            if tool_name == "codes_update_category":
                 catid = self._to_int(tool_args.get("catid"), -1)
                 if catid <= 0:
                     return _('Updating category "error: missing category id"...')
@@ -478,7 +611,7 @@ class AiMcpServer:
                 if category_name is None or str(category_name).strip() == "":
                     category_name = _("Category") + f" #{catid}"
                 return _('Updating category "{name}"...').format(name=str(category_name))
-            if tool_name == "codes/update_code":
+            if tool_name == "codes_update_code":
                 cid = self._to_int(tool_args.get("cid"), -1)
                 if cid <= 0:
                     return _('Updating code "error: missing code id"...')
@@ -486,33 +619,33 @@ class AiMcpServer:
                 if code_name is None or str(code_name).strip() == "":
                     code_name = _("Code") + f" #{cid}"
                 return _('Updating code "{name}"...').format(name=str(code_name))
-            if tool_name == "codes/update_text_coding":
+            if tool_name == "codes_update_text_coding":
                 ctid = self._to_int(tool_args.get("ctid"), -1)
                 return _('Updating text coding #{ctid}...').format(ctid=ctid if ctid > 0 else "?")
-            if tool_name == "codes/move_text_coding":
+            if tool_name == "codes_move_text_coding":
                 ctid = self._to_int(tool_args.get("ctid"), -1)
                 return _('Moving text coding #{ctid}...').format(ctid=ctid if ctid > 0 else "?")
-            if tool_name == "codes/delete_text_coding":
+            if tool_name == "codes_delete_text_coding":
                 ctid = self._to_int(tool_args.get("ctid"), -1)
                 return _('Deleting text coding #{ctid}...').format(ctid=ctid if ctid > 0 else "?")
-            if tool_name == "cases/create_case":
+            if tool_name == "cases_create_case":
                 case_name = " ".join(str(tool_args.get("name", "")).split()).strip()
                 if case_name == "":
                     case_name = _("(unnamed case)")
                 return _('Creating case "{name}"...').format(name=case_name)
-            if tool_name == "cases/update_case":
+            if tool_name == "cases_update_case":
                 caseid = self._to_int(tool_args.get("caseid"), -1)
                 case_name = self._fetch_case_name(caseid) if caseid > 0 else None
                 if case_name is None or str(case_name).strip() == "":
                     case_name = _("Case") + (f" #{caseid}" if caseid > 0 else "")
                 return _('Updating case "{name}"...').format(name=str(case_name))
-            if tool_name == "documents/update_document":
+            if tool_name == "documents_update_document":
                 fid = self._to_int(tool_args.get("fid"), -1)
                 file_name = self._fetch_source_name(fid) if fid > 0 else None
                 if file_name is None or str(file_name).strip() == "":
                     file_name = _("Document") + (f" #{fid}" if fid > 0 else "")
                 return _('Updating document "{name}"...').format(name=str(file_name))
-            if tool_name == "cases/link_text_to_case":
+            if tool_name == "cases_link_text_to_case":
                 caseid = self._to_int(tool_args.get("caseid"), -1)
                 fid = self._to_int(tool_args.get("fid"), -1)
                 case_name = self._fetch_case_name(caseid) if caseid > 0 else None
@@ -525,7 +658,7 @@ class AiMcpServer:
                     document=str(file_name),
                     case=str(case_name),
                 )
-            if tool_name == "cases/unlink_text_from_case":
+            if tool_name == "cases_unlink_text_from_case":
                 link_id = self._to_int(tool_args.get("id"), -1)
                 return _('Removing case-text link #{id}...').format(id=link_id if link_id > 0 else "?")
             return _('Executing tool "{name}"...').format(name=tool_name)
@@ -539,6 +672,8 @@ class AiMcpServer:
             return _('Reviewing the list of text documents...')
         if uri_base == "qualcoder://cases":
             return _('Reviewing the list of cases...')
+        if uri_base == "qualcoder://annotations":
+            return _('Reviewing text annotations...')
         if uri_base == "qualcoder://codes/tree":
             return _('Reviewing the current code structure...')
         if uri_base == "qualcoder://vector/search":
@@ -575,6 +710,9 @@ class AiMcpServer:
             if code_name is None or code_name == "":
                 code_name = f"Code {cid}"
             return _('Reviewing coded text segments for "{name}"...').format(name=code_name)
+        annotation_match = re.fullmatch(r"qualcoder://annotations/(\d+)", uri_base)
+        if annotation_match is not None:
+            return _('Reviewing annotation #{anid}...').format(anid=int(annotation_match.group(1)))
         file_match = re.fullmatch(r"qualcoder://documents/text/(\d+)", uri_base)
         if file_match is not None:
             file_id = int(file_match.group(1))
@@ -593,18 +731,41 @@ class AiMcpServer:
                 tools=types.ToolsCapability(listChanged=False),
                 prompts=types.PromptsCapability(listChanged=False),
             ),
-            serverInfo=types.Implementation(name=self.server_name, version=self.server_version),
+            serverInfo=types.Implementation(
+                name=self.server_name,
+                title=self.server_title,
+                version=self.server_version,
+            ),
             instructions=self._server_instructions(),
         )
-        return result.model_dump(mode="json", exclude_none=True)
+        return result.model_dump(mode="json", by_alias=True, exclude_none=True)
 
-    def _dispatch_sdk(self, req_type: type, req_obj: Any) -> Dict[str, Any]:
-        handler = self._sdk_server.request_handlers.get(req_type)
-        if handler is None:
-            raise RuntimeError(f"MCP handler not registered for {req_type.__name__}.")
-        server_result = asyncio.run(handler(req_obj))
+    @staticmethod
+    def _run_sync(coroutine: Awaitable[ResultT]) -> ResultT:
+        """Run an internal handler coroutine to completion, also when called from inside an event loop."""
+
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(coroutine)
+        # A handler called with no request context runs inline, so a helper thread is safe here
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            return pool.submit(copy_context().run, asyncio.run, coroutine).result()
+
+    def _dispatch_sdk(self, method: str, params: Any) -> Dict[str, Any]:
+        """Dispatch an internal bridge call through one SDK v2 handler."""
+
+        handler_entry = self._sdk_server.get_request_handler(method)
+        if handler_entry is None:
+            raise RuntimeError(f"MCP handler not registered for {method}.")
+        server_result = self._run_sync(handler_entry.handler(None, params))
         if hasattr(server_result, "model_dump"):
-            return server_result.model_dump(mode="json", exclude_none=True)
+            return server_result.model_dump(
+                mode="json",
+                by_alias=True,
+                exclude_none=True,
+                exclude_defaults=True,
+            )
         return dict(server_result)
 
     def _pagination_params(self, params: Dict[str, Any]) -> Optional[types.PaginatedRequestParams]:
@@ -681,14 +842,22 @@ class AiMcpServer:
         base_uri = urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query, doseq=True), parts.fragment))
         return base_uri, window
 
-    def _register_sdk_handlers(self) -> None:
-        @self._sdk_server.list_resources()
-        async def _list_resources(_: types.ListResourcesRequest) -> types.ListResourcesResult:
-            return types.ListResourcesResult(resources=self._base_resources())
+    async def _sdk_list_resources(
+            self, _context: ServerRequestContext[Any], _params: Optional[types.PaginatedRequestParams]
+    ) -> types.ListResourcesResult:
+        """Return the static resources through the SDK v2 low-level API."""
 
-        @self._sdk_server.list_resource_templates()
-        async def _list_resource_templates() -> List[types.ResourceTemplate]:
-            return [
+        return await self._run_sdk_operation(
+            _context, lambda: types.ListResourcesResult(resources=self._base_resources())
+        )
+
+    async def _sdk_list_resource_templates(
+            self, _context: ServerRequestContext[Any], _params: Optional[types.PaginatedRequestParams]
+    ) -> types.ListResourceTemplatesResult:
+        """Return resource templates through the SDK v2 low-level API."""
+
+        def build_result() -> types.ListResourceTemplatesResult:
+            return types.ListResourceTemplatesResult(resourceTemplates=[
                 types.ResourceTemplate(
                     uriTemplate="qualcoder://documents/text/{id}",
                     name="Document by id",
@@ -717,7 +886,19 @@ class AiMcpServer:
                     mimeType="application/json",
                 ),
                 types.ResourceTemplate(
-                    uriTemplate="qualcoder://codes/segments/{cid}",
+                    uriTemplate="qualcoder://annotations/{anid}{?owner}",
+                    name="Text annotation by id",
+                    description=(
+                        "Read one text annotation by annotation id. By default, coder visibility is respected. "
+                        "Supplying owner explicitly permits reading that owner's annotation even when hidden."
+                    ),
+                    mimeType="application/json",
+                ),
+                types.ResourceTemplate(
+                    uriTemplate=(
+                        "qualcoder://codes/segments/{cid}"
+                        "{?strategy,max_segments,max_chars,cursor,file_ids,case_ids,owner}"
+                    ),
                     name="Coded text segments by code id",
                     description=(
                         "Read coded text segments for a code id, including coding memo. Optional query params: strategy "
@@ -775,36 +956,88 @@ class AiMcpServer:
                     ),
                     mimeType="application/json",
                 ),
-            ]
+            ])
 
-        @self._sdk_server.read_resource()
-        async def _read_resource(uri: str) -> List[ReadResourceContents]:
-            uri_str = str(uri)
-            base_uri, window = self._parse_read_window(uri_str)
+        return await self._run_sdk_operation(_context, build_result)
+
+    async def _sdk_read_resource(
+            self, _context: ServerRequestContext[Any], params: types.ReadResourceRequestParams
+    ) -> types.ReadResourceResult:
+        """Read and sanitize one resource through the SDK v2 low-level API."""
+
+        def read_resource() -> types.ReadResourceResult:
+            self._require_open_project()
+            uri = str(params.uri)
+            base_uri, window = self._parse_read_window(uri)
             payload = self._read_resource_payload(base_uri, window)
             sanitized_payload = self._sanitize_memo_payload(payload)
-            return [
-                ReadResourceContents(
-                    content=json.dumps(sanitized_payload, ensure_ascii=False),
-                    mime_type="application/json",
-                )
-            ]
+            return types.ReadResourceResult(
+                contents=[
+                    types.TextResourceContents(
+                        uri=uri,
+                        text=json.dumps(sanitized_payload, ensure_ascii=False),
+                        mimeType="application/json",
+                    )
+                ]
+            )
 
-        @self._sdk_server.list_tools()
-        async def _list_tools(_: types.ListToolsRequest) -> types.ListToolsResult:
-            return types.ListToolsResult.model_validate(self._list_tools_payload())
+        return await self._run_sdk_operation(_context, read_resource)
 
-        @self._sdk_server.call_tool()
-        async def _call_tool(_name: str, _arguments: Dict[str, Any]) -> Dict[str, Any]:
-            return self._call_tool_payload(_name, _arguments, "")
+    async def _sdk_list_tools(
+            self, _context: ServerRequestContext[Any], _params: Optional[types.PaginatedRequestParams]
+    ) -> types.ListToolsResult:
+        """Return QualCoder tools through the SDK v2 low-level API."""
 
-        @self._sdk_server.list_prompts()
-        async def _list_prompts(_: types.ListPromptsRequest) -> types.ListPromptsResult:
-            return types.ListPromptsResult.model_validate(self._list_prompts_payload())
+        return await self._run_sdk_operation(
+            _context, lambda: types.ListToolsResult.model_validate(self._list_tools_payload())
+        )
 
-        @self._sdk_server.get_prompt()
-        async def _get_prompt(_name: str, _arguments: Optional[Dict[str, str]]) -> types.GetPromptResult:
-            return types.GetPromptResult.model_validate(self._get_prompt_payload(_name, _arguments))
+    async def _sdk_call_tool(
+            self, _context: ServerRequestContext[Any], params: types.CallToolRequestParams
+    ) -> types.CallToolResult:
+        """Call one QualCoder tool through the SDK v2 low-level API."""
+
+        def call_tool() -> types.CallToolResult:
+            self._require_open_project()
+            payload = self._call_tool_payload(params.name, params.arguments, "")
+            return types.CallToolResult.model_validate(payload)
+
+        try:
+            return await self._run_sdk_operation(_context, call_tool)
+        except EXPECTED_TOOL_ERRORS as err:
+            if _context is None:
+                raise
+            return types.CallToolResult.model_validate(
+                {"content": [{"type": "text", "text": str(err)}], "isError": True}
+            )
+
+    async def _sdk_list_prompts(
+            self, _context: ServerRequestContext[Any], _params: Optional[types.PaginatedRequestParams]
+    ) -> types.ListPromptsResult:
+        """Return the intentionally empty MCP prompt catalog."""
+
+        return await self._run_sdk_operation(
+            _context, lambda: types.ListPromptsResult(prompts=[])
+        )
+
+    async def _sdk_get_prompt(
+            self, _context: ServerRequestContext[Any], params: types.GetPromptRequestParams
+    ) -> types.GetPromptResult:
+        """Reject prompt reads because QualCoder currently defines no MCP prompts."""
+
+        def reject_prompt() -> types.GetPromptResult:
+            raise ValueError(f"Prompt not found: {params.name}")
+
+        return await self._run_sdk_operation(_context, reject_prompt)
+
+    def _require_open_project(self) -> None:
+        """Reject project operations when no current project is open."""
+
+        if getattr(self.app, "conn", None) is None or getattr(self.app, "project_path", "") == "":
+            raise ProjectNotOpenError(
+                "No QualCoder project is currently open. "
+                "Instruct the user to open or create a project in QualCoder, then retry this operation."
+            )
 
     def _read_resource_payload(self, uri: str, window: Dict[str, Any]) -> Dict[str, Any]:
         parts = urlsplit(uri)
@@ -817,6 +1050,9 @@ class AiMcpServer:
             return {"documents": self._fetch_text_documents()}
         if uri_no_query == "qualcoder://cases":
             return {"cases": self._fetch_cases()}
+        if uri_no_query == "qualcoder://annotations":
+            options = self._parse_annotation_options(query)
+            return self._read_annotations(options)
         if uri_no_query == "qualcoder://help/pages":
             return self.help_index.list_pages()
         if uri_no_query == "qualcoder://vector/search":
@@ -852,6 +1088,12 @@ class AiMcpServer:
             cid = int(code_segments_match.group(1))
             options = self._parse_code_segments_options(query)
             return self._read_code_segments(cid, options)
+
+        annotation_match = re.fullmatch(r"qualcoder://annotations/(\d+)", uri_no_query)
+        if annotation_match is not None:
+            anid = int(annotation_match.group(1))
+            owners = self._parse_string_list_options(query, ("owner", "owners"))
+            return self._read_annotation(anid, owners)
 
         file_match = re.fullmatch(r"qualcoder://documents/text/(\d+)", uri_no_query)
         if file_match is not None:
@@ -903,6 +1145,16 @@ class AiMcpServer:
                 mimeType="application/json",
             ),
             types.Resource(
+                uri="qualcoder://annotations",
+                name="Text annotations",
+                description=(
+                    "Paginated text annotations with source passages. Optional filters: file_ids, case_ids, "
+                    "owner, cursor, and page_size. By default, coder visibility is respected; an explicit owner "
+                    "filter reads that owner's annotations even when hidden."
+                ),
+                mimeType="application/json",
+            ),
+            types.Resource(
                 uri="qualcoder://vector/search",
                 name="Semantic vector search",
                 description="Semantic retrieval over embedded text chunks. Requires query param q. "
@@ -938,10 +1190,22 @@ class AiMcpServer:
         ]
 
     def _list_tools_payload(self) -> Dict[str, Any]:
-        return {
+        payload = {
             "tools": [
                 {
-                    "name": "codes/create_category",
+                    "name": "codes_get_tree",
+                    "description": (
+                        "Get the code hierarchy with visible text-coding counts and ancestor paths. "
+                        "Requires Read-only, Sandboxed, or Full access."
+                    ),
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": False,
+                    },
+                },
+                {
+                    "name": "codes_create_category",
                     "description": (
                         "Create a new code category. Use this only when explicitly needed by the user request."
                     ),
@@ -957,7 +1221,7 @@ class AiMcpServer:
                     },
                 },
                 {
-                    "name": "codes/create_code",
+                    "name": "codes_create_code",
                     "description": (
                         "Create a new code. Use catid to assign the code to a category, "
                         "supercid to nest it under another code, or null for top-level. "
@@ -981,7 +1245,7 @@ class AiMcpServer:
                     },
                 },
                 {
-                    "name": "codes/create_text_coding",
+                    "name": "codes_create_text_coding",
                     "description": (
                         "Create one text coding by code id and quoted text in a text document."
                     ),
@@ -998,7 +1262,52 @@ class AiMcpServer:
                     },
                 },
                 {
-                    "name": "codes/preview_delete_category",
+                    "name": "annotations_create",
+                    "description": (
+                        "Create one text annotation in a text-backed document. Provide either an exact quote that "
+                        "occurs exactly once, or explicit pos0 and pos1 character positions. If quote and positions "
+                        "are both provided, they must identify the same text."
+                    ),
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "fid": {"type": "integer"},
+                            "memo": {"type": "string"},
+                            "quote": {"type": "string"},
+                            "pos0": {"type": "integer"},
+                            "pos1": {"type": "integer"},
+                        },
+                        "required": ["fid", "memo"],
+                        "additionalProperties": False,
+                    },
+                },
+                {
+                    "name": "annotations_update",
+                    "description": "Update the public memo text for one annotation. Requires Full access.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "anid": {"type": "integer"},
+                            "memo": {"type": "string"},
+                        },
+                        "required": ["anid", "memo"],
+                        "additionalProperties": False,
+                    },
+                },
+                {
+                    "name": "annotations_delete",
+                    "description": "Delete one text annotation by annotation id. Requires Full access.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "anid": {"type": "integer"},
+                        },
+                        "required": ["anid"],
+                        "additionalProperties": False,
+                    },
+                },
+                {
+                    "name": "codes_preview_delete_category",
                     "description": (
                         "Preview the impact of deleting a category tree recursively. "
                         "Returns affected subtree counts, warnings, and a preview_token for execution."
@@ -1013,7 +1322,7 @@ class AiMcpServer:
                     },
                 },
                 {
-                    "name": "codes/preview_delete_code",
+                    "name": "codes_preview_delete_code",
                     "description": (
                         "Preview the impact of deleting a code subtree recursively, including descendant "
                         "subcodes and all codings that use any code in the subtree. Returns affected "
@@ -1029,7 +1338,7 @@ class AiMcpServer:
                     },
                 },
                 {
-                    "name": "codes/update_category",
+                    "name": "codes_update_category",
                     "description": "Rename an existing category and/or update its memo. Requires Full access.",
                     "inputSchema": {
                         "type": "object",
@@ -1043,7 +1352,7 @@ class AiMcpServer:
                     },
                 },
                 {
-                    "name": "codes/update_code",
+                    "name": "codes_update_code",
                     "description": "Rename an existing code and/or update its memo. Requires Full access.",
                     "inputSchema": {
                         "type": "object",
@@ -1057,7 +1366,7 @@ class AiMcpServer:
                     },
                 },
                 {
-                    "name": "codes/move_category",
+                    "name": "codes_move_category",
                     "description": (
                         "Move a category tree under another category or to top-level. "
                         "Requires Full access."
@@ -1073,7 +1382,7 @@ class AiMcpServer:
                     },
                 },
                 {
-                    "name": "codes/move_code",
+                    "name": "codes_move_code",
                     "description": (
                         "Move a code subtree under another code, under a category, or to top-level. "
                         "Requires Full access."
@@ -1090,10 +1399,10 @@ class AiMcpServer:
                     },
                 },
                 {
-                    "name": "codes/delete_category",
+                    "name": "codes_delete_category",
                     "description": (
                         "Delete a category tree recursively, including descendant categories, codes, and codings. "
-                        "Requires Full access and a preview_token from codes/preview_delete_category."
+                        "Requires Full access and a preview_token from codes_preview_delete_category."
                     ),
                     "inputSchema": {
                         "type": "object",
@@ -1106,11 +1415,11 @@ class AiMcpServer:
                     },
                 },
                 {
-                    "name": "codes/delete_code",
+                    "name": "codes_delete_code",
                     "description": (
                         "Delete a code subtree recursively, including descendant subcodes and all codings "
                         "that use any code in the subtree. "
-                        "Requires Full access and a preview_token from codes/preview_delete_code."
+                        "Requires Full access and a preview_token from codes_preview_delete_code."
                     ),
                     "inputSchema": {
                         "type": "object",
@@ -1123,7 +1432,7 @@ class AiMcpServer:
                     },
                 },
                 {
-                    "name": "codes/update_text_coding",
+                    "name": "codes_update_text_coding",
                     "description": "Update the memo for one text coding. Requires Full access.",
                     "inputSchema": {
                         "type": "object",
@@ -1136,7 +1445,7 @@ class AiMcpServer:
                     },
                 },
                 {
-                    "name": "codes/move_text_coding",
+                    "name": "codes_move_text_coding",
                     "description": "Move one text coding to a different code. Requires Full access.",
                     "inputSchema": {
                         "type": "object",
@@ -1149,7 +1458,7 @@ class AiMcpServer:
                     },
                 },
                 {
-                    "name": "codes/delete_text_coding",
+                    "name": "codes_delete_text_coding",
                     "description": "Delete one text coding. Requires Full access.",
                     "inputSchema": {
                         "type": "object",
@@ -1161,7 +1470,7 @@ class AiMcpServer:
                     },
                 },
                 {
-                    "name": "cases/create_case",
+                    "name": "cases_create_case",
                     "description": (
                         "Create a new case. Use this only when explicitly needed by the user request."
                     ),
@@ -1176,7 +1485,7 @@ class AiMcpServer:
                     },
                 },
                 {
-                    "name": "cases/link_text_to_case",
+                    "name": "cases_link_text_to_case",
                     "description": (
                         "Link one text passage or a whole text document to a case. "
                         "Supports either quote matching, explicit pos0/pos1, or full_document=true."
@@ -1197,7 +1506,7 @@ class AiMcpServer:
                     },
                 },
                 {
-                    "name": "cases/update_case",
+                    "name": "cases_update_case",
                     "description": "Rename a case and/or update its memo. Requires Full access.",
                     "inputSchema": {
                         "type": "object",
@@ -1211,7 +1520,7 @@ class AiMcpServer:
                     },
                 },
                 {
-                    "name": "cases/create_attribute",
+                    "name": "cases_create_attribute",
                     "description": (
                         "Create a new case attribute definition and placeholder values for all cases. "
                         "Requires Full access."
@@ -1227,7 +1536,7 @@ class AiMcpServer:
                     },
                 },
                 {
-                    "name": "cases/update_attributes",
+                    "name": "cases_update_attributes",
                     "description": (
                         "Update values for one or more existing attributes on a case. "
                         "Requires Full access."
@@ -1254,7 +1563,7 @@ class AiMcpServer:
                     },
                 },
                 {
-                    "name": "cases/unlink_text_from_case",
+                    "name": "cases_unlink_text_from_case",
                     "description": "Remove one text link from a case by link id. Requires Full access.",
                     "inputSchema": {
                         "type": "object",
@@ -1266,7 +1575,7 @@ class AiMcpServer:
                     },
                 },
                 {
-                    "name": "documents/create_attribute",
+                    "name": "documents_create_attribute",
                     "description": (
                         "Create a new document attribute definition and placeholder values for all project documents. "
                         "Requires Full access."
@@ -1282,7 +1591,7 @@ class AiMcpServer:
                     },
                 },
                 {
-                    "name": "documents/update_document",
+                    "name": "documents_update_document",
                     "description": "Update the memo of a text document. Requires Full access.",
                     "inputSchema": {
                         "type": "object",
@@ -1295,7 +1604,7 @@ class AiMcpServer:
                     },
                 },
                 {
-                    "name": "documents/update_attributes",
+                    "name": "documents_update_attributes",
                     "description": (
                         "Update values for one or more existing attributes on a text document. "
                         "Does not modify document text. Requires Full access."
@@ -1321,71 +1630,242 @@ class AiMcpServer:
                         "additionalProperties": False,
                     },
                 },
+                {
+                    "name": "qualcoder_list_resources",
+                    "title": "List QualCoder resources",
+                    "description": (
+                        "List the qualcoder:// URIs that expose the open project's data (documents, cases, codes, "
+                        "coded segments, annotations, searches, help pages). Read them with qualcoder_read_resource. "
+                        "Requires Read-only, Sandboxed, or Full access."
+                    ),
+                    "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+                    "annotations": {"readOnlyHint": True},
+                },
+                {
+                    "name": "qualcoder_read_resource",
+                    "title": "Read a QualCoder resource",
+                    "description": (
+                        "Read project data by qualcoder:// URI, for clients that do not read MCP resources directly. "
+                        "Filters and paging go in the query string, for example "
+                        "qualcoder://search/regex?pattern=word&file_ids=1. Call qualcoder_list_resources for the "
+                        "catalog. Requires Read-only, Sandboxed, or Full access."
+                    ),
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "uri": {"type": "string", "description": "A qualcoder:// URI, with optional query parameters."},
+                            "start": {"type": "integer", "description": "Optional character offset for long texts."},
+                            "length": {"type": "integer", "description": "Optional number of characters to return."},
+                        },
+                        "required": ["uri"],
+                        "additionalProperties": False,
+                    },
+                    "annotations": {"readOnlyHint": True},
+                },
             ]
         }
+        if self.request_source == "external_mcp":
+            payload["tools"].insert(
+                0,
+                {
+                    "name": "project_get_status",
+                    "description": (
+                        "Get the open QualCoder project's identity, public memo, active coder, "
+                        "permissions, and version information. External MCP only."
+                    ),
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": False,
+                    },
+                },
+            )
+        return payload
+
+    DATABASE_BUSY_WAIT_SECONDS = 8.0
 
     def _call_tool_payload(self, name: str, arguments: Optional[Dict[str, Any]], change_set_id: str) -> Dict[str, Any]:
+        """Run one tool, backing off and retrying while the project database is busy.
+
+        A write that waits inside SQLite keeps the write lock, and any GUI write during that wait fails at once
+        and leaves the GUI connection in an open transaction. Waiting between attempts holds no lock."""
+
+        deadline = time.monotonic() + self.DATABASE_BUSY_WAIT_SECONDS
+        flag = _fail_fast_database.set(True)
+        try:
+            while True:
+                preview_tokens = dict(self._preview_tokens)
+                try:
+                    return self._call_tool_payload_once(name, arguments, change_set_id)
+                except sqlite3.OperationalError as err:
+                    # Every write tool rolls back on failure, so a locked attempt changed nothing
+                    self._preview_tokens.update(preview_tokens)
+                    if "locked" not in str(err).lower():
+                        raise
+                    if time.monotonic() >= deadline:
+                        raise self._database_locked_error() from err
+                    time.sleep(0.2)
+        finally:
+            _fail_fast_database.reset(flag)
+
+    def _database_locked_error(self) -> ProjectDatabaseLockedError:
+        """Describe a persistent lock in terms of what the user can do about it."""
+
+        pending = bool(getattr(getattr(self.app, "conn", None), "in_transaction", False))
+        if pending:
+            reason = ("A QualCoder window has changes that are not saved to the project yet. "
+                      "Ask the user to finish or close that window in QualCoder.")
+        else:
+            reason = ("Another QualCoder window is still reading the project database. "
+                      "Ask the user to close open coding, report or graph windows.")
+        return ProjectDatabaseLockedError(
+            f"The project database stayed locked and nothing was written. {reason} "
+            "Do not retry until the user confirms.",
+            pending,
+        )
+
+    def _call_tool_payload_once(
+            self, name: str, arguments: Optional[Dict[str, Any]], change_set_id: str
+    ) -> Dict[str, Any]:
         if arguments is None:
             arguments = {}
         if not isinstance(arguments, dict):
             raise ValueError("Tool arguments must be an object.")
-        tool_name = str(name).strip()
+        # Clients configured before the rename may still send the slashed names
+        tool_name = str(name).strip().replace("/", "_")
         if tool_name == "":
             raise ValueError("Missing tool name.")
+        if tool_name == "project_get_status" and self.request_source != "external_mcp":
+            raise ValueError(f"Unknown tool name: {tool_name}")
+        if tool_name in ("project_get_status", "codes_get_tree") and len(arguments) > 0:
+            raise ValueError(f"Tool {tool_name} does not accept arguments.")
         required_permission = self._tool_required_permission(tool_name)
         if self._current_ai_permissions() < required_permission:
             return self._tool_permission_error(tool_name, required_permission)
 
-        if tool_name == "codes/create_category":
+        if tool_name == "project_get_status":
+            payload = self._tool_project_get_status()
+        elif tool_name == "codes_get_tree":
+            payload = {"tool": tool_name, **self._codes_tree()}
+        elif tool_name == "qualcoder_list_resources":
+            payload = {"tool": tool_name, **self._tool_list_resources()}
+        elif tool_name == "qualcoder_read_resource":
+            return self._tool_read_resource(arguments)
+        elif tool_name == "codes_create_category":
             payload = self._tool_create_category(arguments, change_set_id)
-        elif tool_name == "codes/create_code":
+        elif tool_name == "codes_create_code":
             payload = self._tool_create_code(arguments, change_set_id)
-        elif tool_name == "codes/create_text_coding":
+        elif tool_name == "codes_create_text_coding":
             payload = self._tool_create_text_coding(arguments, change_set_id)
-        elif tool_name == "codes/preview_delete_category":
+        elif tool_name == "annotations_create":
+            payload = self._tool_create_annotation(arguments, change_set_id)
+        elif tool_name == "annotations_update":
+            payload = self._tool_update_annotation(arguments, change_set_id)
+        elif tool_name == "annotations_delete":
+            payload = self._tool_delete_annotation(arguments, change_set_id)
+        elif tool_name == "codes_preview_delete_category":
             payload = self._tool_preview_delete_category(arguments)
-        elif tool_name == "codes/preview_delete_code":
+        elif tool_name == "codes_preview_delete_code":
             payload = self._tool_preview_delete_code(arguments)
-        elif tool_name == "codes/update_category":
+        elif tool_name == "codes_update_category":
             payload = self._tool_update_category(arguments, change_set_id)
-        elif tool_name == "codes/update_code":
+        elif tool_name == "codes_update_code":
             payload = self._tool_update_code(arguments, change_set_id)
-        elif tool_name == "codes/update_text_coding":
+        elif tool_name == "codes_update_text_coding":
             payload = self._tool_update_text_coding(arguments, change_set_id)
-        elif tool_name == "codes/move_category":
+        elif tool_name == "codes_move_category":
             payload = self._tool_move_category(arguments, change_set_id)
-        elif tool_name == "codes/move_code":
+        elif tool_name == "codes_move_code":
             payload = self._tool_move_code(arguments, change_set_id)
-        elif tool_name == "codes/delete_category":
+        elif tool_name == "codes_delete_category":
             payload = self._tool_delete_category(arguments, change_set_id)
-        elif tool_name == "codes/delete_code":
+        elif tool_name == "codes_delete_code":
             payload = self._tool_delete_code(arguments, change_set_id)
-        elif tool_name == "codes/move_text_coding":
+        elif tool_name == "codes_move_text_coding":
             payload = self._tool_move_text_coding(arguments, change_set_id)
-        elif tool_name == "codes/delete_text_coding":
+        elif tool_name == "codes_delete_text_coding":
             payload = self._tool_delete_text_coding(arguments, change_set_id)
-        elif tool_name == "cases/create_case":
+        elif tool_name == "cases_create_case":
             payload = self._tool_create_case(arguments, change_set_id)
-        elif tool_name == "cases/link_text_to_case":
+        elif tool_name == "cases_link_text_to_case":
             payload = self._tool_link_text_to_case(arguments, change_set_id)
-        elif tool_name == "cases/update_case":
+        elif tool_name == "cases_update_case":
             payload = self._tool_update_case(arguments, change_set_id)
-        elif tool_name == "cases/create_attribute":
+        elif tool_name == "cases_create_attribute":
             payload = self._tool_create_attribute("case", arguments, change_set_id)
-        elif tool_name == "cases/update_attributes":
+        elif tool_name == "cases_update_attributes":
             payload = self._tool_update_attributes("case", arguments, change_set_id)
-        elif tool_name == "cases/unlink_text_from_case":
+        elif tool_name == "cases_unlink_text_from_case":
             payload = self._tool_unlink_text_from_case(arguments, change_set_id)
-        elif tool_name == "documents/create_attribute":
+        elif tool_name == "documents_create_attribute":
             payload = self._tool_create_attribute("file", arguments, change_set_id)
-        elif tool_name == "documents/update_document":
+        elif tool_name == "documents_update_document":
             payload = self._tool_update_document(arguments, change_set_id)
-        elif tool_name == "documents/update_attributes":
+        elif tool_name == "documents_update_attributes":
             payload = self._tool_update_attributes("file", arguments, change_set_id)
         else:
             raise ValueError(f"Unknown tool name: {tool_name}")
 
         return self._tool_result_payload(payload)
+
+    def _tool_list_resources(self) -> Dict[str, Any]:
+        """Return the resource catalog for clients that only use tools."""
+
+        resources = self._dispatch_sdk("resources/list", None)
+        templates = self._dispatch_sdk("resources/templates/list", None)
+        return {
+            "resources": resources.get("resources", []),
+            "resourceTemplates": templates.get("resourceTemplates", []),
+        }
+
+    def _tool_read_resource(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Read one qualcoder:// resource as a tool result, text content only."""
+
+        uri = arguments.get("uri")
+        if not isinstance(uri, str) or uri.strip() == "":
+            raise ValueError("Missing resource uri.")
+        uri_with_window = self._with_read_window(
+            uri.strip(), arguments.get("start"), arguments.get("length"),
+            arguments.get("line_start"), arguments.get("line_end"),
+        )
+        result = self._dispatch_sdk("resources/read", types.ReadResourceRequestParams(uri=uri_with_window))
+        content = []
+        for item in result.get("contents", []):
+            text = item.get("text")
+            if not isinstance(text, str):
+                text = f"[binary content, {item.get('mimeType', 'unknown type')}]"
+            content.append({"type": "text", "text": text})
+        if not content:
+            content.append({"type": "text", "text": "(empty)"})
+        return {"isError": False, "content": content}
+
+    def _tool_project_get_status(self) -> Dict[str, Any]:
+        """Return current project context for an external MCP client."""
+
+        project_row = self._fetchone(
+            "SELECT databaseversion, ifnull(memo,'') FROM project LIMIT 1"
+        )
+        if project_row is None:
+            raise RuntimeError("The open project has no project metadata.")
+        project_name = str(getattr(self.app, "project_name", "")).strip()
+        if project_name.lower().endswith(".qda"):
+            project_name = project_name[:-4]
+        permission_names = {
+            self.AI_PERMISSION_READ_ONLY: "read_only",
+            self.AI_PERMISSION_SANDBOXED: "sandboxed",
+            self.AI_PERMISSION_FULL_ACCESS: "full_access",
+        }
+        permission_level = self._current_ai_permissions()
+        return {
+            "tool": "project_get_status",
+            "project_name": project_name,
+            "project_memo": self._memo_public_text(project_row[1]),
+            "active_coder": str(self.app.settings.get("codername", "")),
+            "ai_permission_level": permission_names[permission_level],
+            "database_version": str(project_row[0] if project_row[0] is not None else ""),
+            "qualcoder_version": str(getattr(self.app, "version", "")),
+            "mcp_server_version": self.server_version,
+        }
 
     def _tool_create_category(self, arguments: Dict[str, Any], change_set_id: str) -> Dict[str, Any]:
         name = " ".join(str(arguments.get("name", "")).split()).strip()
@@ -1414,7 +1894,7 @@ class AiMcpServer:
             ).fetchone()
             if existing is not None:
                 return {
-                    "tool": "codes/create_category",
+                    "tool": "codes_create_category",
                     "created": False,
                     "reason": "already_exists",
                     "category": {
@@ -1428,7 +1908,7 @@ class AiMcpServer:
 
             cur.execute(
                 "INSERT INTO code_cat (name, memo, owner, date, supercatid) VALUES (?, ?, ?, ?, ?)",
-                (name, memo, self.AI_AGENT_OWNER, now, supercatid),
+                (name, memo, self.request_owner, now, supercatid),
             )
             catid = int(cur.lastrowid)
             conn.commit()
@@ -1443,19 +1923,19 @@ class AiMcpServer:
                     "name": name,
                     "memo": memo,
                     "supercatid": supercatid,
-                    "owner": self.AI_AGENT_OWNER,
+                    "owner": self.request_owner,
                     "created_at": now,
                 },
             )
             self._emit_project_table_changes(["code_cat"])
             return {
-                "tool": "codes/create_category",
+                "tool": "codes_create_category",
                 "created": True,
                 "category": {
                     "catid": catid,
                     "name": name,
                     "memo": memo,
-                    "owner": self.AI_AGENT_OWNER,
+                    "owner": self.request_owner,
                     "date": now,
                     "supercatid": supercatid,
                 },
@@ -1505,7 +1985,7 @@ class AiMcpServer:
             ).fetchone()
             if existing is not None:
                 return {
-                    "tool": "codes/create_code",
+                    "tool": "codes_create_code",
                     "created": False,
                     "reason": "already_exists",
                     "code": {
@@ -1522,7 +2002,7 @@ class AiMcpServer:
             cur.execute(
                 "INSERT INTO code_name (name, memo, catid, owner, date, color, supercid) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (name, memo, catid, self.AI_AGENT_OWNER, now, color, supercid),
+                (name, memo, catid, self.request_owner, now, color, supercid),
             )
             cid = int(cur.lastrowid)
             conn.commit()
@@ -1539,13 +2019,13 @@ class AiMcpServer:
                     "catid": catid,
                     "supercid": supercid,
                     "color": color,
-                    "owner": self.AI_AGENT_OWNER,
+                    "owner": self.request_owner,
                     "created_at": now,
                 },
             )
             self._emit_project_table_changes(["code_name"])
             return {
-                "tool": "codes/create_code",
+                "tool": "codes_create_code",
                 "created": True,
                 "code": {
                     "cid": cid,
@@ -1554,7 +2034,7 @@ class AiMcpServer:
                     "catid": catid,
                     "supercid": supercid,
                     "color": color,
-                    "owner": self.AI_AGENT_OWNER,
+                    "owner": self.request_owner,
                     "date": now,
                 },
             }
@@ -1596,16 +2076,16 @@ class AiMcpServer:
 
             pos0, pos1 = self._quote_search(quote, fulltext)
             if pos0 < 0 or pos1 <= pos0:
-                raise ValueError("quote could not be matched in the document text.")
+                raise ValueError(self._quote_not_matched_message(fid))
             seltext = fulltext[pos0:pos1]
 
             existing = cur.execute(
                 "SELECT ctid FROM code_text WHERE cid=? AND fid=? AND pos0=? AND pos1=? AND owner=?",
-                (cid, fid, pos0, pos1, self.AI_AGENT_OWNER),
+                (cid, fid, pos0, pos1, self.request_owner),
             ).fetchone()
             if existing is not None:
                 return {
-                    "tool": "codes/create_text_coding",
+                    "tool": "codes_create_text_coding",
                     "created": False,
                     "reason": "already_exists",
                     "coding": {
@@ -1614,13 +2094,13 @@ class AiMcpServer:
                         "fid": fid,
                         "pos0": pos0,
                         "pos1": pos1,
-                        "owner": self.AI_AGENT_OWNER,
+                        "owner": self.request_owner,
                     },
                 }
 
             cur.execute(
                 "INSERT INTO code_text (cid, fid, seltext, pos0, pos1, owner, date, memo) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (cid, fid, seltext, pos0, pos1, self.AI_AGENT_OWNER, now, memo),
+                (cid, fid, seltext, pos0, pos1, self.request_owner, now, memo),
             )
             ctid = int(cur.lastrowid)
             conn.commit()
@@ -1639,14 +2119,14 @@ class AiMcpServer:
                     "pos0": pos0,
                     "pos1": pos1,
                     "seltext": seltext,
-                    "owner": self.AI_AGENT_OWNER,
+                    "owner": self.request_owner,
                     "memo": memo,
                     "created_at": now,
                 },
             )
             self._emit_project_table_changes(["code_text"])
             return {
-                "tool": "codes/create_text_coding",
+                "tool": "codes_create_text_coding",
                 "created": True,
                 "coding": {
                     "ctid": ctid,
@@ -1656,8 +2136,246 @@ class AiMcpServer:
                     "pos1": pos1,
                     "quote": seltext,
                     "memo": memo,
-                    "owner": self.AI_AGENT_OWNER,
+                    "owner": self.request_owner,
                     "date": now,
+                },
+            }
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def _tool_create_annotation(self, arguments: Dict[str, Any], change_set_id: str) -> Dict[str, Any]:
+        """Create one annotation over an unambiguous text span."""
+
+        fid = self._to_int(arguments.get("fid"), -1)
+        memo = self._memo_update_text(arguments.get("memo", ""))
+        quote_value = arguments.get("quote", None)
+        quote = "" if quote_value is None else str(quote_value)
+        has_pos0 = "pos0" in arguments
+        has_pos1 = "pos1" in arguments
+
+        if fid <= 0:
+            raise ValueError("fid must be a positive integer.")
+        if memo.strip() == "":
+            raise ValueError("Annotation memo must not be empty.")
+        if has_pos0 != has_pos1:
+            raise ValueError("Provide both pos0 and pos1, or neither.")
+        if not has_pos0 and quote.strip() == "":
+            raise ValueError("Provide an exact quote or explicit pos0 and pos1 character positions.")
+
+        conn = self._connect()
+        try:
+            cur = conn.cursor()
+            source_row = cur.execute(
+                "SELECT id, name, ifnull(fulltext,'') FROM source WHERE id=? AND fulltext IS NOT NULL",
+                (fid,),
+            ).fetchone()
+            if source_row is None:
+                raise ValueError(f"Text document id {fid} not found.")
+            fulltext = str(source_row[2])
+
+            if has_pos0:
+                pos0 = self._to_int(arguments.get("pos0"), -1)
+                pos1 = self._to_int(arguments.get("pos1"), -1)
+                if pos0 < 0 or pos1 <= pos0:
+                    raise ValueError("Annotation positions must satisfy 0 <= pos0 < pos1.")
+                if pos1 > len(fulltext):
+                    raise ValueError("pos1 exceeds the document length.")
+                excerpt = fulltext[pos0:pos1]
+                if quote != "" and excerpt != quote:
+                    raise ValueError("The supplied quote does not match the text at pos0 and pos1.")
+            else:
+                positions = self._exact_quote_positions(quote, fulltext)
+                if len(positions) == 0:
+                    raise ValueError(
+                        f"Quote was not found exactly in document {fid}. Provide pos0 and pos1 character positions."
+                    )
+                if len(positions) > 1:
+                    raise ValueError(
+                        f"Quote occurs {len(positions)} times in document {fid} and is ambiguous. "
+                        "Provide pos0 and pos1 character positions."
+                    )
+                pos0 = positions[0]
+                pos1 = pos0 + len(quote)
+                excerpt = quote
+
+            existing = cur.execute(
+                "SELECT anid, ifnull(memo,''), date FROM annotation "
+                "WHERE fid=? AND pos0=? AND pos1=? AND owner=?",
+                (fid, pos0, pos1, self.request_owner),
+            ).fetchone()
+            if existing is not None:
+                return {
+                    "tool": "annotations_create",
+                    "created": False,
+                    "reason": "already_exists",
+                    "annotation": {
+                        "anid": int(existing[0]),
+                        "fid": fid,
+                        "source_name": str(source_row[1] if source_row[1] is not None else ""),
+                        "pos0": pos0,
+                        "pos1": pos1,
+                        "quote": excerpt,
+                        "memo": str(existing[1] if existing[1] is not None else ""),
+                        "owner": self.request_owner,
+                        "date": str(existing[2] if existing[2] is not None else ""),
+                    },
+                }
+
+            now = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
+            cur.execute(
+                "INSERT INTO annotation (fid, pos0, pos1, memo, owner, date) VALUES (?, ?, ?, ?, ?, ?)",
+                (fid, pos0, pos1, memo, self.request_owner, now),
+            )
+            anid = int(cur.lastrowid)
+            conn.commit()
+            if hasattr(self.app, "delete_backup"):
+                self.app.delete_backup = False
+            self._record_ai_change(
+                change_set_id,
+                {
+                    "type": "create_annotation",
+                    "anid": anid,
+                    "fid": fid,
+                    "source_name": str(source_row[1] if source_row[1] is not None else ""),
+                    "pos0": pos0,
+                    "pos1": pos1,
+                    "memo": memo,
+                    "owner": self.request_owner,
+                    "created_at": now,
+                },
+            )
+            self._emit_project_table_changes(["annotation"])
+            return {
+                "tool": "annotations_create",
+                "created": True,
+                "annotation": {
+                    "anid": anid,
+                    "fid": fid,
+                    "source_name": str(source_row[1] if source_row[1] is not None else ""),
+                    "pos0": pos0,
+                    "pos1": pos1,
+                    "quote": excerpt,
+                    "memo": memo,
+                    "owner": self.request_owner,
+                    "date": now,
+                },
+            }
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def _tool_update_annotation(self, arguments: Dict[str, Any], change_set_id: str) -> Dict[str, Any]:
+        """Update the public memo text of one annotation."""
+
+        anid = self._to_int(arguments.get("anid"), -1)
+        if anid <= 0:
+            raise ValueError("anid must be a positive integer.")
+        if "memo" not in arguments:
+            raise ValueError("Provide the memo field to update.")
+        public_memo = self._memo_update_text(arguments.get("memo", ""))
+        if public_memo.strip() == "":
+            raise ValueError("Annotation memo must not be empty. Use annotations_delete to remove the annotation.")
+
+        conn = self._connect()
+        try:
+            cur = conn.cursor()
+            annotation = self._fetch_annotation_row_cur(cur, anid)
+            if annotation is None:
+                raise ValueError(f"Annotation id {anid} not found.")
+            old_memo = str(annotation.get("memo", ""))
+            new_memo = self._merge_public_memo(old_memo, public_memo)
+            if new_memo == old_memo:
+                return {
+                    "tool": "annotations_update",
+                    "updated": False,
+                    "reason": "no_changes",
+                    "annotation": {"anid": anid, "fid": int(annotation.get("fid", -1))},
+                }
+
+            now = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
+            cur.execute("UPDATE annotation SET memo=?, date=? WHERE anid=?", (new_memo, now, anid))
+            conn.commit()
+            if hasattr(self.app, "delete_backup"):
+                self.app.delete_backup = False
+            self._record_ai_change(
+                change_set_id,
+                {
+                    "type": "update_annotation",
+                    "anid": anid,
+                    "fid": int(annotation.get("fid", -1)),
+                    "before": {
+                        "memo": old_memo,
+                        "date": str(annotation.get("date", "")),
+                        "owner": str(annotation.get("owner", "")),
+                    },
+                    "after": {
+                        "memo": new_memo,
+                        "date": now,
+                        "owner": str(annotation.get("owner", "")),
+                    },
+                },
+            )
+            self._emit_project_table_changes(["annotation"])
+            return {
+                "tool": "annotations_update",
+                "updated": True,
+                "annotation": {
+                    "anid": anid,
+                    "fid": int(annotation.get("fid", -1)),
+                    "pos0": int(annotation.get("pos0", -1)),
+                    "pos1": int(annotation.get("pos1", -1)),
+                    "memo": new_memo,
+                    "owner": str(annotation.get("owner", "")),
+                    "date": now,
+                },
+            }
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def _tool_delete_annotation(self, arguments: Dict[str, Any], change_set_id: str) -> Dict[str, Any]:
+        """Delete one annotation and record a restorable snapshot."""
+
+        anid = self._to_int(arguments.get("anid"), -1)
+        if anid <= 0:
+            raise ValueError("anid must be a positive integer.")
+
+        conn = self._connect()
+        try:
+            cur = conn.cursor()
+            annotation = self._fetch_annotation_row_cur(cur, anid)
+            if annotation is None:
+                raise ValueError(f"Annotation id {anid} not found.")
+            snapshot = {"tables": {"annotation": [dict(annotation)]}}
+            cur.execute("DELETE FROM annotation WHERE anid=?", (anid,))
+            conn.commit()
+            if hasattr(self.app, "delete_backup"):
+                self.app.delete_backup = False
+            self._record_ai_change(
+                change_set_id,
+                {
+                    "type": "delete_annotation",
+                    "anid": anid,
+                    "snapshot": snapshot,
+                },
+            )
+            self._emit_project_table_changes(["annotation"])
+            return {
+                "tool": "annotations_delete",
+                "deleted": True,
+                "annotation": {
+                    "anid": anid,
+                    "fid": int(annotation.get("fid", -1)),
+                    "pos0": int(annotation.get("pos0", -1)),
+                    "pos1": int(annotation.get("pos1", -1)),
+                    "owner": str(annotation.get("owner", "")),
                 },
             }
         except Exception:
@@ -1676,8 +2394,8 @@ class AiMcpServer:
                 raise ValueError(f"Category id {catid} not found.")
             subtree = self._collect_category_subtree(cur, catid)
             impact = self._build_category_tree_impact(cur, subtree)
-            signature = {"tool": "codes/delete_category", "catid": catid}
-            preview_token = self._issue_preview_token("codes/delete_category", signature)
+            signature = {"tool": "codes_delete_category", "catid": catid}
+            preview_token = self._issue_preview_token("codes_delete_category", signature)
             warnings = [
                 _("Deleting this category removes the full subtree, including descendant categories, codes, and codings.")
             ]
@@ -1687,8 +2405,8 @@ class AiMcpServer:
                     _("Warning: {count} affected coding(s) are not owned by 'AI Agent'.").format(count=non_ai)
                 )
             return {
-                "tool": "codes/preview_delete_category",
-                "execute_tool": "codes/delete_category",
+                "tool": "codes_preview_delete_category",
+                "execute_tool": "codes_delete_category",
                 "preview_token": preview_token,
                 "requires_confirmation": True,
                 "risk_level": "high",
@@ -1708,8 +2426,8 @@ class AiMcpServer:
             if code is None:
                 raise ValueError(f"Code id {cid} not found.")
             impact = self._build_code_impact(cur, code)
-            signature = {"tool": "codes/delete_code", "cid": cid}
-            preview_token = self._issue_preview_token("codes/delete_code", signature)
+            signature = {"tool": "codes_delete_code", "cid": cid}
+            preview_token = self._issue_preview_token("codes_delete_code", signature)
             warnings = [
                 _("Deleting this code removes the full subcode tree, including descendant subcodes and all codings that use any code in the subtree.")
             ]
@@ -1719,8 +2437,8 @@ class AiMcpServer:
                     _("Warning: {count} affected coding(s) are not owned by 'AI Agent'.").format(count=non_ai)
                 )
             return {
-                "tool": "codes/preview_delete_code",
-                "execute_tool": "codes/delete_code",
+                "tool": "codes_preview_delete_code",
+                "execute_tool": "codes_delete_code",
                 "preview_token": preview_token,
                 "requires_confirmation": True,
                 "risk_level": "high",
@@ -1768,7 +2486,7 @@ class AiMcpServer:
                     raise ValueError(f'Another category already uses the name "{new_name}".')
             if new_name == old_name and new_memo == old_memo:
                 return {
-                    "tool": "codes/update_category",
+                    "tool": "codes_update_category",
                     "updated": False,
                     "reason": "no_changes",
                     "category": self._category_ref(category),
@@ -1797,7 +2515,7 @@ class AiMcpServer:
             )
             self._emit_project_table_changes(["code_cat"])
             return {
-                "tool": "codes/update_category",
+                "tool": "codes_update_category",
                 "updated": True,
                 "category": {
                     "catid": catid,
@@ -1842,7 +2560,7 @@ class AiMcpServer:
                     raise ValueError(f'Another code already uses the name "{new_name}".')
             if new_name == old_name and new_memo == old_memo:
                 return {
-                    "tool": "codes/update_code",
+                    "tool": "codes_update_code",
                     "updated": False,
                     "reason": "no_changes",
                     "code": self._code_ref(code),
@@ -1871,7 +2589,7 @@ class AiMcpServer:
             )
             self._emit_project_table_changes(["code_name"])
             return {
-                "tool": "codes/update_code",
+                "tool": "codes_update_code",
                 "updated": True,
                 "code": {
                     "cid": cid,
@@ -1903,7 +2621,7 @@ class AiMcpServer:
             new_memo = self._merge_public_memo(old_memo, arguments.get("memo", ""))
             if new_memo == old_memo:
                 return {
-                    "tool": "codes/update_text_coding",
+                    "tool": "codes_update_text_coding",
                     "updated": False,
                     "reason": "no_changes",
                     "coding": {
@@ -1937,7 +2655,7 @@ class AiMcpServer:
             )
             self._emit_project_table_changes(["code_text"])
             return {
-                "tool": "codes/update_text_coding",
+                "tool": "codes_update_text_coding",
                 "updated": True,
                 "coding": {
                     "ctid": ctid,
@@ -1976,7 +2694,7 @@ class AiMcpServer:
             old_supercatid = category.get("supercatid", None)
             if old_supercatid == new_supercatid:
                 return {
-                    "tool": "codes/move_category",
+                    "tool": "codes_move_category",
                     "moved": False,
                     "reason": "unchanged",
                     "category": self._category_ref(category),
@@ -1999,7 +2717,7 @@ class AiMcpServer:
             )
             self._emit_project_table_changes(["code_cat"])
             return {
-                "tool": "codes/move_category",
+                "tool": "codes_move_category",
                 "moved": True,
                 "category": self._category_ref(category),
                 "old_supercatid": old_supercatid,
@@ -2046,7 +2764,7 @@ class AiMcpServer:
             old_supercid = code.get("supercid", None)
             if old_catid == new_catid and old_supercid == new_supercid:
                 return {
-                    "tool": "codes/move_code",
+                    "tool": "codes_move_code",
                     "moved": False,
                     "reason": "unchanged",
                     "code": self._code_ref(code),
@@ -2072,7 +2790,7 @@ class AiMcpServer:
             )
             self._emit_project_table_changes(["code_name"])
             return {
-                "tool": "codes/move_code",
+                "tool": "codes_move_code",
                 "moved": True,
                 "code": self._code_ref(moved_code),
                 "old_catid": old_catid,
@@ -2089,8 +2807,8 @@ class AiMcpServer:
 
     def _tool_delete_category(self, arguments: Dict[str, Any], change_set_id: str) -> Dict[str, Any]:
         catid = self._to_int(arguments.get("catid"), -1)
-        signature = {"tool": "codes/delete_category", "catid": catid}
-        self._consume_preview_token("codes/delete_category", signature, arguments.get("preview_token", ""))
+        signature = {"tool": "codes_delete_category", "catid": catid}
+        self._consume_preview_token("codes_delete_category", signature, arguments.get("preview_token", ""))
 
         conn = self._connect()
         try:
@@ -2129,7 +2847,7 @@ class AiMcpServer:
             )
             self._emit_project_table_changes(self._snapshot_changed_table_names(snapshot))
             return {
-                "tool": "codes/delete_category",
+                "tool": "codes_delete_category",
                 "deleted": True,
                 "category": self._category_ref(category),
                 "impact": impact,
@@ -2142,8 +2860,8 @@ class AiMcpServer:
 
     def _tool_delete_code(self, arguments: Dict[str, Any], change_set_id: str) -> Dict[str, Any]:
         cid = self._to_int(arguments.get("cid"), -1)
-        signature = {"tool": "codes/delete_code", "cid": cid}
-        self._consume_preview_token("codes/delete_code", signature, arguments.get("preview_token", ""))
+        signature = {"tool": "codes_delete_code", "cid": cid}
+        self._consume_preview_token("codes_delete_code", signature, arguments.get("preview_token", ""))
 
         conn = self._connect()
         try:
@@ -2179,7 +2897,7 @@ class AiMcpServer:
             )
             self._emit_project_table_changes(self._snapshot_changed_table_names(snapshot))
             return {
-                "tool": "codes/delete_code",
+                "tool": "codes_delete_code",
                 "deleted": True,
                 "code": self._code_ref(code),
                 "impact": impact,
@@ -2209,7 +2927,7 @@ class AiMcpServer:
                 raise ValueError(f"Target code id {new_cid} not found.")
             if old_cid == new_cid:
                 return {
-                    "tool": "codes/move_text_coding",
+                    "tool": "codes_move_text_coding",
                     "moved": False,
                     "reason": "unchanged",
                     "coding": {"ctid": ctid, "cid": old_cid},
@@ -2230,7 +2948,7 @@ class AiMcpServer:
             )
             self._emit_project_table_changes(["code_text"])
             return {
-                "tool": "codes/move_text_coding",
+                "tool": "codes_move_text_coding",
                 "moved": True,
                 "coding": {"ctid": ctid, "old_cid": old_cid, "new_cid": new_cid},
             }
@@ -2266,7 +2984,7 @@ class AiMcpServer:
             )
             self._emit_project_table_changes(["code_text"])
             return {
-                "tool": "codes/delete_text_coding",
+                "tool": "codes_delete_text_coding",
                 "deleted": True,
                 "coding": {
                     "ctid": ctid,
@@ -2296,7 +3014,7 @@ class AiMcpServer:
             ).fetchone()
             if existing is not None:
                 return {
-                    "tool": "cases/create_case",
+                    "tool": "cases_create_case",
                     "created": False,
                     "reason": "already_exists",
                     "case": {
@@ -2309,7 +3027,7 @@ class AiMcpServer:
 
             cur.execute(
                 "INSERT INTO cases (name, memo, owner, date) VALUES (?, ?, ?, ?)",
-                (name, memo, self.AI_AGENT_OWNER, now),
+                (name, memo, self.request_owner, now),
             )
             caseid = int(cur.lastrowid)
             conn.commit()
@@ -2322,19 +3040,19 @@ class AiMcpServer:
                     "caseid": caseid,
                     "name": name,
                     "memo": memo,
-                    "owner": self.AI_AGENT_OWNER,
+                    "owner": self.request_owner,
                     "created_at": now,
                 },
             )
             self._emit_project_table_changes(["cases"])
             return {
-                "tool": "cases/create_case",
+                "tool": "cases_create_case",
                 "created": True,
                 "case": {
                     "caseid": caseid,
                     "name": name,
                     "memo": memo,
-                    "owner": self.AI_AGENT_OWNER,
+                    "owner": self.request_owner,
                     "date": now,
                 },
             }
@@ -2395,7 +3113,7 @@ class AiMcpServer:
             ).fetchone()
             if existing is not None:
                 return {
-                    "tool": "cases/link_text_to_case",
+                    "tool": "cases_link_text_to_case",
                     "created": False,
                     "reason": "already_exists",
                     "link": {
@@ -2411,7 +3129,7 @@ class AiMcpServer:
 
             cur.execute(
                 "INSERT INTO case_text (caseid, fid, pos0, pos1, owner, date, memo) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (caseid, fid, pos0, pos1, self.AI_AGENT_OWNER, now, memo),
+                (caseid, fid, pos0, pos1, self.request_owner, now, memo),
             )
             link_id = int(cur.lastrowid)
             conn.commit()
@@ -2428,14 +3146,14 @@ class AiMcpServer:
                     "source_name": str(source_row[1] if source_row[1] is not None else ""),
                     "pos0": pos0,
                     "pos1": pos1,
-                    "owner": self.AI_AGENT_OWNER,
+                    "owner": self.request_owner,
                     "memo": memo,
                     "created_at": now,
                 },
             )
             self._emit_project_table_changes(["case_text"])
             return {
-                "tool": "cases/link_text_to_case",
+                "tool": "cases_link_text_to_case",
                 "created": True,
                 "link": {
                     "id": link_id,
@@ -2446,7 +3164,7 @@ class AiMcpServer:
                     "pos0": pos0,
                     "pos1": pos1,
                     "text": excerpt,
-                    "owner": self.AI_AGENT_OWNER,
+                    "owner": self.request_owner,
                     "date": now,
                     "memo": memo,
                 },
@@ -2488,7 +3206,7 @@ class AiMcpServer:
                     raise ValueError(f'Case name "{new_name}" already exists.')
             if new_name == old_name and new_memo == old_memo:
                 return {
-                    "tool": "cases/update_case",
+                    "tool": "cases_update_case",
                     "updated": False,
                     "reason": "no_changes",
                     "case": {
@@ -2527,7 +3245,7 @@ class AiMcpServer:
             )
             self._emit_project_table_changes(["cases"])
             return {
-                "tool": "cases/update_case",
+                "tool": "cases_update_case",
                 "updated": True,
                 "case": {
                     "caseid": caseid,
@@ -2561,7 +3279,7 @@ class AiMcpServer:
             new_memo = self._merge_public_memo(old_memo, arguments.get("memo", ""))
             if new_memo == old_memo:
                 return {
-                    "tool": "documents/update_document",
+                    "tool": "documents_update_document",
                     "updated": False,
                     "reason": "no_changes",
                     "document": {
@@ -2596,7 +3314,7 @@ class AiMcpServer:
             )
             self._emit_project_table_changes(["source"])
             return {
-                "tool": "documents/update_document",
+                "tool": "documents_update_document",
                 "updated": True,
                 "document": {
                     "fid": fid,
@@ -2637,7 +3355,7 @@ class AiMcpServer:
             )
             self._emit_project_table_changes(["case_text"])
             return {
-                "tool": "cases/unlink_text_from_case",
+                "tool": "cases_unlink_text_from_case",
                 "deleted": True,
                 "link": {
                     "id": link_id,
@@ -2653,7 +3371,7 @@ class AiMcpServer:
 
     def _tool_create_attribute(self, target_type: str, arguments: Dict[str, Any], change_set_id: str) -> Dict[str, Any]:
         normalized_target_type = self._normalize_attribute_target_type(target_type)
-        tool_name = "cases/create_attribute" if normalized_target_type == "case" else "documents/create_attribute"
+        tool_name = "cases_create_attribute" if normalized_target_type == "case" else "documents_create_attribute"
         attribute_name = self._normalize_attribute_name(arguments.get("name", ""))
         if attribute_name == "":
             raise ValueError("Attribute name must not be empty.")
@@ -2682,11 +3400,11 @@ class AiMcpServer:
 
             cur.execute(
                 "INSERT INTO attribute_type (name, date, owner, memo, caseOrFile, valuetype) VALUES (?, ?, ?, ?, ?, ?)",
-                (attribute_name, now, self.AI_AGENT_OWNER, "", normalized_target_type, value_type),
+                (attribute_name, now, self.request_owner, "", normalized_target_type, value_type),
             )
             target_ids = self._fetch_attribute_target_ids_cur(cur, normalized_target_type)
             placeholder_rows = [
-                (attribute_name, "", target_id, normalized_target_type, now, self.AI_AGENT_OWNER)
+                (attribute_name, "", target_id, normalized_target_type, now, self.request_owner)
                 for target_id in target_ids
             ]
             if len(placeholder_rows) > 0:
@@ -2704,7 +3422,7 @@ class AiMcpServer:
                     "name": attribute_name,
                     "target_type": normalized_target_type,
                     "value_type": value_type,
-                    "owner": self.AI_AGENT_OWNER,
+                    "owner": self.request_owner,
                     "placeholder_count": len(target_ids),
                     "created_at": now,
                 },
@@ -2717,7 +3435,7 @@ class AiMcpServer:
                     "name": attribute_name,
                     "target_type": normalized_target_type,
                     "value_type": value_type,
-                    "owner": self.AI_AGENT_OWNER,
+                    "owner": self.request_owner,
                     "memo": "",
                     "date": now,
                 },
@@ -2733,10 +3451,10 @@ class AiMcpServer:
         normalized_target_type = self._normalize_attribute_target_type(target_type)
         if normalized_target_type == "file":
             self._validate_document_attribute_arguments(arguments)
-            tool_name = "documents/update_attributes"
+            tool_name = "documents_update_attributes"
             target_field_name = "fid"
         else:
-            tool_name = "cases/update_attributes"
+            tool_name = "cases_update_attributes"
             target_field_name = "caseid"
 
         target_id = self._to_int(arguments.get(target_field_name), -1)
@@ -2797,7 +3515,7 @@ class AiMcpServer:
                         continue
                     cur.execute(
                         "INSERT INTO attribute (name, value, id, attr_type, date, owner) VALUES (?, ?, ?, ?, ?, ?)",
-                        (attribute_name, new_value, target_id, normalized_target_type, now, self.AI_AGENT_OWNER),
+                        (attribute_name, new_value, target_id, normalized_target_type, now, self.request_owner),
                     )
                     attrid = int(cur.lastrowid)
                     before_state = {
@@ -2807,7 +3525,7 @@ class AiMcpServer:
                         "exists": True,
                         "attrid": attrid,
                         "value": new_value,
-                        "owner": self.AI_AGENT_OWNER,
+                        "owner": self.request_owner,
                         "date": now,
                     }
                 else:
@@ -2822,15 +3540,18 @@ class AiMcpServer:
                         "owner": "" if existing_row.get("owner", None) is None else str(existing_row.get("owner", "")),
                         "date": "" if existing_row.get("date", None) is None else str(existing_row.get("date", "")),
                     }
+                    existing_owner = (
+                        "" if existing_row.get("owner", None) is None else str(existing_row.get("owner", ""))
+                    )
                     cur.execute(
-                        "UPDATE attribute SET value=?, date=?, owner=? WHERE attrid=?",
-                        (new_value, now, self.AI_AGENT_OWNER, attrid),
+                        "UPDATE attribute SET value=?, date=? WHERE attrid=?",
+                        (new_value, now, attrid),
                     )
                     after_state = {
                         "exists": True,
                         "attrid": attrid,
                         "value": new_value,
-                        "owner": self.AI_AGENT_OWNER,
+                        "owner": existing_owner,
                         "date": now,
                     }
 
@@ -2976,6 +3697,19 @@ class AiMcpServer:
             (ctid_i,),
         )
 
+    def _fetch_annotation_row_cur(self, cur: sqlite3.Cursor, anid: Any) -> Optional[Dict[str, Any]]:
+        """Return one annotation row as a dictionary."""
+
+        anid_i = self._to_int(anid, -1)
+        if anid_i <= 0:
+            return None
+        return self._fetchone_dict_cur(
+            cur,
+            "SELECT anid, fid, pos0, pos1, ifnull(memo,'') as memo, owner, date "
+            "FROM annotation WHERE anid=?",
+            (anid_i,),
+        )
+
     def _fetch_case_row_cur(self, cur: sqlite3.Cursor, caseid: Any) -> Optional[Dict[str, Any]]:
         caseid_i = self._to_int(caseid, -1)
         if caseid_i <= 0:
@@ -3112,7 +3846,7 @@ class AiMcpServer:
                 forbidden_fields.append(field_name)
         if len(forbidden_fields) > 0:
             raise ValueError(
-                "documents/update_attributes only supports document attributes and cannot modify memo or text."
+                "documents_update_attributes only supports document attributes and cannot modify memo or text."
             )
 
     def _collect_category_subtree(self, cur: sqlite3.Cursor, root_catid: int) -> Dict[str, Any]:
@@ -3344,24 +4078,116 @@ class AiMcpServer:
         return str(random.choice(colors))
 
     def _quote_search(self, quote: str, fulltext: str) -> Tuple[int, int]:
-        """Find quote boundaries, preferring ai_llm.ai_quote_search with graceful fallback."""
+        """Find quote boundaries: exact, then layout tolerant, then ai_llm.ai_quote_search."""
 
+        quote_text = str(quote).strip()
+        if quote_text == "":
+            return -1, -1
+        start = fulltext.find(quote_text)
+        if start >= 0:
+            return start, start + len(quote_text)
+        pos0, pos1 = self._layout_tolerant_quote_search(quote_text, fulltext)
+        if pos0 >= 0:
+            return pos0, pos1
         try:
             from .ai_llm import ai_quote_search as _ai_quote_search
+            self._approximate_search_error = ""
             return _ai_quote_search(quote, fulltext)
-        except Exception:
-            quote_text = str(quote).strip()
-            if quote_text == "":
-                return -1, -1
-            start = fulltext.find(quote_text)
-            if start < 0:
-                return -1, -1
-            return start, start + len(quote_text)
+        except Exception as err:
+            # Kept for the error message, a missing AI runtime used to fail silently here
+            self._approximate_search_error = f"{type(err).__name__}: {err}"
+            return -1, -1
+
+    _QUOTE_CHAR_MAP = {
+        "\u201c": '"', "\u201d": '"', "\u00ab": '"', "\u00bb": '"', "\u2018": "'", "\u2019": "'",
+        "\u2013": "-", "\u2014": "-", "\u2212": "-", "\u00a0": " ",
+        "\ufb00": "ff", "\ufb01": "fi", "\ufb02": "fl", "\ufb03": "ffi", "\ufb04": "ffl",
+    }
+
+    def _layout_normalized(self, text: str) -> Tuple[str, List[int]]:
+        """Return text without PDF layout noise, plus the source index of every kept character."""
+
+        chars: List[str] = []
+        index_map: List[int] = []
+        length = len(text)
+        i = 0
+        while i < length:
+            char = text[i]
+            if char in "-\u00ad":
+                j = i + 1
+                while j < length and text[j].isspace():
+                    j += 1
+                broken_line = "\n" in text[i + 1:j] or "\r" in text[i + 1:j]
+                # Hyphens inside words are dropped on both sides, so split and compound words compare equal
+                if chars and chars[-1].isalpha() and j < length and text[j].isalpha() and (j == i + 1 or broken_line):
+                    i = j
+                    continue
+                if char == "\u00ad":
+                    i += 1
+                    continue
+            if char.isspace():
+                if chars and chars[-1] != " ":
+                    chars.append(" ")
+                    index_map.append(i)
+                i += 1
+                continue
+            for piece in self._QUOTE_CHAR_MAP.get(char, char).lower():
+                chars.append(piece)
+                index_map.append(i)
+            i += 1
+        return "".join(chars), index_map
+
+    def _layout_tolerant_quote_search(self, quote: str, fulltext: str) -> Tuple[int, int]:
+        """Match a quote ignoring line breaks, soft hyphens, split words, ligatures, quote marks and case."""
+
+        needle = self._layout_normalized(quote)[0].strip()
+        if needle == "":
+            return -1, -1
+        haystack, index_map = self._layout_normalized(fulltext)
+        start = haystack.find(needle)
+        if start < 0:
+            return -1, -1
+        return index_map[start], index_map[start + len(needle) - 1] + 1
+
+    def _quote_not_matched_message(self, fid: int) -> str:
+        """Explain a failed quote match so the agent can correct the quote by itself."""
+
+        message = (
+            "quote could not be matched in the document text. Copy the words exactly as they appear in "
+            f"qualcoder://documents/text/{fid} without paraphrasing, shortening or using ellipses. "
+            "Line breaks, split words and quote marks may differ."
+        )
+        reason = getattr(self, "_approximate_search_error", "")
+        if reason != "":
+            message += f" Approximate matching is unavailable in this QualCoder ({reason})."
+        return message
+
+    def _exact_quote_positions(self, quote: str, fulltext: str) -> List[int]:
+        """Return every exact start position for a quote, including overlapping matches."""
+
+        quote_text = str(quote if quote is not None else "")
+        if quote_text == "":
+            return []
+        positions: List[int] = []
+        start = 0
+        while start <= len(fulltext) - len(quote_text):
+            match = fulltext.find(quote_text, start)
+            if match < 0:
+                break
+            positions.append(match)
+            start = match + 1
+        return positions
 
     def _record_ai_change(self, change_set_id: str, operation: Dict[str, Any]) -> None:
         ai = getattr(self.app, "ai", None)
         if ai is not None and hasattr(ai, "record_ai_change"):
-            ai.record_ai_change(change_set_id, operation)
+            context = _execution_context.get()
+            recorded_operation = dict(operation)
+            recorded_operation["actor_source"] = context.source
+            recorded_operation["actor_owner"] = context.owner
+            if context.client_name is not None:
+                recorded_operation["actor_client_name"] = context.client_name
+            ai.record_ai_change(change_set_id, recorded_operation)
 
     def _codes_tree(self) -> Dict[str, Any]:
         categories = []
@@ -3395,6 +4221,76 @@ class AiMcpServer:
                     "supercid": row[6],
                 }
             )
+
+        visible_text_coding_counts: Dict[int, int] = {}
+        if self._view_exists("code_text_visible"):
+            visible_text_coding_counts = {
+                int(row[0]): int(row[1])
+                for row in self._fetchall(
+                    "SELECT cid, count(*) FROM code_text_visible GROUP BY cid"
+                )
+            }
+
+        categories_by_id = {
+            int(category["catid"]): category
+            for category in categories
+            if self._to_int(category.get("catid"), -1) > 0
+        }
+        codes_by_id = {
+            int(code["cid"]): code
+            for code in codes
+            if self._to_int(code.get("cid"), -1) > 0
+        }
+        direct_child_counts: Dict[int, int] = {}
+        for code in codes:
+            parent_id = self._to_int(code.get("supercid"), -1)
+            if parent_id > 0:
+                direct_child_counts[parent_id] = direct_child_counts.get(parent_id, 0) + 1
+
+        def category_path_nodes(catid: Any) -> List[Dict[str, Any]]:
+            nodes: List[Dict[str, Any]] = []
+            visited: set[int] = set()
+            current_id = self._to_int(catid, -1)
+            while current_id > 0 and current_id not in visited:
+                visited.add(current_id)
+                category = categories_by_id.get(current_id)
+                if category is None:
+                    break
+                nodes.append({
+                    "type": "category",
+                    "id": current_id,
+                    "name": str(category.get("name", "")),
+                })
+                current_id = self._to_int(category.get("supercatid"), -1)
+            nodes.reverse()
+            return nodes
+
+        def code_path_nodes(code: Dict[str, Any]) -> List[Dict[str, Any]]:
+            code_nodes: List[Dict[str, Any]] = []
+            visited: set[int] = {self._to_int(code.get("cid"), -1)}
+            current = code
+            parent_id = self._to_int(current.get("supercid"), -1)
+            while parent_id > 0 and parent_id not in visited:
+                visited.add(parent_id)
+                parent = codes_by_id.get(parent_id)
+                if parent is None:
+                    break
+                code_nodes.append({
+                    "type": "code",
+                    "id": parent_id,
+                    "name": str(parent.get("name", "")),
+                })
+                current = parent
+                parent_id = self._to_int(current.get("supercid"), -1)
+            code_nodes.reverse()
+            return category_path_nodes(current.get("catid")) + code_nodes
+
+        for code in codes:
+            code_id = self._to_int(code.get("cid"), -1)
+            code["text_coding_count"] = visible_text_coding_counts.get(code_id, 0)
+            code["child_count"] = direct_child_counts.get(code_id, 0)
+            code["path_nodes"] = code_path_nodes(code)
+
         speaker_prefix = "\U0001F4CC "
         speaker_categories = []
         for cat in categories:
@@ -3643,6 +4539,29 @@ class AiMcpServer:
             "file_ids": file_ids,
         }
 
+    def _parse_annotation_options(self, query: Dict[str, List[str]]) -> Dict[str, Any]:
+        """Parse filters and pagination for annotation reads."""
+
+        cursor = max(0, self._to_int(query.get("cursor", [0])[0], 0))
+        page_size = self._to_int(
+            query.get("page_size", [self.default_annotation_page_size])[0],
+            self.default_annotation_page_size,
+        )
+        page_size = max(1, min(page_size, self.max_annotation_page_size))
+        max_chars = self._to_int(
+            query.get("max_chars", [self.default_segments_max_chars])[0],
+            self.default_segments_max_chars,
+        )
+        max_chars = max(1, min(max_chars, self.max_segments_chars_limit))
+        return {
+            "cursor": cursor,
+            "page_size": page_size,
+            "max_chars": max_chars,
+            "file_ids": self._parse_positive_int_list_options(query, ("file_ids",)),
+            "case_ids": self._parse_positive_int_list_options(query, ("case_ids",)),
+            "owners": self._parse_string_list_options(query, ("owner", "owners")),
+        }
+
     def _parse_string_list_options(self, query: Dict[str, List[str]], keys: Tuple[str, ...]) -> List[str]:
         values: List[str] = []
         for key in keys:
@@ -3851,16 +4770,42 @@ class AiMcpServer:
             "exclude_cids": exclude_cids,
         }
 
+    def _require_ready_vectorstore(self) -> Any:
+        """Return the shared vectorstore or raise an actionable MCP error."""
+
+        state = str(getattr(self.app, "vectorstore_runtime_state", "")).strip().lower()
+        vectorstore = getattr(self.app, "vectorstore", None)
+        if state == VECTORSTORE_FAILED:
+            raise RuntimeError(
+                "The QualCoder search index could not be prepared. "
+                "Instruct the user to check QualCoder for details and retry the initialization."
+            )
+        if state == VECTORSTORE_DISABLED:
+            raise RuntimeError(
+                "The QualCoder search index is disabled. "
+                "Instruct the user to enable External MCP or AI-powered search in QualCoder, "
+                "then retry this operation."
+            )
+        if vectorstore is None or state in (
+                VECTORSTORE_UNLOADED,
+                VECTORSTORE_LOADING,
+                VECTORSTORE_INDEXING,
+        ):
+            raise RuntimeError(
+                "The QualCoder search index is currently being prepared. "
+                "Wait briefly, then retry this operation. Other project tools remain available."
+            )
+        is_open = getattr(vectorstore, "is_open", None)
+        is_ready = getattr(vectorstore, "is_ready", None)
+        if not callable(is_open) or not is_open() or not callable(is_ready) or not is_ready():
+            raise RuntimeError(
+                "The QualCoder search index is currently being prepared. "
+                "Wait briefly, then retry this operation. Other project tools remain available."
+            )
+        return vectorstore
+
     def _read_vector_search(self, options: Dict[str, Any]) -> Dict[str, Any]:
-        ai = getattr(self.app, "ai", None)
-        if ai is None:
-            raise RuntimeError("AI integration is not initialized.")
-        vectorstore = getattr(ai, "sources_vectorstore", None)
-        if vectorstore is None or getattr(vectorstore, "faiss_db", None) is None:
-            raise RuntimeError("Vectorstore is not initialized.")
-        is_ready_fn = getattr(vectorstore, "is_ready", None)
-        if callable(is_ready_fn) and not is_ready_fn():
-            raise RuntimeError("Vectorstore is currently updating. Please try again shortly.")
+        vectorstore = self._require_ready_vectorstore()
 
         queries = options.get("queries", [])
         if not isinstance(queries, list) or len(queries) == 0:
@@ -4034,15 +4979,7 @@ class AiMcpServer:
             conn.close()
 
     def _read_bm25_search(self, options: Dict[str, Any]) -> Dict[str, Any]:
-        ai = getattr(self.app, "ai", None)
-        if ai is None:
-            raise RuntimeError("AI integration is not initialized.")
-        vectorstore = getattr(ai, "sources_vectorstore", None)
-        if vectorstore is None or not getattr(vectorstore, "is_open", lambda: False)():
-            raise RuntimeError("Vectorstore is not initialized.")
-        is_ready_fn = getattr(vectorstore, "is_ready", None)
-        if callable(is_ready_fn) and not is_ready_fn():
-            raise RuntimeError("Vectorstore is currently updating. Please try again shortly.")
+        vectorstore = self._require_ready_vectorstore()
 
         queries = options.get("queries", [])
         if not isinstance(queries, list) or len(queries) == 0:
@@ -4499,11 +5436,9 @@ class AiMcpServer:
                                    vectorstore_sig: str, queries: List[str], file_ids: List[int],
                                    case_ids: List[int], exclude_cids: List[int], score_threshold: float,
                                    k_per_query: int) -> Tuple[int, int]:
-        ai = getattr(self.app, "ai", None)
-        if ai is None:
-            raise RuntimeError("AI integration is not initialized.")
+        vectorstore = self._require_ready_vectorstore()
         doc_filter = file_ids if len(file_ids) > 0 else None
-        chunks = ai._retrieve_from_vectorstore(
+        chunks = vectorstore.retrieve_similar_documents(
             queries,
             doc_ids=doc_filter,
             score_threshold=score_threshold,
@@ -4845,14 +5780,13 @@ class AiMcpServer:
         return flags
 
     def _vectorstore_signature(self) -> str:
-        ai = getattr(self.app, "ai", None)
-        vectorstore = getattr(ai, "sources_vectorstore", None) if ai is not None else None
+        vectorstore = getattr(self.app, "vectorstore", None)
         faiss_path = getattr(vectorstore, "faiss_db_path", None) if vectorstore is not None else None
         if faiss_path is None or str(faiss_path).strip() == "":
             project_path = getattr(self.app, "project_path", "")
             if project_path is None or project_path == "":
                 return "missing"
-            faiss_path = os.path.join(project_path, "ai_data", "vectorstore", "faiss_store.bin")
+            faiss_path = os.path.join(project_path, "ai_data", "search.sqlite")
         if not os.path.exists(faiss_path):
             return "missing"
         try:
@@ -4863,8 +5797,7 @@ class AiMcpServer:
 
     def _fetch_cached_documents_by_docstore_id(self, docstore_ids: List[str]) -> Dict[str, Any]:
         result: Dict[str, Any] = {}
-        ai = getattr(self.app, "ai", None)
-        vectorstore = getattr(ai, "sources_vectorstore", None) if ai is not None else None
+        vectorstore = getattr(self.app, "vectorstore", None)
         if vectorstore is None:
             return result
         try:
@@ -5255,6 +6188,176 @@ class AiMcpServer:
             if r_start > end:
                 break
         return False
+
+    def _read_annotations(self, options: Dict[str, Any]) -> Dict[str, Any]:
+        """Read a filtered, paginated set of text annotations."""
+
+        cursor = int(options.get("cursor", 0))
+        page_size = int(options.get("page_size", self.default_annotation_page_size))
+        max_chars = int(options.get("max_chars", self.default_segments_max_chars))
+        file_ids = options.get("file_ids", [])
+        case_ids = options.get("case_ids", [])
+        owners = options.get("owners", [])
+        if not isinstance(file_ids, list):
+            file_ids = []
+        if not isinstance(case_ids, list):
+            case_ids = []
+        if not isinstance(owners, list):
+            owners = []
+
+        if len(owners) > 0:
+            table_name = "annotation"
+        else:
+            if not self._view_exists("annotation_visible"):
+                raise RuntimeError("Required view 'annotation_visible' not found.")
+            table_name = "annotation_visible"
+
+        where_parts: List[str] = []
+        where_params: List[Any] = []
+        if len(file_ids) > 0:
+            placeholders = ",".join(["?"] * len(file_ids))
+            where_parts.append(f"a.fid IN ({placeholders})")
+            where_params.extend(file_ids)
+        if len(case_ids) > 0:
+            placeholders = ",".join(["?"] * len(case_ids))
+            where_parts.append(
+                "EXISTS (SELECT 1 FROM case_text AS ctf WHERE ctf.fid=a.fid "
+                f"AND ctf.caseid IN ({placeholders}) "
+                "AND a.pos0 >= ctf.pos0 AND a.pos1 <= ctf.pos1)"
+            )
+            where_params.extend(case_ids)
+        if len(owners) > 0:
+            placeholders = ",".join(["?"] * len(owners))
+            where_parts.append(f"a.owner IN ({placeholders})")
+            where_params.extend(owners)
+        where_sql = "" if len(where_parts) == 0 else " WHERE " + " AND ".join(where_parts)
+
+        count_row = self._fetchone(
+            f"SELECT count(*) FROM {table_name} AS a" + where_sql,
+            tuple(where_params),
+        )
+        total_annotations = 0 if count_row is None else int(count_row[0])
+        rows = self._fetchall(
+            "SELECT a.anid, a.fid, a.pos0, a.pos1, ifnull(a.memo,''), a.owner, a.date, source.name "
+            f"FROM {table_name} AS a JOIN source ON source.id=a.fid"
+            + where_sql
+            + " ORDER BY a.fid, a.pos0, a.anid LIMIT ? OFFSET ?",
+            tuple(where_params + [page_size, cursor]),
+        )
+
+        source_texts = self._fetch_sources_texts([self._to_int(row[1], -1) for row in rows])
+        case_memberships = self._fetch_case_memberships([self._to_int(row[1], -1) for row in rows])
+        annotations: List[Dict[str, Any]] = []
+        used_chars = 0
+        hit_max_char_limit = False
+        for row in rows:
+            fid = self._to_int(row[1], -1)
+            source_row = source_texts.get(fid)
+            fulltext = "" if source_row is None else str(source_row[1] if source_row[1] is not None else "")
+            pos0 = self._to_int(row[2], -1)
+            pos1 = self._to_int(row[3], -1)
+            full_quote = fulltext[pos0:pos1] if 0 <= pos0 < pos1 <= len(fulltext) else ""
+            remaining_chars = max_chars - used_chars
+            if remaining_chars <= 0:
+                hit_max_char_limit = True
+                break
+            quote = full_quote[:remaining_chars]
+            quote_truncated = len(quote) < len(full_quote)
+            if quote_truncated:
+                hit_max_char_limit = True
+            annotation = {
+                "anid": row[0],
+                "fid": row[1],
+                "source_name": row[7],
+                "pos0": row[2],
+                "pos1": row[3],
+                "quote": quote,
+                "quote_truncated": quote_truncated,
+                "memo": "" if row[4] is None else str(row[4]),
+                "owner": row[5],
+                "date": row[6],
+                "matching_cases": self._matching_cases_for_range(
+                    pos0,
+                    pos1,
+                    case_memberships.get(fid, []),
+                ),
+            }
+            self._append_line_range_fields(annotation, fulltext, pos0, pos1 - pos0)
+            self._append_snippet_context_fields(annotation, fulltext, pos0, pos1 - pos0)
+            annotations.append(annotation)
+            used_chars += len(quote)
+            if quote_truncated:
+                break
+
+        next_cursor = min(cursor + len(annotations), total_annotations)
+        return {
+            "selection": {
+                "cursor": cursor,
+                "page_size": page_size,
+                "max_chars": max_chars,
+                "file_ids": file_ids,
+                "case_ids": case_ids,
+                "owners": owners,
+                "total_annotations": total_annotations,
+                "next_cursor": next_cursor,
+                "truncated": next_cursor < total_annotations,
+                "hit_max_char_limit": hit_max_char_limit,
+            },
+            "annotations": annotations,
+        }
+
+    def _read_annotation(self, anid: int, owners: List[str]) -> Dict[str, Any]:
+        """Read one annotation, respecting visibility unless an owner is explicit."""
+
+        if anid <= 0:
+            raise ValueError("anid must be a positive integer.")
+        if len(owners) > 0:
+            table_name = "annotation"
+        else:
+            if not self._view_exists("annotation_visible"):
+                raise RuntimeError("Required view 'annotation_visible' not found.")
+            table_name = "annotation_visible"
+        where_owner = ""
+        params: List[Any] = [anid]
+        if len(owners) > 0:
+            placeholders = ",".join(["?"] * len(owners))
+            where_owner = f" AND a.owner IN ({placeholders})"
+            params.extend(owners)
+        row = self._fetchone(
+            "SELECT a.anid, a.fid, a.pos0, a.pos1, ifnull(a.memo,''), a.owner, a.date, "
+            "source.name, ifnull(source.fulltext,'') "
+            f"FROM {table_name} AS a JOIN source ON source.id=a.fid WHERE a.anid=?"
+            + where_owner,
+            tuple(params),
+        )
+        if row is None:
+            raise ValueError(f"Annotation id {anid} not found or is not visible for the requested owner.")
+        fulltext = str(row[8] if row[8] is not None else "")
+        fid = self._to_int(row[1], -1)
+        pos0 = self._to_int(row[2], -1)
+        pos1 = self._to_int(row[3], -1)
+        full_quote = fulltext[pos0:pos1] if 0 <= pos0 < pos1 <= len(fulltext) else ""
+        quote = full_quote[:self.max_read_length]
+        annotation = {
+            "anid": row[0],
+            "fid": row[1],
+            "source_name": row[7],
+            "pos0": row[2],
+            "pos1": row[3],
+            "quote": quote,
+            "quote_truncated": len(quote) < len(full_quote),
+            "memo": "" if row[4] is None else str(row[4]),
+            "owner": row[5],
+            "date": row[6],
+            "matching_cases": self._matching_cases_for_range(
+                pos0,
+                pos1,
+                self._fetch_case_memberships([fid]).get(fid, []),
+            ),
+        }
+        self._append_line_range_fields(annotation, fulltext, pos0, pos1 - pos0)
+        self._append_snippet_context_fields(annotation, fulltext, pos0, pos1 - pos0)
+        return {"annotation": annotation}
 
     def _read_code_segments(self, cid: int, options: Dict[str, Any]) -> Dict[str, Any]:
         code_name = self._fetch_code_name(cid)
@@ -5665,6 +6768,8 @@ class AiMcpServer:
         return db_path
 
     def _connect(self) -> sqlite3.Connection:
+        if _fail_fast_database.get():
+            return sqlite3.connect(self._project_db_path(), timeout=0)
         return sqlite3.connect(self._project_db_path())
 
     def _fetchall(self, sql: str, params: Tuple[Any, ...] = ()) -> List[Tuple[Any, ...]]:

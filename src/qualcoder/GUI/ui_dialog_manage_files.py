@@ -31,7 +31,7 @@ class Ui_Dialog_manage_files(object):
         self.pushButton_clear_filter.setText("")
         self.pushButton_clear_filter.setObjectName("pushButton_clear_filter")
         self.label_file = QtWidgets.QLabel(parent=self.groupBox_2)
-        self.label_file.setGeometry(QtCore.QRect(310, 0, 561, 28))
+        self.label_file.setGeometry(QtCore.QRect(310, 0, 551, 28))
         self.label_file.setText("")
         self.label_file.setObjectName("label_file")
         self.gridLayout.addWidget(self.groupBox_2, 3, 0, 1, 1)
@@ -80,10 +80,6 @@ class Ui_Dialog_manage_files(object):
         self.pushButton_export_attributes.setGeometry(QtCore.QRect(330, 3, 30, 30))
         self.pushButton_export_attributes.setText("")
         self.pushButton_export_attributes.setObjectName("pushButton_export_attributes")
-        self.pushButton_help = QtWidgets.QPushButton(parent=self.groupBox)
-        self.pushButton_help.setGeometry(QtCore.QRect(640, 3, 30, 30))
-        self.pushButton_help.setText("")
-        self.pushButton_help.setObjectName("pushButton_help")
         self.pushButton_undo = QtWidgets.QPushButton(parent=self.groupBox)
         self.pushButton_undo.setEnabled(False)
         self.pushButton_undo.setGeometry(QtCore.QRect(560, 3, 30, 30))
@@ -141,34 +137,37 @@ class Ui_Dialog_manage_files(object):
         Dialog_manage_files.setTabOrder(self.pushButton_display_delete, self.pushButton_bulk_rename)
         Dialog_manage_files.setTabOrder(self.pushButton_bulk_rename, self.pushButton_undo)
         Dialog_manage_files.setTabOrder(self.pushButton_undo, self.pushButton_delete)
-        Dialog_manage_files.setTabOrder(self.pushButton_delete, self.pushButton_help)
-        Dialog_manage_files.setTabOrder(self.pushButton_help, self.lineEdit_search_files)
+        Dialog_manage_files.setTabOrder(self.pushButton_delete, self.lineEdit_search_files)
         Dialog_manage_files.setTabOrder(self.lineEdit_search_files, self.pushButton_clear_filter)
         Dialog_manage_files.setTabOrder(self.pushButton_clear_filter, self.tableWidget)
 
     def retranslateUi(self, Dialog_manage_files):
         _translate = QtCore.QCoreApplication.translate
         Dialog_manage_files.setWindowTitle(_translate("Dialog_manage_files", "Files"))
-        self.lineEdit_search_files.setToolTip(_translate("Dialog_manage_files", "<html><head/><body><p>File name filter</p></body></html>"))
+        self.lineEdit_search_files.setToolTip(_translate("Dialog_manage_files", "File name filter"))
         self.pushButton_clear_filter.setToolTip(_translate("Dialog_manage_files", "Clear filter"))
-        self.pushButton_view.setToolTip(_translate("Dialog_manage_files", "<html><head/><body><p>View file</p></body></html>"))
-        self.pushButton_create.setToolTip(_translate("Dialog_manage_files", "<html><head/><body><p>Create a text file</p></body></html>"))
+        self.pushButton_view.setToolTip(_translate("Dialog_manage_files", "View file"))
+        self.pushButton_create.setToolTip(_translate("Dialog_manage_files", "Create a text file"))
         self.pushButton_export.setToolTip(_translate("Dialog_manage_files", "Export selected file.\n"
 "Text files (from any source) are exported from the text stored in the database as .txt files.\n"
-"(You can open the project folder and copy/paste the orignal text file if preferred.)"))
-        self.pushButton_delete.setToolTip(_translate("Dialog_manage_files", "<html><head/><body><p>Select files for deletion</p></body></html>"))
-        self.pushButton_import.setToolTip(_translate("Dialog_manage_files", "<html><head/><body><p>Import file into project folder</p></body></html>"))
-        self.pushButton_add_attribute.setToolTip(_translate("Dialog_manage_files", "<html><head/><body><p>Add attribute</p></body></html>"))
-        self.pushButton_link.setToolTip(_translate("Dialog_manage_files", "<html><head/><body><p>Link to a file that is outside the project folder</p></body></html>"))
-        self.pushButton_import_from_linked.setToolTip(_translate("Dialog_manage_files", "<html><head/><body><p>Import linked file into project folder</p></body></html>"))
+"(You can open the project folder and copy/paste the original text file if preferred.)"))
+        self.pushButton_delete.setToolTip(_translate("Dialog_manage_files", "Select files for deletion"))
+        self.pushButton_import.setToolTip(_translate("Dialog_manage_files", "Import file into project folder"))
+        self.pushButton_add_attribute.setToolTip(_translate("Dialog_manage_files", "Add attribute"))
+        self.pushButton_link.setToolTip(_translate("Dialog_manage_files", "Link to a file that is outside the project folder"))
+        self.pushButton_import_from_linked.setToolTip(_translate("Dialog_manage_files", "Import linked file into project folder"))
         self.pushButton_export_to_linked.setToolTip(_translate("Dialog_manage_files", "Export file from project folder as a linked file.\n"
 "Cannot export text transcription file associated with an audio or video as a linked file."))
-        self.pushButton_export_attributes.setToolTip(_translate("Dialog_manage_files", "<html><head/><body><p>Export attributes to file</p></body></html>"))
-        self.pushButton_help.setToolTip(_translate("Dialog_manage_files", "Help"))
-        self.pushButton_undo.setToolTip(_translate("Dialog_manage_files", "<html><head/><body><p>Undo file rename</p></body></html>"))
-        self.pushButton_bulk_rename.setToolTip(_translate("Dialog_manage_files", "<html><head/><body><p>Bulk rename of database name file entries.</p><p>Only rename visible file rows. Can show only some rows by using attribute selection, or show/hide value like...</p><p>Renamed as: User chosen prefix and numbered suffix _nnn.</p><p>e.g. interview_001</p></body></html>"))
-        self.pushButton_display_save.setToolTip(_translate("Dialog_manage_files", "<html><head/><body><p>Save table display settings. </p><p>(Hidden rows and columns and column sizing)</p></body></html>"))
-        self.pushButton_display_load.setToolTip(_translate("Dialog_manage_files", "<html><head/><body><p>Load saved table display setting.</p><p>(Hidden rows and columns and column sizing)</p></body></html>"))
+        self.pushButton_export_attributes.setToolTip(_translate("Dialog_manage_files", "Export attributes to file"))
+        self.pushButton_undo.setToolTip(_translate("Dialog_manage_files", "Undo file rename"))
+        self.pushButton_bulk_rename.setToolTip(_translate("Dialog_manage_files", "Bulk rename of database name file entries.\n"
+"Only rename visible file rows. Can show only some rows by using attribute selection, or show/hide value like...\n"
+"Renamed as: User chosen prefix and numbered suffix _nnn.\n"
+"e.g. interview_001"))
+        self.pushButton_display_save.setToolTip(_translate("Dialog_manage_files", "Save table display settings.\n"
+"(Hidden rows and columns and column sizing)"))
+        self.pushButton_display_load.setToolTip(_translate("Dialog_manage_files", "Load saved table display setting.\n"
+"(Hidden rows and columns and column sizing)"))
         self.pushButton_display_delete.setToolTip(_translate("Dialog_manage_files", "Delete saved table display settings. "))
         self.pushButton_pseudonyms.setToolTip(_translate("Dialog_manage_files", "Pseudonymisation (data de-identification)\n"
 "Before importing text files, create a list of names or phrases to be replaced.\n"

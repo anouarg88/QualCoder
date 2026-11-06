@@ -111,9 +111,9 @@ class Ui_Dialog_Coocurrence(object):
 
     def retranslateUi(self, Dialog_Coocurrence):
         _translate = QtCore.QCoreApplication.translate
-        Dialog_Coocurrence.setWindowTitle(_translate("Dialog_Coocurrence", "Code Co-occurence"))
-        self.label_selections.setToolTip(_translate("Dialog_Coocurrence", "<html><head/><body><p>Show the overlapping codes.</p></body></html>"))
-        self.label_selections.setText(_translate("Dialog_Coocurrence", "Code co-occurence"))
+        Dialog_Coocurrence.setWindowTitle(_translate("Dialog_Coocurrence", "Code Co-occurrence"))
+        self.label_selections.setToolTip(_translate("Dialog_Coocurrence", "Show the overlapping codes."))
+        self.label_selections.setText(_translate("Dialog_Coocurrence", "Code co-occurrence"))
         self.pushButton_export.setToolTip(_translate("Dialog_Coocurrence", "Export to file"))
         self.checkBox_hide_blanks.setText(_translate("Dialog_Coocurrence", "Hide blank lines"))
         self.pushButton_select_files.setToolTip(_translate("Dialog_Coocurrence", "Select files"))
@@ -121,20 +121,10 @@ class Ui_Dialog_Coocurrence(object):
         self.pushButton_select_codes.setToolTip(_translate("Dialog_Coocurrence", "Select codes"))
         self.pushButton_file_attributes.setToolTip(_translate("Dialog_Coocurrence", "Select files by attributes"))
         self.pushButton_export_gephi.setToolTip(_translate("Dialog_Coocurrence", "Export to Gephi. GraphML format"))
-        self.pushButton_export_coocurrence_graph.setToolTip(_translate("Dialog_Coocurrence", "Export Co-occurence Graph Image\n"
+        self.pushButton_export_coocurrence_graph.setToolTip(_translate("Dialog_Coocurrence", "Export Co-occurrence Graph Image\n"
 "Right-click for format options"))
         self.pushButton_export_cluster_graph.setToolTip(_translate("Dialog_Coocurrence", "Export Cluster Graph Image\n"
 "Right-click for format options\n"
 ""))
         self.pushButton_color.setToolTip(_translate("Dialog_Coocurrence", "Highlight colour"))
         self.pushButton_transpose.setToolTip(_translate("Dialog_Coocurrence", "Transpose"))
-
-
-if __name__ == "__main__":
-    import sys
-    app = QtWidgets.QApplication(sys.argv)
-    Dialog_Coocurrence = QtWidgets.QDialog()
-    ui = Ui_Dialog_Coocurrence()
-    ui.setupUi(Dialog_Coocurrence)
-    Dialog_Coocurrence.show()
-    sys.exit(app.exec())

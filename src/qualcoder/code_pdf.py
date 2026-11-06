@@ -30,15 +30,14 @@ import pymupdf
 import logging
 import os
 from pathlib import Path
+from PyQt6 import QtCore, QtGui, QtWidgets
+from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QBrush, QColor
 import qtawesome as qta  # https://pictogrammers.com/library/mdi/
 import re
 import sqlite3
 import weakref
 import webbrowser # For: Open original file
-
-from PyQt6 import QtCore, QtGui, QtWidgets
-from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QBrush, QColor
 
 from .code_in_all_files import DialogCodeInAllFiles
 from .code_tree import CodeTreeController
@@ -51,11 +50,12 @@ from .helpers import Message, init_persistent_tree_header, \
 from .GUI.ui_dialog_code_pdf import Ui_Dialog_code_pdf
 from .memo import DialogMemo
 from .report_attributes import DialogSelectAttributeParameters
+from .ris import Ris
 from .select_items import DialogSelectItems
-# IA
+# AI
 from .ai_agent_prompts import AiAgentPromptsCatalog  # PromptsList removed; new Markdown-based catalog
-from .ai_prompt_library import DialogAiEditPrompts  # Dialog moved from ai_prompts to ai_prompt_library
-from .ai_chat import ai_chat_signal_emitter
+from .ai_runtime import ensure_ai_ready
+from .ai_ui import ai_chat_signal_emitter
 # Shared PDF helpers live in pdf_utils, so lighter modules do not import this one.
 from .pdf_utils import W_X0, W_Y0, W_X1, W_Y1, W_POS0, W_POS1, W_LINE, \
     _page_words_raw, _build_page_text
@@ -302,8 +302,9 @@ class PdfPageItem(QtWidgets.QGraphicsItem):
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.setPen(QtGui.QPen(QColor(170, 170, 175), 0))
         painter.drawRect(rect)
-        # Text codings: style shared with code_text ('marker' = translucent fill, 'underline' = dashed underline)
-        if getattr(self.view.dialog, 'highlight_style', 'marker') == 'underline':
+        # Text codings: full or light marker fill, or a dashed underline.
+        highlight_style = getattr(self.view.dialog, 'highlight_style', 'marker')
+        if highlight_style == 'underline':
             for mark_rect, _color, info in self.text_marks:
                 pen = QtGui.QPen(QColor(info['color']), 1.2, Qt.PenStyle.DashLine)
                 pen.setCosmetic(True)
@@ -330,10 +331,11 @@ class PdfPageItem(QtWidgets.QGraphicsItem):
                         continue
                     painter.setClipRegion(remaining)
                     fill = QColor(info['color'])
-                    fill.setAlpha(110)
+                    fill.setAlpha(40 if highlight_style == 'marker light' else 110)
                     painter.fillRect(mark_rect, fill)
                     painted_region = painted_region.united(aligned)
                 painter.restore()
+
         # Annotations: wavy underline in its own color (purple), distinct from codings and
         # from the search highlight. Always drawn, whatever the highlight style; hovering
         # shows the memo in a tooltip.
@@ -458,7 +460,7 @@ class PdfView(QtWidgets.QGraphicsView):
         self.viewport().setMouseTracking(True)
         # Initial cursor for the default mode (text): the text-selection I-beam.
         self.viewport().setCursor(Qt.CursorShape.IBeamCursor)
-        if self.dialog.app.settings.get('stylesheet', '') in ('dark', 'rainbow'):
+        if self.palette().color(QtGui.QPalette.ColorRole.Base).lightness() < 128:
             self.setBackgroundBrush(QColor(45, 45, 48))
         else:
             self.setBackgroundBrush(QColor(208, 209, 212))
@@ -992,21 +994,22 @@ class PdfResizeHandle(QtWidgets.QWidget):
     Mirror of the CodeResizeHandle from helpers:
     the start one points top-right and the end one points top-left.
     Dragging snaps to the exact character.
+    code_items is a list of coded segments to resize. All codes must be same pos0 and pos1.
     """
 
-    def __init__(self, view, is_start, code_item, main_dialog):
+    def __init__(self, view, is_start, code_items, main_dialog):
         super().__init__(view.viewport())
         self.view = view
         self.is_start = is_start
-        self.code_item = code_item
+        self.code_items = code_items
         self.main_dialog = main_dialog
         # Original positions in case we need to revert
-        self.orig_pos0 = code_item['pos0']
-        self.orig_pos1 = code_item['pos1']
+        self.orig_pos0 = code_items[0]['pos0']
+        self.orig_pos1 = code_items[0]['pos1']
         self.setCursor(QtCore.Qt.CursorShape.SizeHorCursor)
         self.setFixedSize(20, 26)
         self.setAttribute(QtCore.Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        self._color = self.code_item.get('color', '#0078d7')
+        self._color = self.code_items[0].get('color', '#0078d7')
         self.dragging = False
         self.show()
         self.raise_()
@@ -1056,11 +1059,13 @@ class PdfResizeHandle(QtWidgets.QWidget):
             return
         # In-memory update for live visual feedback.
         if self.is_start:
-            if new_pos < self.code_item['pos1']:
-                self.code_item['pos0'] = new_pos
+            if new_pos < self.code_items[0]['pos1']:
+                for c in self.code_items:
+                    c['pos0'] = new_pos
         else:
-            if new_pos > self.code_item['pos0']:
-                self.code_item['pos1'] = new_pos
+            if new_pos > self.code_items[0]['pos0']:
+                for c in self.code_items:
+                    c['pos1'] = new_pos
         self.main_dialog.rebuild_marks()
         self.main_dialog.reposition_resize_handles()
 
@@ -1071,9 +1076,9 @@ class PdfResizeHandle(QtWidgets.QWidget):
         new_pos = self._char_at_global(event.globalPosition().toPoint())
         if new_pos is None:
             # Released outside of a word: confirm the current live position.
-            new_pos = self.code_item['pos0'] if self.is_start else self.code_item['pos1']
+            new_pos = self.code_items[0]['pos0'] if self.is_start else self.code_items[0]['pos1']
         self.main_dialog.update_code_position_from_handle(
-            self.code_item, new_pos, self.is_start, self.orig_pos0, self.orig_pos1)
+            self.code_items, new_pos, self.is_start, self.orig_pos0, self.orig_pos1)
 
 
 DEFAULT_PDF_CODING_MARGIN_WIDTH = 120
@@ -1568,7 +1573,7 @@ class DialogCodePdf(QtWidgets.QWidget):
             saved_style = self.app.settings.get('codetext_highlight_style', None)
         except (KeyError, AttributeError):
             saved_style = None
-        if saved_style in ('marker', 'underline'):
+        if saved_style in ('marker', 'marker light', 'underline'):
             self.highlight_style = saved_style
         else:
             self.highlight_style = 'marker'
@@ -1686,7 +1691,6 @@ class DialogCodePdf(QtWidgets.QWidget):
         self.ui.splitter.splitterMoved.connect(self.update_sizes)
         self.ui.leftsplitter.splitterMoved.connect(self.update_sizes)
         
-        self.ui.pushButton_help.setIcon(qta.icon('mdi6.help'))
         self.ui.pushButton_previous.setIcon(qta.icon('mdi6.arrow-left', options=[{'scale_factor': 1.3}]))
         self.ui.pushButton_next.setIcon(qta.icon('mdi6.arrow-right', options=[{'scale_factor': 1.3}]))
         self.ui.pushButton_previous_page.setIcon(qta.icon('mdi6.arrow-left', options=[{'scale_factor': 1.3}]))
@@ -1789,7 +1793,6 @@ class DialogCodePdf(QtWidgets.QWidget):
         self.ui.pushButton_auto_code_surround.pressed.connect(self.button_autocode_surround)
         self.ui.pushButton_auto_code_undo.setIcon(qta.icon('mdi6.undo'))
         self.ui.pushButton_auto_code_undo.pressed.connect(self.undo_autocoding)
-        self.ui.pushButton_help.clicked.connect(lambda: self.app.help_wiki("4.3.-Coding-Text-on-PDFs"))
 
         # Bookmark button: jumps to the saved file and position (key B saves them).
         try:
@@ -1826,8 +1829,6 @@ class DialogCodePdf(QtWidgets.QWidget):
         self.code_tree.codes_changed.connect(self.update_dialog_codes_and_categories)
         self.ui.treeWidget.itemClicked.connect(self.tree_item_clicked)
         self.ui.treeWidget.itemSelectionChanged.connect(self.fill_code_label)
-        self.ui.treeWidget.itemCollapsed.connect(self.get_collapsed)
-        self.ui.treeWidget.itemExpanded.connect(self.get_collapsed)
         # Enable the tree's internal drag-and-drop. Without this the drop never reaches the
         # eventFilter, codes/sub-codes cannot be nested nor categories moved, and the cycle guards
         # never fire.
@@ -4311,12 +4312,17 @@ class DialogCodePdf(QtWidgets.QWidget):
         else:
             action_margin_right = margin_menu.addAction(_("Move margin to the right"))
         style_menu = menu.addMenu(_("Highlight style"))
-        action_style_marker = None
-        action_style_underline = None
-        if self.highlight_style != 'marker':
-            action_style_marker = style_menu.addAction(_("Marker"))
-        if self.highlight_style != 'underline':
-            action_style_underline = style_menu.addAction(_("Underline"))
+        action_style_marker = style_menu.addAction(_("Marker"))
+        action_style_marker_light = style_menu.addAction(_("Marker light"))
+        action_style_underline = style_menu.addAction(_("Underline"))
+        style_group = QtGui.QActionGroup(style_menu)
+        style_group.setExclusive(True)
+        for style_action, style in ((action_style_marker, 'marker'),
+                                    (action_style_marker_light, 'marker light'),
+                                    (action_style_underline, 'underline')):
+            style_action.setCheckable(True)
+            style_group.addAction(style_action)
+            style_action.setChecked(self.highlight_style == style)
         menu.addSeparator()
         action_goto = menu.addAction(_("Go to page"))
         action_fit = menu.addAction(_("Fit page width"))
@@ -4376,10 +4382,9 @@ class DialogCodePdf(QtWidgets.QWidget):
             self.toggle_important(texts_here, areas_here)
             return
         if action == action_resize_text:
-            target = self._select_single(
-                [{'name': c['name'], 'ref': c} for c in texts_here], _("Select code to resize"))
-            if target is not None:
-                self.show_resize_handles(target)
+            targets = self._select_codes_to_resize(texts_here)
+            if targets:
+                self.show_resize_handles(targets)
             return
         if action == action_area_interactive:
             target = self._select_single(
@@ -4406,6 +4411,9 @@ class DialogCodePdf(QtWidgets.QWidget):
         if action == action_style_marker:
             self._set_highlight_style('marker')
             return
+        if action == action_style_marker_light:
+            self._set_highlight_style('marker light')
+            return
         if action == action_style_underline:
             self._set_highlight_style('underline')
             return
@@ -4428,6 +4436,8 @@ class DialogCodePdf(QtWidgets.QWidget):
         # self.export_page_image()
 
         if action.property('submenu') == 'ai_text_analysis':
+            if not ensure_ai_ready(self.app, _("AI Text Analysis")):
+                return
             if self.file_ is None:
                 Message(self.app, _('Warning'), _("No file was selected"), "warning").exec()
                 return
@@ -4442,6 +4452,8 @@ class DialogCodePdf(QtWidgets.QWidget):
             )
             return
         if action.property('submenu') == 'ai_text_analysis_prompts':
+            from .ai_prompt_library import DialogAiEditPrompts
+
             ui = DialogAiEditPrompts(self.app, 'text_analysis')
             ui.exec()
             return
@@ -4604,16 +4616,6 @@ class DialogCodePdf(QtWidgets.QWidget):
             if self.selection is not None:
                 self.mark()
         self.fill_code_label()
-
-    def get_collapsed(self, item):
-        """ Preserves the expanded/collapsed state of categories across dialogs. """
-
-        if item.text(1)[0:3] == "cid":
-            return
-        if item.isExpanded() and item.text(1) in self.app.collapsed_categories:
-            self.app.collapsed_categories.remove(item.text(1))
-        if not item.isExpanded() and item.text(1) not in self.app.collapsed_categories:
-            self.app.collapsed_categories.append(item.text(1))
 
     def coded_media_dialog(self, code_dict, category_name=""):
         """ Displays all media coded with this code (or category branch) in a
@@ -5380,12 +5382,17 @@ class DialogCodePdf(QtWidgets.QWidget):
             action_move_right = menu.addAction(_("Move margin to the right"))
         menu.addSeparator()
         style_menu = menu.addMenu(_("Highlight style"))
-        action_style_marker = None
-        action_style_underline = None
-        if self.highlight_style != 'marker':
-            action_style_marker = style_menu.addAction(_("Marker"))
-        if self.highlight_style != 'underline':
-            action_style_underline = style_menu.addAction(_("Underline"))
+        action_style_marker = style_menu.addAction(_("Marker"))
+        action_style_marker_light = style_menu.addAction(_("Marker light"))
+        action_style_underline = style_menu.addAction(_("Underline"))
+        style_group = QtGui.QActionGroup(style_menu)
+        style_group.setExclusive(True)
+        for style_action, style in ((action_style_marker, 'marker'),
+                                    (action_style_marker_light, 'marker light'),
+                                    (action_style_underline, 'underline')):
+            style_action.setCheckable(True)
+            style_group.addAction(style_action)
+            style_action.setChecked(self.highlight_style == style)
         global_pos = source_widget.mapToGlobal(position)
         action = menu.exec(global_pos)
         if action is None:
@@ -5402,8 +5409,12 @@ class DialogCodePdf(QtWidgets.QWidget):
         if action == action_style_marker:
             self._set_highlight_style('marker')
             return
+        if action == action_style_marker_light:
+            self._set_highlight_style('marker light')
+            return
         if action == action_style_underline:
             self._set_highlight_style('underline')
+            return
 
     def _coding_margin_code_actions_menu(self, code, source_widget, position):
         """
@@ -5459,7 +5470,7 @@ class DialogCodePdf(QtWidgets.QWidget):
             self.coded_memo([target], [])
             return
         if action == action_resize:
-            self.show_resize_handles(target)
+            self.show_resize_handles([target])
             return
         if action == action_change_code:
             self.change_code_for_segment(text_item=target)
@@ -5516,13 +5527,14 @@ class DialogCodePdf(QtWidgets.QWidget):
         if getattr(self, 'coding_margin', None) is not None:
             self.coding_margin.update()
 
-    def _set_highlight_style(self, style):
-        """
-        Changes the highlight style between 'marker' and 'underline',
-        persists the shared preference and repaints the layers.
+    def _set_highlight_style(self, style: str):
+        """Change the PDF highlight style and repaint the layers.
+
+        Args:
+            style: The shared highlight style ('marker', 'marker light', or 'underline').
         """
 
-        if style not in ('marker', 'underline') or style == self.highlight_style:
+        if style not in ('marker', 'marker light', 'underline') or style == self.highlight_style:
             return
         self.highlight_style = style
         try:
@@ -5531,12 +5543,12 @@ class DialogCodePdf(QtWidgets.QWidget):
             pass
         self.rebuild_marks()
 
-    def apply_highlight_style_setting(self, style:str|None=None):
+    def apply_highlight_style_setting(self, style: str | None = None):
         """Apply the saved highlight style without relying on translated UI text."""
 
         if style is None:
             style = self.app.settings.get('codetext_highlight_style', 'marker')
-        if style not in ('marker', 'underline'):
+        if style not in ('marker', 'marker light', 'underline'):
             style = 'marker'
         self._set_highlight_style(style)
 
@@ -5557,6 +5569,30 @@ class DialogCodePdf(QtWidgets.QWidget):
         if not selected:
             return None
         return selected['ref']
+
+    def _select_codes_to_resize(self, texts_here):
+        """ Returns the text codings to resize; several only if they share exact positions. """
+
+        if not texts_here:
+            return []
+        if len(texts_here) == 1:
+            return [texts_here[0]]
+        entries = [{'name': c['name'], 'ref': c} for c in texts_here]
+        ui = DialogSelectItems(self.app, entries,
+                               _("Select code to resize. Select multiple if exactly overlapping."), "multiple")
+        if not ui.exec():
+            return []
+        selected = [e['ref'] for e in ui.get_selected()]
+        if not selected:
+            return []
+        pos0 = selected[0]['pos0']
+        pos1 = selected[0]['pos1']
+        for c in selected:
+            if c['pos0'] != pos0 or c['pos1'] != pos1:
+                msg = _("Selected codes have differing start and end positions to other codes selected.\nMultiple selected coded segments must have identical positions")
+                Message(self.app, _('Different positions'), msg, 'warning').exec()
+                return []
+        return selected
 
     def _text_handle_anchor(self, code_item, is_start):
         """ Viewport point (word edge, bottom of the line) where to anchor the
@@ -5582,11 +5618,11 @@ class DialogCodePdf(QtWidgets.QWidget):
         item = self.view.items_[page_idx]
         return self.view.mapFromScene(item.mapToScene(point))
 
-    def show_resize_handles(self, code_item):
-        """ Creates the two teardrops (start and end) for the exact segment,
-        like _margin_resize_ctid of code_text. """
+    def show_resize_handles(self, code_items):
+        """ Creates the two teardrops (start and end) for one or more segments with identical positions,
+        like _margin_resize_ctid and display_handles_for_code of code_text. """
 
-        if code_item is None or code_item.get('ctid') is None:
+        if not code_items or any(c is None or c.get('ctid') is None for c in code_items):
             return
         if not self.text_ready():
             Message(self.app, _("Warning"),
@@ -5594,18 +5630,21 @@ class DialogCodePdf(QtWidgets.QWidget):
             return
         self.cancel_interactive_area_resize()
         self.hide_resize_handles()
-        target = next((c for c in self.code_text if c.get('ctid') == code_item['ctid']), None)
-        if target is None:
-            return
-        anchor_start = self._text_handle_anchor(target, True)
-        anchor_end = self._text_handle_anchor(target, False)
+        targets = []
+        for item in code_items:
+            target = next((c for c in self.code_text if c.get('ctid') == item['ctid']), None)
+            if target is None:
+                return
+            targets.append(target)
+        anchor_start = self._text_handle_anchor(targets[0], True)
+        anchor_end = self._text_handle_anchor(targets[0], False)
         if anchor_start is None or anchor_end is None:
             return
-        h_start = PdfResizeHandle(self.view, True, target, self)
+        h_start = PdfResizeHandle(self.view, True, targets, self)
         # The tip of the start teardrop is at its top right corner.
         h_start.move(anchor_start.x() - h_start.width(), anchor_start.y())
         self.active_handles.append(h_start)
-        h_end = PdfResizeHandle(self.view, False, target, self)
+        h_end = PdfResizeHandle(self.view, False, targets, self)
         # The tip of the end teardrop is at its top left corner.
         h_end.move(anchor_end.x(), anchor_end.y())
         self.active_handles.append(h_end)
@@ -5629,12 +5668,13 @@ class DialogCodePdf(QtWidgets.QWidget):
             self.hide_resize_handles()
             return
         for h in list(self.active_handles):
+            first = h.code_items[0]
             if next((c for c in self.code_text
-                     if c.get('ctid') == h.code_item.get('ctid')), None) is None \
-                    and h.code_item not in self.code_text:
+                     if c.get('ctid') == first.get('ctid')), None) is None \
+                    and first not in self.code_text:
                 self.hide_resize_handles()
                 return
-            anchor = self._text_handle_anchor(h.code_item, h.is_start)
+            anchor = self._text_handle_anchor(first, h.is_start)
             if anchor is None:
                 continue
             if h.is_start:
@@ -5643,59 +5683,78 @@ class DialogCodePdf(QtWidgets.QWidget):
                 h.move(anchor.x(), anchor.y())
             h.raise_()
 
-    def update_code_position_from_handle(self, code_item, new_pos, is_start, orig_pos0, orig_pos1):
+    def update_code_position_from_handle(self, code_items, new_pos, is_start, orig_pos0, orig_pos1):
         """ Receives the final position of the teardrop and updates the database.
+        For one or more codes if they have exact same start and end positions.
         Ported from code_text (same validations and revert).
         """
 
         if is_start:
-            if new_pos >= code_item['pos1']:
-                code_item['pos0'] = orig_pos0  # Revertir visualmente. Revert visually.
+            if new_pos >= code_items[0]['pos1']:
+                for code_item in code_items:
+                    code_item['pos0'] = orig_pos0  # Revert visually
                 self.hide_resize_handles()
                 self.rebuild_marks()
                 return
-            code_item['pos0'] = new_pos
+            for code_item in code_items:
+                code_item['pos0'] = new_pos
         else:
-            if new_pos <= code_item['pos0']:
-                code_item['pos1'] = orig_pos1  # Revertir visualmente. Revert visually.
+            if new_pos <= code_items[0]['pos0']:
+                for code_item in code_items:
+                    code_item['pos1'] = orig_pos1  # Revert visually
                 self.hide_resize_handles()
                 self.rebuild_marks()
                 return
-            code_item['pos1'] = new_pos
+            for code_item in code_items:
+                code_item['pos1'] = new_pos
+
+        # Get seltext from textEdit
+        plain_text_edit = QtWidgets.QPlainTextEdit(self.file_['fulltext'])
+        cursor = plain_text_edit.textCursor()
+        cursor.setPosition(code_items[0]['pos0'])
+        cursor.setPosition(code_items[0]['pos1'], QtGui.QTextCursor.MoveMode.KeepAnchor)
+        seltext = cursor.selectedText()
+
         cur = self.app.conn.cursor()
-        cur.execute("select substr(fulltext,?,?) from source where id=?",
-                    [code_item['pos0'] + 1, code_item['pos1'] - code_item['pos0'], code_item['fid']])
-        res = cur.fetchone()
-        if not res:
-            code_item['pos0'] = orig_pos0
-            code_item['pos1'] = orig_pos1
-            self.hide_resize_handles()
-            self.rebuild_marks()
-            return
-        seltext = res[0]
-        try:
-            cur.execute("update code_text set pos0=?, pos1=?, seltext=? where ctid=?",
-                        [code_item['pos0'], code_item['pos1'], seltext, code_item['ctid']])
-            self.app.conn.commit()
+        saved = False
+        failed = False
+        for code_item in code_items:
+            try:
+                cur.execute("update code_text set pos0=?, pos1=?, seltext=? where ctid=?",
+                            [code_item['pos0'], code_item['pos1'], seltext, code_item['ctid']])
+                self.app.conn.commit()
+                saved = True
+            except sqlite3.IntegrityError:
+                self.app.conn.rollback()
+                code_item['pos0'] = orig_pos0
+                code_item['pos1'] = orig_pos1
+                failed = True
+        if saved:
             self._emit_project_table_changes(['code_text'])
             self.app.delete_backup = False
-        except sqlite3.IntegrityError:
-            self.app.conn.rollback()
-            code_item['pos0'] = orig_pos0
-            code_item['pos1'] = orig_pos1
+        if failed:
+            Message(self.app, _("Duplicate Error"),
+                    _("This code already exists at this exact location."), "warning").exec()
+        if not saved:
             self.hide_resize_handles()
             self.rebuild_marks()
             return
         self.get_coded_text_update_eventfilter_tooltips()
         self.fill_code_counts_in_tree()
-        # Rebind the handles to the reloaded dict and relocate them.
+        if failed:
+            # Segments no longer share positions, so the teardrops are removed.
+            self.hide_resize_handles()
+            return
+        # Rebind the handles to the reloaded dicts and relocate them.
+        ctids = [c['ctid'] for c in code_items]
+        refreshed = [c for ctid in ctids for c in self.code_text if c.get('ctid') == ctid]
+        if len(refreshed) != len(ctids):
+            self.hide_resize_handles()
+            return
         for h in self.active_handles:
-            refreshed = next((c for c in self.code_text
-                              if c.get('ctid') == code_item['ctid']), None)
-            if refreshed is not None:
-                h.code_item = refreshed
-                h.orig_pos0 = refreshed['pos0']
-                h.orig_pos1 = refreshed['pos1']
+            h.code_items = refreshed
+            h.orig_pos0 = refreshed[0]['pos0']
+            h.orig_pos1 = refreshed[0]['pos1']
         self.reposition_resize_handles()
 
     def _area_handle_rects(self, area):
@@ -6183,6 +6242,10 @@ class DialogCodePdf(QtWidgets.QWidget):
 
             norm_fmt = QtGui.QTextCharFormat()
             norm_fmt.setFontPointSize(12)
+
+            ref_fmt = QtGui.QTextCharFormat()
+            ref_fmt.setFontPointSize(9)
+            ref_fmt.setFontItalic(True)
             
             it_fmt = QtGui.QTextCharFormat(norm_fmt)
             it_fmt.setFontItalic(True)
@@ -6207,6 +6270,16 @@ class DialogCodePdf(QtWidgets.QWidget):
             cursor.insertText(f"{_('File')}: {self.file_['name']}\n", header_fmt)
             report_date = datetime.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
             cursor.insertText(f"{_('Generated report')}: {report_date}\n\n", header_fmt)
+
+            # Add reference, if any
+            cur = self.app.conn.cursor()
+            cur.execute("select risid from source where source.id=?", [self.file_['id']])
+            ris_res = cur.fetchone()
+            if ris_res and ris_res[0]:
+                ris = Ris(self.app)
+                ris.get_references(ris_res[0])
+                if ris.refs:
+                    cursor.insertText(_("Reference: ") + ris.refs[0]['apa'].replace('\n', ' ') + "\n\n", ref_fmt)
 
             seg_co_occurrences = defaultdict(set)
             area_co_occurrences = defaultdict(set)
